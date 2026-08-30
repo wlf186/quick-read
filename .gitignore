@@ -1,0 +1,16 @@
+.venv/
+.tools/
+.cache/
+.temp/
+runtime/
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+frontend/playwright-report/
+frontend/test-results/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store

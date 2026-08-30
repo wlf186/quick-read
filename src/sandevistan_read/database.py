@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+from .paths import PATHS
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def json_load(value: str | None, default: Any = None) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return default
+
+
+class Database:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or PATHS.database
+        self._write_lock = threading.RLock()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._write_lock:
+            connection = self.connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def initialize(self) -> None:
+        schema = """
+        CREATE TABLE IF NOT EXISTS schema_versions (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notebooks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sources (
+            id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+            revision_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            blob_path TEXT NOT NULL,
+            preview_path TEXT,
+            state TEXT NOT NULL,
+            selected INTEGER NOT NULL DEFAULT 1,
+            page_count INTEGER NOT NULL DEFAULT 0,
+            parser TEXT,
+            error TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sources_notebook ON sources(notebook_id, selected, state);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_revision ON sources(revision_id);
+        CREATE TABLE IF NOT EXISTS chunks (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            source_revision_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            locator_json TEXT NOT NULL,
+            embedding_json TEXT,
+            checksum TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id, ordinal);
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            chunk_id UNINDEXED,
+            source_id UNINDEXED,
+            content,
+            tokenize='unicode61'
+        );
+        CREATE TABLE IF NOT EXISTS summaries (
+            id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+            scope_hash TEXT NOT NULL,
+            content TEXT NOT NULL,
+            citations_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_summaries_scope ON summaries(notebook_id, scope_hash, created_at DESC);
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            scope_hash TEXT,
+            state TEXT NOT NULL DEFAULT 'complete',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+        CREATE TABLE IF NOT EXISTS provider_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            secret_enc TEXT NOT NULL DEFAULT '',
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            active INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_role ON provider_profiles(role, active);
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            progress REAL NOT NULL,
+            notebook_id TEXT,
+            parent_id TEXT,
+            payload_json TEXT NOT NULL,
+            result_json TEXT,
+            error TEXT,
+            retryable INTEGER NOT NULL DEFAULT 1,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, created_at);
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            language TEXT NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            citations_json TEXT NOT NULL,
+            media_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_notebook ON artifacts(notebook_id, type, created_at DESC);
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id TEXT PRIMARY KEY,
+            artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+            answers_json TEXT NOT NULL,
+            score REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS flashcard_reviews (
+            id TEXT PRIMARY KEY,
+            artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+            card_id TEXT NOT NULL,
+            rating TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+        with self.connect() as connection:
+            connection.executescript(schema)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES(1, ?)",
+                (utc_now(),),
+            )
+            connection.commit()
+        self._migrate_v2()
+        with self.transaction() as connection:
+            connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
+                WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
+            connection.execute("UPDATE jobs SET stage_progress=progress WHERE stage_progress=0 AND progress>0")
+
+    def _migrate_v2(self) -> None:
+        """Add observable jobs and resumable cleanup. Safe to run on every start."""
+        current = self.fetchone("SELECT MAX(version) AS version FROM schema_versions") or {}
+        if int(current.get("version") or 0) >= 2:
+            return
+        if self.path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = PATHS.backups / f"sandevistan-read.pre-v2.{stamp}.db"
+            source = sqlite3.connect(self.path)
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close(); source.close()
+        with self.transaction() as connection:
+            notebook_columns = {row[1] for row in connection.execute("PRAGMA table_info(notebooks)")}
+            job_columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+            notebook_additions = {
+                "state": "TEXT NOT NULL DEFAULT 'active'",
+                "deletion_requested_at": "TEXT",
+                "cleanup_error": "TEXT",
+            }
+            job_additions = {
+                "display_name": "TEXT NOT NULL DEFAULT ''",
+                "stage_code": "TEXT NOT NULL DEFAULT 'queued'",
+                "stage_progress": "REAL NOT NULL DEFAULT 0",
+                "progress_basis": "TEXT NOT NULL DEFAULT 'observed'",
+                "stage_current": "REAL",
+                "stage_total": "REAL",
+                "stage_unit": "TEXT",
+                "activity_json": "TEXT NOT NULL DEFAULT '{}'",
+                "workload_json": "TEXT NOT NULL DEFAULT '{}'",
+                "execution_profile_json": "TEXT NOT NULL DEFAULT '{}'",
+                "processing_seconds": "REAL NOT NULL DEFAULT 0",
+            }
+            for name, definition in notebook_additions.items():
+                if name not in notebook_columns:
+                    connection.execute(f"ALTER TABLE notebooks ADD COLUMN {name} {definition}")
+            for name, definition in job_additions.items():
+                if name not in job_columns:
+                    connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS job_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    stage_code TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    progress REAL NOT NULL,
+                    stage_current REAL,
+                    stage_total REAL,
+                    stage_unit TEXT,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, id);
+                CREATE TABLE IF NOT EXISTS local_resources (
+                    id TEXT PRIMARY KEY,
+                    owner_type TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    notebook_id TEXT,
+                    kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    transferred_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_local_resources_owner ON local_resources(owner_type, owner_id, state);
+                CREATE TABLE IF NOT EXISTS cleanup_operations (
+                    id TEXT PRIMARY KEY,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_cleanup_state ON cleanup_operations(state, created_at);
+            """)
+            connection.execute("UPDATE jobs SET display_name=CASE kind WHEN 'ingest' THEN '文档解析' WHEN 'summary' THEN '生成摘要' WHEN 'quiz' THEN 'Quiz 题库' WHEN 'flashcard' THEN 'Flashcard 闪卡' WHEN 'podcast' THEN '双人音频播客' ELSE kind END WHERE display_name='' OR display_name IS NULL")
+            connection.execute("UPDATE jobs SET stage_code=CASE WHEN state='complete' THEN 'complete' WHEN state='failed' THEN 'failed' WHEN state='cancelled' THEN 'cancelled' WHEN state='running' THEN 'recovering' ELSE 'queued' END")
+            connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(2, ?)", (utc_now(),))
+
+    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
+        with self.transaction() as connection:
+            connection.execute(sql, parameters)
+
+    def fetchone(self, sql: str, parameters: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(sql, parameters).fetchone()
+            return dict(row) if row else None
+
+    def fetchall(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
+
+    def seed(self, ollama_url: str, ollama_model: str, tts_url: str) -> None:
+        now = utc_now()
+        with self.transaction() as connection:
+            if not connection.execute("SELECT 1 FROM notebooks LIMIT 1").fetchone():
+                connection.execute(
+                    "INSERT INTO notebooks(id, title, description, created_at, updated_at) VALUES(?,?,?,?,?)",
+                    (new_id("nb"), "Project Relic / 产品研究", "本地资料研究笔记本", now, now),
+                )
+            if not connection.execute("SELECT 1 FROM provider_profiles LIMIT 1").fetchone():
+                connection.executemany(
+                    """INSERT INTO provider_profiles
+                    (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            new_id("provider"), "Local Ollama", "main", "ollama", ollama_url.rstrip("/"),
+                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now,
+                        ),
+                        (
+                            new_id("provider"), "Local Vision", "vlm", "ollama", ollama_url.rstrip("/"),
+                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now,
+                        ),
+                        (
+                            new_id("provider"), "Sandevistan Audio", "tts", "sandevistan_tts", tts_url.rstrip("/"),
+                            "qwen3-tts-0.6b", "", json_dump({"async": True}),
+                            json_dump({"host_a": "Vivian", "host_b": "Dylan", "language": "Chinese", "response_format": "wav", "compute_device": "cpu"}),
+                            1, now, now,
+                        ),
+                    ],
+                )
+
+    def reset_running_jobs(self) -> None:
+        now = utc_now()
+        self.execute(
+            "UPDATE jobs SET state='queued', stage='服务重启后恢复排队', stage_code='recovering', updated_at=? WHERE state IN ('running','cancelling')",
+            (now,),
+        )
+
+
+DB = Database()

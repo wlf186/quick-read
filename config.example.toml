@@ -1,0 +1,28 @@
+[server]
+host = "127.0.0.1"
+port = 20830
+log_level = "info"
+
+[security]
+# Required when server.host is not a loopback address. Leave blank for localhost-only use.
+access_key = ""
+
+[runtime]
+max_upload_mib = 512
+minimum_free_mib = 2048
+job_poll_seconds = 0.5
+
+[models]
+embedding = "intfloat/multilingual-e5-small"
+reranker = "BAAI/bge-reranker-v2-m3"
+offline = true
+
+[tools]
+# Relative paths resolve from the project root. Empty values fall back to PATH discovery.
+ffmpeg = ""
+libreoffice = ""
+
+[development]
+ollama_url = "http://iollama:11434"
+ollama_model = "qwen3.5:2b"
+tts_url = "http://localhost:20810"

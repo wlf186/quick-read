@@ -1,0 +1,40 @@
+{
+  "ffmpeg": {
+    "version": "9.0",
+    "linux-x86_64": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-lgpl-9.0.tar.xz",
+      "sha256": "d80d003d06c5f7897d72fb2954e75a607c34ad54e57143e6a42b63431c5c0ca1"
+    },
+    "linux-arm64": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linuxarm64-lgpl-9.0.tar.xz",
+      "sha256": "2bc867d381f49ccbeac43229be333c1803f62ecd9a5c6ee0e0c24c1e1c39d2de"
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-9.0.zip",
+      "sha256": "84b3d7129762b32b2be561ff341d93a42ce2b1e02cfc10c31f26e7b67dfdb32f"
+    },
+    "windows-arm64": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-winarm64-lgpl-9.0.zip",
+      "sha256": "08da46ebca4d5212e33e7a176f4e9088445ed4b117cd6df0f4c4a6afa1a252fa"
+    }
+  },
+  "libreoffice": {
+    "version": "26.2.5",
+    "linux-x86_64": {
+      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.5/deb/x86_64/LibreOffice_26.2.5_Linux_x86-64_deb.tar.gz",
+      "sha256": "2f03bfb2ac9f33ea7c77331b4b7a23300fb0ed7443566046bf8b5bc51c1bed1e"
+    },
+    "linux-arm64": {
+      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.5/deb/aarch64/LibreOffice_26.2.5_Linux_aarch64_deb.tar.gz",
+      "sha256": "0e72aa19d216f54100389b8b7840e2d1212470d88fddddb1dae9993d06d7e4ec"
+    },
+    "windows-x86_64": {
+      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.5/win/x86_64/LibreOffice_26.2.5_Win_x86-64.msi",
+      "sha256": "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9"
+    },
+    "windows-arm64": {
+      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.5/win/aarch64/LibreOffice_26.2.5_Win_aarch64.msi",
+      "sha256": "48e99bba813c65a823b86a9fe8c0746a415f3d0e9459255f81f745f58fd353aa"
+    }
+  }
+}
