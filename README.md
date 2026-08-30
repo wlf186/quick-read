@@ -26,6 +26,21 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://iollama:11434` 的 `qwen3.5:2b`，TTS 是 `http://localhost:20810`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
 
+## Provider 配置
+
+设置页按角色限制可选协议：
+
+| 角色 | 支持的 Provider 类型 |
+| --- | --- |
+| MAIN、VLM | Ollama、OpenAI-compatible |
+| TTS | Sandevistan TTS、OpenAI TTS |
+
+推荐流程是“连接并读取模型 → 选择或手填模型 → 验证并启用”。连接检查会读取服务实时公开的模型、设备和音色清单；若兼容服务不提供清单，可手填模型并执行深度验证。服务地址可直接粘贴带 `/v1`、`/api` 或 `/api/v1` 的常见形式，保存时会规范化为服务根地址。
+
+连接检查不保存配置。深度验证只发送内置的极短测试文本或测试图片，不会发送 Notebook 资料；使用云端模型时仍可能产生少量 API 费用。未通过验证的配置可以保存为未启用状态，启用失败不会替换当前同角色的活跃 Provider。
+
+程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用。请求和响应模型以 `/api/docs` 为准。
+
 ## 本地数据边界
 
 所有可删除的项目状态都在工作目录：

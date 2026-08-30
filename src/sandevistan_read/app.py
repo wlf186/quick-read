@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
 from contextlib import asynccontextmanager
@@ -17,9 +18,9 @@ from .jobs import WORKER, enqueue
 from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete
 from .observability import Reporter, present_job
 from .paths import PATHS
-from .providers import active_provider, health, probe_tts_provider
+from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_tts_provider, provider_by_id
 from .retrieval import EMBEDDINGS
-from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, LoginRequest, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderUpdate, QuizRequest, QuizSubmission, SourceSelection, SummaryRequest
+from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, LoginRequest, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizRequest, QuizSubmission, SourceSelection, SummaryRequest
 from .security import VAULT
 from .services import grounded_generate, source_scope
 
@@ -85,7 +86,9 @@ async def status():
         "ffmpeg": {"available": bool(ffmpeg), "scope": CONFIG.tools.scope(ffmpeg), "version": CONFIG.tools.version(ffmpeg), "path": str(Path(ffmpeg).resolve().relative_to(PATHS.root)) if ffmpeg and CONFIG.tools.scope(ffmpeg) == "project" else ffmpeg},
         "libreoffice": {"available": bool(libreoffice), "scope": CONFIG.tools.scope(libreoffice), "version": CONFIG.tools.version(libreoffice), "path": str(Path(libreoffice).resolve().relative_to(PATHS.root)) if libreoffice and CONFIG.tools.scope(libreoffice) == "project" else libreoffice},
     }
-    return {"name": "Sandevistan-Read", "version": "0.4.0", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": {role: await health(role) for role in ("main", "vlm", "tts")}, "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
+    roles = ("main", "vlm", "tts")
+    health_results = await asyncio.gather(*(health(role) for role in roles))
+    return {"name": "Sandevistan-Read", "version": "0.4.0", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
 
 
 @api.get("/notebooks")
@@ -385,32 +388,130 @@ def providers():
     return rows
 
 
+def _provider_candidate(body: ProviderCreate | ProviderInspectionRequest, *, api_key: str | None = None) -> dict[str, Any]:
+    return {
+        "name": getattr(body, "name", "Provider"),
+        "role": body.role,
+        "kind": body.kind,
+        "base_url": body.base_url,
+        "model": body.model,
+        "api_key": body.api_key if api_key is None else api_key,
+        "config": dict(body.config),
+    }
+
+
+def _persisted_capabilities(kind: str, inspection: dict[str, Any]) -> dict[str, Any]:
+    capabilities = dict(inspection.get("capabilities") or {})
+    if kind == "sandevistan_tts":
+        capabilities["models"] = inspection.get("models") or []
+        capabilities["recommended"] = inspection.get("recommended")
+    return capabilities
+
+
+def _apply_recommendation(candidate: dict[str, Any], inspection: dict[str, Any]) -> None:
+    recommended = inspection.get("recommended") or {}
+    config = candidate.get("config") or {}
+    if candidate.get("kind") == "sandevistan_tts" and config.get("auto_select") and recommended.get("model"):
+        candidate["model"] = recommended["model"]
+        config["compute_device"] = recommended.get("compute_device")
+        candidate["config"] = config
+
+
+def _inspection_conflict(inspection: dict[str, Any]) -> HTTPException:
+    error = inspection.get("error") or {}
+    message = error.get("message") or inspection.get("warning") or "Provider 验证未通过"
+    return HTTPException(409, {"message": message, "inspection": inspection})
+
+
+@api.post("/providers/inspect")
+async def inspect_provider_configuration(body: ProviderInspectionRequest):
+    key = body.api_key
+    if body.provider_id and key is None:
+        stored = provider_by_id(body.provider_id)
+        if not stored:
+            raise HTTPException(404, "Provider 不存在")
+        key = stored.get("api_key", "")
+    return await inspect_provider(_provider_candidate(body, api_key=key or ""), body.mode)
+
+
 @api.post("/providers")
-def create_provider(body: ProviderCreate):
+async def create_provider(body: ProviderCreate):
     identifier, now = new_id("provider"), utc_now()
-    if body.active: DB.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (body.role,))
-    DB.execute("INSERT INTO provider_profiles VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (identifier, body.name, body.role, body.kind, body.base_url.rstrip("/"), body.model, VAULT.encrypt(body.api_key), json_dump(body.capabilities), json_dump(body.config), int(body.active), now, now)); return {"id": identifier}
+    candidate = _provider_candidate(body)
+    try:
+        candidate["base_url"] = normalize_provider_base_url(body.kind, body.base_url)
+    except ProviderError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    inspection = None
+    if body.active:
+        inspection = await inspect_provider(candidate, body.validation_mode)
+        if not inspection.get("activation_eligible"):
+            raise _inspection_conflict(inspection)
+        _apply_recommendation(candidate, inspection)
+    capabilities = _persisted_capabilities(body.kind, inspection) if inspection else body.capabilities
+    with DB.transaction() as connection:
+        if body.active:
+            connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (body.role,))
+        connection.execute(
+            """INSERT INTO provider_profiles
+            (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (identifier, body.name, body.role, body.kind, candidate["base_url"], candidate["model"], VAULT.encrypt(body.api_key), json_dump(capabilities), json_dump(candidate["config"]), int(body.active), now, now),
+        )
+    return {"id": identifier, "active": body.active, "inspection": inspection}
 
 
 @api.patch("/providers/{provider_id}")
-def update_provider(provider_id: str, body: ProviderUpdate):
-    row = DB.fetchone("SELECT * FROM provider_profiles WHERE id=?", (provider_id,));
-    if not row: raise HTTPException(404, "Provider 不存在")
-    values = body.model_dump(exclude_none=True)
-    if values.get("active"): DB.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (row["role"],))
+async def update_provider(provider_id: str, body: ProviderUpdate):
+    row = provider_by_id(provider_id)
+    if not row:
+        raise HTTPException(404, "Provider 不存在")
+    values = body.model_dump(exclude_none=True, exclude={"validation_mode"})
+    if "base_url" in values:
+        try:
+            values["base_url"] = normalize_provider_base_url(row["kind"], values["base_url"])
+        except ProviderError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    material = {"base_url", "model", "api_key", "config"}
+    target_active = bool(values.get("active", row["active"]))
+    requires_validation = target_active and (not row["active"] or bool(material.intersection(values)))
+    if requires_validation:
+        candidate = {
+            "name": values.get("name", row["name"]),
+            "role": row["role"],
+            "kind": row["kind"],
+            "base_url": values.get("base_url", row["base_url"]),
+            "model": values.get("model", row["model"]),
+            "api_key": values.get("api_key", row.get("api_key", "")),
+            "config": dict(values.get("config", row.get("config") or {})),
+        }
+        inspection = await inspect_provider(candidate, body.validation_mode)
+        if not inspection.get("activation_eligible"):
+            raise _inspection_conflict(inspection)
+        _apply_recommendation(candidate, inspection)
+        values["model"] = candidate["model"]
+        values["config"] = candidate["config"]
+        values["capabilities"] = _persisted_capabilities(row["kind"], inspection)
     mapping = {"capabilities": "capabilities_json", "config": "config_json", "api_key": "secret_enc"}
     sets, params = [], []
     for key, value in values.items():
         column = mapping.get(key, key); value = VAULT.encrypt(value) if key == "api_key" else json_dump(value) if key in {"capabilities", "config"} else int(value) if key == "active" else value
         sets.append(f"{column}=?"); params.append(value)
-    sets.append("updated_at=?"); params.extend([utc_now(), provider_id]); DB.execute(f"UPDATE provider_profiles SET {','.join(sets)} WHERE id=?", tuple(params)); return {"ok": True}
+    sets.append("updated_at=?"); params.extend([utc_now(), provider_id])
+    with DB.transaction() as connection:
+        if values.get("active"):
+            connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (row["role"],))
+        connection.execute(f"UPDATE provider_profiles SET {','.join(sets)} WHERE id=?", tuple(params))
+    return {"ok": True, "active": target_active}
 
 
 @api.post("/providers/{provider_id}/test")
 async def test_provider(provider_id: str):
-    row = DB.fetchone("SELECT role FROM provider_profiles WHERE id=?", (provider_id,));
-    if not row: raise HTTPException(404, "Provider 不存在")
-    return await health(row["role"], provider_id)
+    provider = provider_by_id(provider_id)
+    if not provider:
+        raise HTTPException(404, "Provider 不存在")
+    inspection = await inspect_provider(provider, "catalog")
+    return {"ok": inspection.get("activation_eligible", False), **inspection}
 
 
 @api.post("/providers/{provider_id}/probe")

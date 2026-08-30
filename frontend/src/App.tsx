@@ -1,8 +1,9 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {BookOpen,Headphones,MessageSquare} from 'lucide-react';
-import {ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SettingsDrawer,SourceRail,StudioRail} from './components';
-import {authStatus,ask,createArtifact,createNotebook,createProvider,deleteSource,getArtifacts,getConversations,getJobs,getMessages,getNotebook,getNotebooks,getProviders,getStatus,login,probeProvider,reviewFlashcard,selectSource,submitQuiz,testProvider,updateProvider,upload,type Artifact,type Citation,type Job,type Notebook,type PodcastOptions,type Provider,type Source} from './api';
+import {ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SourceRail,StudioRail} from './components';
+import {authStatus,ask,createArtifact,createNotebook,createProvider,deleteSource,getArtifacts,getConversations,getJobs,getMessages,getNotebook,getNotebooks,getProviders,getStatus,inspectProvider,login,reviewFlashcard,selectSource,submitQuiz,updateProvider,upload,type Artifact,type Citation,type Job,type Notebook,type PodcastOptions,type Provider,type ProviderDraft,type ProviderInspection,type Source} from './api';
 import {JobsPage,NotebooksPage} from './management';
+import {SettingsDrawer} from './provider_settings';
 import {Overlay} from './ui';
 
 const ACTIVE_NOTEBOOK_KEY='sread_active_notebook_v1';
@@ -56,10 +57,11 @@ export default function App(){
     try{
       const access=await authStatus();
       if(access.required&&!access.authenticated){setPhase('locked');return}
-      const[list,nextStatus,nextProviders]=await Promise.all([getNotebooks(),getStatus(),getProviders()]);
-      setNotebooks(list);setStatus(nextStatus);setProviders(nextProviders);
+      const[list,nextProviders]=await Promise.all([getNotebooks(),getProviders()]);
+      setNotebooks(list);setProviders(nextProviders);
       const preferred=storedNotebook();const next=list.some(item=>item.id===preferred)?preferred:list[0]?.id||'';
       setActiveId(next);persistNotebook(next);setPhase('ready');
+      void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}));
     }catch(error){
       if(error instanceof Error&&error.message==='AUTH_REQUIRED'){setPhase('locked');return}
       const message=error instanceof Error?error.message:'无法启动应用';setBootError(message);setPhase('error');
@@ -67,9 +69,10 @@ export default function App(){
   },[]);
 
   const loadGlobal=useCallback(async()=>{
-    const[list,nextStatus,nextProviders]=await Promise.all([getNotebooks(),getStatus(),getProviders()]);
-    setNotebooks(list);setStatus(nextStatus);setProviders(nextProviders);
+    const[list,nextProviders]=await Promise.all([getNotebooks(),getProviders()]);
+    setNotebooks(list);setProviders(nextProviders);
     if(!activeId||!list.some(item=>item.id===activeId)){const next=list[0]?.id||'';setActiveId(next);persistNotebook(next)}
+    void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}));
   },[activeId]);
 
   const loadCurrent=useCallback(async(id:string,loadHistory=false)=>{
@@ -130,14 +133,13 @@ export default function App(){
     try{const created=await createNotebook(title);const list=await getNotebooks();setNotebooks(list);setActiveId(created.id);persistNotebook(created.id);location.hash='workspace';notify('Notebook 已创建','success')}catch(error){reportError(error);throw error}
   }
   async function saveProvider(id:string,body:Record<string,any>){
-    try{await updateProvider(id,body);const[nextProviders,nextStatus]=await Promise.all([getProviders(),getStatus()]);setProviders(nextProviders);setStatus(nextStatus);notify('Provider 配置已保存','success')}catch(error){reportError(error);throw error}
+    try{await updateProvider(id,body);setProviders(await getProviders());notify('Provider 配置已保存','success');void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}))}catch(error){reportError(error);throw error}
   }
   async function addProvider(body:Record<string,any>){
-    try{await createProvider(body);const[nextProviders,nextStatus]=await Promise.all([getProviders(),getStatus()]);setProviders(nextProviders);setStatus(nextStatus);notify('Provider 已创建并启用','success')}catch(error){reportError(error);throw error}
+    try{await createProvider(body);setProviders(await getProviders());notify(body.active?'Provider 已创建并启用':'Provider 已保存为未启用','success');void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}))}catch(error){reportError(error);throw error}
   }
-  async function checkProvider(id:string){try{return await testProvider(id)}catch(error){reportError(error);throw error}}
-  async function detectProvider(id:string){
-    try{const result=await probeProvider(id);const[nextProviders,nextStatus]=await Promise.all([getProviders(),getStatus()]);setProviders(nextProviders);setStatus(nextStatus);notify(`TTS 已探测 · ${result.recommended?.model||'MANUAL'} / ${(result.recommended?.compute_device||'DEVICE').toUpperCase()}`,'success');return result}catch(error){reportError(error);throw error}
+  async function inspectConfiguration(draft:ProviderDraft,mode:'catalog'|'deep'):Promise<ProviderInspection>{
+    try{return await inspectProvider({provider_id:draft.provider_id,role:draft.role,kind:draft.kind,base_url:draft.base_url,model:draft.model,api_key:draft.api_key||undefined,config:draft.config,mode})}catch(error){reportError(error);throw error}
   }
   async function handleReview(id:string,cardId:string,rating:string){try{await reviewFlashcard(id,cardId,rating);notify(`FLASHCARD · ${rating.toUpperCase()}`,'success')}catch(error){reportError(error);throw error}}
 
@@ -164,7 +166,7 @@ export default function App(){
     <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.0</span></footer>
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
-    {settings?<SettingsDrawer status={status} providers={providers} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onTest={checkProvider} onProbe={detectProvider}/>:null}
+    {settings?<SettingsDrawer status={status} providers={providers} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration}/>:null}
     {podcastOpen?<PodcastCreateModal provider={ttsProvider} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
     {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}><button className="drawer-close" data-autofocus onClick={()=>setTabletStudio(false)}>关闭 ×</button>{studio}</Overlay>:null}
     {toast?<div className={`toast toast-${toast.tone}`} role={toast.tone==='error'?'alert':'status'}><span>{toast.message}</span><button aria-label="关闭提示" onClick={()=>setToast(undefined)}>×</button></div>:null}

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Backend code lives in `src/sandevistan_read/`. Keep HTTP routes in `app.py`, document parsing in `documents.py`, retrieval logic in `retrieval.py`, background work in `jobs.py`, and provider integrations in `providers.py`. The React 19/Vite UI is under `frontend/src/`; shared overlays and rendering helpers belong in `ui.tsx`, while route-level management views belong in `management.tsx`. Python tests live in `tests/`, including the Playwright smoke test. Treat `runtime/`, `.venv/`, `.tools/`, `frontend/dist/`, and `frontend/node_modules/` as generated or local-state directories; do not commit their contents or use production data as fixtures.
+Backend code lives in `src/sandevistan_read/`. Keep HTTP routes in `app.py`, document parsing in `documents.py`, retrieval logic in `retrieval.py`, background work in `jobs.py`, and provider integrations in `providers.py`. The React 19/Vite UI is under `frontend/src/`; shared overlays and rendering helpers belong in `ui.tsx`, Provider settings and capability discovery UI belong in `provider_settings.tsx`, while route-level management views belong in `management.tsx`. Python tests live in `tests/`, including the Playwright smoke test. Treat `runtime/`, `.venv/`, `.tools/`, `frontend/dist/`, and `frontend/node_modules/` as generated or local-state directories; do not commit their contents or use production data as fixtures.
 
 ## Build, Test, and Development Commands
 

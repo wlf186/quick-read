@@ -19,26 +19,60 @@ class SourceSelection(BaseModel):
     selected: bool
 
 
+ProviderRole = Literal["main", "vlm", "tts"]
+ProviderKind = Literal["ollama", "openai", "sandevistan_tts", "openai_tts"]
+ProviderValidationMode = Literal["catalog", "deep"]
+
+
+def _validate_provider_pair(role: str, kind: str) -> None:
+    allowed = {"main": {"ollama", "openai"}, "vlm": {"ollama", "openai"}, "tts": {"sandevistan_tts", "openai_tts"}}
+    if kind not in allowed.get(role, set()):
+        raise ValueError(f"{role.upper()} 角色不支持 {kind} Provider")
+
+
 class ProviderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    role: Literal["main", "vlm", "tts"]
-    kind: Literal["ollama", "openai", "sandevistan_tts", "openai_tts"]
-    base_url: str
-    model: str = ""
+    role: ProviderRole
+    kind: ProviderKind
+    base_url: str = Field(min_length=1, max_length=2048)
+    model: str = Field(default="", max_length=240)
     api_key: str = ""
     capabilities: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     active: bool = True
+    validation_mode: ProviderValidationMode = "catalog"
+
+    @model_validator(mode="after")
+    def validate_provider_pair(self):
+        _validate_provider_pair(self.role, self.kind)
+        return self
 
 
 class ProviderUpdate(BaseModel):
-    name: str | None = None
-    base_url: str | None = None
-    model: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    base_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    model: str | None = Field(default=None, max_length=240)
     api_key: str | None = None
     capabilities: dict[str, Any] | None = None
     config: dict[str, Any] | None = None
     active: bool | None = None
+    validation_mode: ProviderValidationMode = "catalog"
+
+
+class ProviderInspectionRequest(BaseModel):
+    provider_id: str | None = None
+    role: ProviderRole
+    kind: ProviderKind
+    base_url: str = Field(min_length=1, max_length=2048)
+    model: str = Field(default="", max_length=240)
+    api_key: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    mode: ProviderValidationMode = "catalog"
+
+    @model_validator(mode="after")
+    def validate_provider_pair(self):
+        _validate_provider_pair(self.role, self.kind)
+        return self
 
 
 class ChatRequest(BaseModel):

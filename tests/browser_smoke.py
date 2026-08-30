@@ -50,6 +50,8 @@ def main() -> None:
         page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
         authenticate(page)
         select_qa_notebook(page)
+        page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
+        page.wait_for_function("document.querySelectorAll('.artifact').length === 4")
 
         assert page.title() == "Sandevistan-Read"
         assert page.get_by_role("heading", name="向资料提问").is_visible()
@@ -68,6 +70,55 @@ def main() -> None:
         settings = page.get_by_role("dialog", name="Provider 配置")
         assert settings.is_visible()
         assert settings.evaluate("element => element.contains(document.activeElement)")
+
+        def inspect_provider(route) -> None:
+            request = json.loads(route.request.post_data or "{}")
+            selected = request.get("model", "")
+            models = [{"id": "alpha-chat", "name": "Alpha Chat"}, {"id": "beta-vision", "name": "Beta Vision"}]
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "status": "passed" if selected else "warning",
+                        "connection_ok": True,
+                        "activation_eligible": bool(selected),
+                        "latency_ms": 42,
+                        "catalog_supported": True,
+                        "models": models,
+                        "capabilities": {},
+                        "recommended": None,
+                        "warning": None if selected else "连接成功，请选择或填写模型",
+                        "error": None,
+                    }
+                ),
+            )
+
+        page.route("**/api/providers/inspect", inspect_provider)
+        settings.get_by_role("button", name="添加 Provider").click()
+        assert settings.get_by_role("heading", name="添加 Provider").is_visible()
+        settings.get_by_label("角色").select_option("tts")
+        assert settings.get_by_label("类型").locator("option").count() == 2
+        settings.get_by_label("角色").select_option("main")
+        settings.get_by_label("名称").fill("QA Provider")
+        settings.get_by_label("服务地址").fill("https://api.example.com/v1")
+        settings.get_by_role("button", name="连接并读取模型").click()
+        settings.get_by_text("连接成功，请选择或填写模型").wait_for()
+        assert settings.get_by_text("连接成功，请选择或填写模型").is_visible()
+        model_picker = settings.get_by_role("combobox", name="模型")
+        model_picker.click()
+        settings.get_by_role("button", name=re.compile("Alpha Chat")).click()
+        settings.get_by_role("button", name="连接并读取模型").click()
+        settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
+        assert settings.get_by_text(re.compile("2 个模型 · 42 ms")).is_visible()
+        assert settings.get_by_role("button", name="验证并启用").is_enabled()
+        assert_no_horizontal_overflow(page)
+        page.screenshot(path="/tmp/sandevistan-read-provider-desktop.png")
+        settings.get_by_role("button", name=re.compile("返回 Provider 列表")).click()
+        discard = page.get_by_role("dialog", name="放弃未保存的 Provider 配置？")
+        assert discard.is_visible()
+        discard.get_by_role("button", name="放弃修改").click()
+        assert settings.get_by_role("button", name="添加 Provider").is_visible()
         page.keyboard.press("Escape")
         assert settings.count() == 0
 
@@ -150,6 +201,17 @@ def main() -> None:
         mobile.get_by_role("button", name="Studio", exact=True).click()
         assert mobile.locator(".workspace > .studio").is_visible()
         mobile.screenshot(path="/tmp/sandevistan-read-ui-mobile.png")
+
+        mobile.get_by_role("button", name="设置").click()
+        mobile_settings = mobile.get_by_role("dialog", name="Provider 配置")
+        mobile_settings.get_by_role("button", name="添加 Provider").click()
+        assert mobile_settings.get_by_role("heading", name="添加 Provider").is_visible()
+        assert_no_horizontal_overflow(mobile)
+        panel_metrics = mobile_settings.evaluate("element => ({scroll: element.scrollWidth, client: element.clientWidth})")
+        assert panel_metrics["scroll"] <= panel_metrics["client"], panel_metrics
+        mobile.screenshot(path="/tmp/sandevistan-read-provider-mobile.png")
+        mobile.keyboard.press("Escape")
+        assert mobile_settings.count() == 0
 
         mobile.goto(f"{BASE_URL}/#jobs", wait_until="networkidle")
         mobile.wait_for_function(

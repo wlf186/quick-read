@@ -4,7 +4,12 @@ export type Citation={id:string;filename:string;locator:Record<string,unknown>;q
 export type Job={id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
 export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:number};
 export type Artifact={id:string;type:'summary'|'quiz'|'flashcard'|'podcast';title:string;status:string;payload:Record<string,any>;citations:Citation[];media_url?:string;language:string};
-export type Provider={id:string;name:string;role:'main'|'vlm'|'tts';kind:string;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>;config:Record<string,any>};
+export type ProviderRole='main'|'vlm'|'tts';
+export type ProviderKind='ollama'|'openai'|'sandevistan_tts'|'openai_tts';
+export type Provider={id:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>;config:Record<string,any>};
+export type ProviderModel={id:string;name:string;installed?:boolean;devices?:Array<{id:string;available:boolean;precision?:string;reason?:string}>;controls?:Record<string,any>;details?:Record<string,any>};
+export type ProviderInspection={status:'passed'|'warning'|'failed';connection_ok:boolean;activation_eligible:boolean;latency_ms:number;catalog_supported:boolean;models:ProviderModel[];capabilities:Record<string,any>;recommended?:{model?:string;compute_device?:string}|null;warning?:string|null;error?:{code:string;stage:string;message:string;hint:string;upstream_status?:number|null}|null};
+export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:Record<string,any>};
 export type PodcastOptions={duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
 export type AuthStatus={required:boolean;authenticated:boolean};
 
@@ -13,7 +18,7 @@ function storedToken(){try{return localStorage.getItem('sread_token')}catch{retu
 function saveToken(token:string){try{localStorage.setItem('sread_token',token)}catch{/* The secure cookie remains the source of truth. */}}
 export function clearSession(){try{localStorage.removeItem('sread_token')}catch{/* Storage may be unavailable. */}}
 export async function authStatus(){const headers=new Headers();const token=storedToken();if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch('/auth/status',{headers});if(!response.ok)throw new Error('无法确认访问状态');return response.json() as Promise<AuthStatus>}
-export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));throw new Error(body.detail||body.error||'请求失败')}if(response.status===204)return undefined as T;return response.json()}
+export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));const detail=body.detail;const message=typeof detail==='string'?detail:detail?.message||detail?.inspection?.error?.message||body.error||'请求失败';throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
 export async function login(access_key:string){const response=await fetch('/auth/login',{method:'POST',headers:jsonHeaders,body:JSON.stringify({access_key})});if(!response.ok)throw new Error('访问密钥错误');const result=await response.json();saveToken(result.token);return result}
 export const getNotebooks=()=>api<Notebook[]>('/notebooks');
 export const createNotebook=(title:string,description='')=>api<Notebook>('/notebooks',{method:'POST',headers:jsonHeaders,body:JSON.stringify({title,description})});
@@ -42,7 +47,8 @@ export const getSummary=(id:string)=>api<any>(`/notebooks/${id}/summary`);
 export const submitQuiz=(id:string,answers:Record<string,number>)=>api<any>(`/artifacts/${id}/quiz/submit`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({answers})});
 export const reviewFlashcard=(id:string,card_id:string,rating:string)=>api<any>(`/artifacts/${id}/flashcards/review`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({card_id,rating})});
 export const getProviders=()=>api<Provider[]>('/providers');
-export const createProvider=(body:Record<string,any>)=>api<{id:string}>('/providers',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
+export const createProvider=(body:Record<string,any>)=>api<{id:string;active:boolean;inspection?:ProviderInspection}>('/providers',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
 export const updateProvider=(id:string,body:Record<string,any>)=>api(`/providers/${id}`,{method:'PATCH',headers:jsonHeaders,body:JSON.stringify(body)});
+export const inspectProvider=(body:Omit<ProviderDraft,'name'>&{mode:'catalog'|'deep'})=>api<ProviderInspection>('/providers/inspect',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
 export const testProvider=(id:string)=>api<any>(`/providers/${id}/test`,{method:'POST'});
 export const probeProvider=(id:string)=>api<any>(`/providers/${id}/probe`,{method:'POST'});
