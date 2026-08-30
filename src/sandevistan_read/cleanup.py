@@ -83,6 +83,36 @@ def request_notebook_delete(notebook_id: str) -> str:
     return operation_id
 
 
+def request_notebook_deletes(notebook_ids: list[str]) -> list[dict[str, Any]]:
+    """Queue deletions for active notebooks and report each accepted target."""
+    unique_ids = list(dict.fromkeys(notebook_ids))
+    results: list[dict[str, Any]] = []
+    with DB.transaction() as connection:
+        for notebook_id in unique_ids:
+            row = connection.execute("SELECT state FROM notebooks WHERE id=?", (notebook_id,)).fetchone()
+            if not row:
+                results.append({"id": notebook_id, "accepted": False, "error": "Notebook 不存在"})
+                continue
+            if row["state"] != "active":
+                results.append({"id": notebook_id, "accepted": False, "error": "Notebook 当前状态不可删除"})
+                continue
+            operation_id, now = new_id("cleanup"), utc_now()
+            connection.execute(
+                "UPDATE jobs SET cancel_requested=1,state=CASE WHEN state='running' THEN 'cancelling' ELSE state END,updated_at=? WHERE notebook_id=? AND state IN ('queued','running','cancelling')",
+                (now, notebook_id),
+            )
+            connection.execute(
+                "UPDATE notebooks SET state='deleting',deletion_requested_at=?,cleanup_error=NULL,updated_at=? WHERE id=?",
+                (now, now, notebook_id),
+            )
+            connection.execute(
+                "INSERT INTO cleanup_operations VALUES(?,?,?,?,?,?,?,?,?)",
+                (operation_id, "notebook", notebook_id, "queued", "waiting_for_jobs", None, now, now, None),
+            )
+            results.append({"id": notebook_id, "accepted": True, "operation_id": operation_id})
+    return results
+
+
 def process_cleanup_operations() -> None:
     operations = DB.fetchall("SELECT * FROM cleanup_operations WHERE state IN ('queued','running') ORDER BY created_at")
     for operation in operations:

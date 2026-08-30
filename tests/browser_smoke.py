@@ -160,12 +160,48 @@ def main() -> None:
         assert job_dialog.count() == 0
         page.screenshot(path="/tmp/sandevistan-read-ui-jobs-desktop.png")
 
+        notebook_items = [
+            {"id": "nb_batch_a", "title": "Batch QA A", "description": "第一项", "state": "active", "source_count": 2, "source_bytes": 2048, "artifact_count": 1, "active_jobs": 0},
+            {"id": "nb_batch_b", "title": "Batch QA B", "description": "第二项", "state": "active", "source_count": 3, "source_bytes": 4096, "artifact_count": 2, "active_jobs": 1},
+            {"id": "nb_batch_busy", "title": "Batch QA Deleting", "description": "不可选择", "state": "deleting", "source_count": 1, "source_bytes": 1024, "artifact_count": 0, "active_jobs": 0},
+        ]
+
+        def notebook_management(route) -> None:
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"items": notebook_items, "page": 1, "page_size": 20, "total": len(notebook_items), "pages": 1}),
+            )
+
+        page.route("**/api/notebook-management?*", notebook_management)
         page.goto(f"{BASE_URL}/#notebooks", wait_until="networkidle")
         page.get_by_role("button", name="新建 Notebook").click()
         create_dialog = page.get_by_role("dialog", name="新建 Notebook")
         assert create_dialog.is_visible()
         page.keyboard.press("Escape")
         assert create_dialog.count() == 0
+
+        first_batch_checkbox = page.get_by_role("checkbox", name="选择 Batch QA A")
+        second_batch_checkbox = page.get_by_role("checkbox", name="选择 Batch QA B")
+        unavailable_checkbox = page.get_by_role("checkbox", name="选择 Batch QA Deleting")
+        assert unavailable_checkbox.is_disabled()
+        first_batch_checkbox.check()
+        second_batch_checkbox.check()
+        assert page.get_by_role("button", name="删除 2", exact=True).is_enabled()
+        assert page.get_by_role("checkbox", name="选择本页可删除 Notebook").is_checked()
+        page.get_by_role("button", name="删除 2", exact=True).click()
+        batch_dialog = page.get_by_role("dialog", name="批量删除 2 个 Notebook")
+        assert batch_dialog.is_visible()
+        assert batch_dialog.get_by_text("Batch QA A", exact=True).is_visible()
+        assert batch_dialog.get_by_text("Batch QA B", exact=True).is_visible()
+        batch_confirm = batch_dialog.get_by_role("button", name="删除 2 个 Notebook")
+        assert batch_confirm.is_disabled()
+        batch_dialog.locator("input").fill("批量删除")
+        assert batch_confirm.is_enabled()
+        page.screenshot(path="/tmp/sandevistan-read-ui-notebooks-batch-desktop.png")
+        page.keyboard.press("Escape")
+        assert batch_dialog.count() == 0
+        page.get_by_role("checkbox", name="选择本页可删除 Notebook").uncheck()
 
         first_row = page.locator(".notebook-grid.manage-row").first
         notebook_title = first_row.locator(".record-title b").inner_text()
@@ -220,6 +256,25 @@ def main() -> None:
         assert mobile.locator(".record-open").count() > 0
         assert_no_horizontal_overflow(mobile)
         mobile.screenshot(path="/tmp/sandevistan-read-ui-jobs-mobile.png")
+
+        mobile.route("**/api/notebook-management?*", notebook_management)
+        mobile.goto(f"{BASE_URL}/#notebooks", wait_until="networkidle")
+        mobile.wait_for_function(
+            "document.querySelector('.manage-table')?.getAttribute('aria-busy') === 'false' && "
+            "document.querySelectorAll('.notebook-grid.manage-row').length === 3"
+        )
+        assert mobile.get_by_role("button", name="打开 Batch QA A").is_visible()
+        assert mobile.locator(".notebook-grid.manage-row").first.get_by_text("2 FILES", exact=True).is_visible()
+        assert mobile.locator(".state-pill.active").first.is_visible()
+        mobile.get_by_role("checkbox", name="选择 Batch QA A").check()
+        mobile.get_by_role("checkbox", name="选择 Batch QA B").check()
+        mobile.get_by_role("button", name="删除 2", exact=True).click()
+        mobile_batch_dialog = mobile.get_by_role("dialog", name="批量删除 2 个 Notebook")
+        assert mobile_batch_dialog.is_visible()
+        assert_no_horizontal_overflow(mobile)
+        mobile.screenshot(path="/tmp/sandevistan-read-ui-notebooks-batch-mobile.png")
+        mobile.keyboard.press("Escape")
+        assert mobile_batch_dialog.count() == 0
         browser.close()
 
     if console_errors:

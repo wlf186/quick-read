@@ -15,6 +15,10 @@ class NotebookUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
 
 
+class NotebookBatchDelete(BaseModel):
+    notebook_ids: list[str] = Field(min_length=1, max_length=100)
+
+
 class SourceSelection(BaseModel):
     selected: bool
 

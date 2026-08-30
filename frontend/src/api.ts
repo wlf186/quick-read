@@ -1,5 +1,7 @@
 export type Source={id:string;filename:string;state:string;selected:number;page_count:number;parser?:string;error?:string;metadata?:Record<string,any>};
 export type Notebook={id:string;title:string;description:string;state?:string;sources?:Source[];source_count?:number;source_bytes?:number;artifact_count?:number;active_jobs?:number;cleanup_error?:string};
+export type NotebookDeleteResult={id:string;accepted:boolean;operation_id?:string;error?:string};
+export type NotebookBatchDeleteResponse={items:NotebookDeleteResult[]};
 export type Citation={id:string;filename:string;locator:Record<string,unknown>;quote:string;source_id:string};
 export type Job={id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
 export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:number};
@@ -23,6 +25,7 @@ export async function login(access_key:string){const response=await fetch('/auth
 export const getNotebooks=()=>api<Notebook[]>('/notebooks');
 export const createNotebook=(title:string,description='')=>api<Notebook>('/notebooks',{method:'POST',headers:jsonHeaders,body:JSON.stringify({title,description})});
 export const deleteNotebook=(id:string)=>api<void>(`/notebooks/${id}`,{method:'DELETE'});
+export const batchDeleteNotebooks=(notebook_ids:string[])=>api<NotebookBatchDeleteResponse>('/notebooks/batch-delete',{method:'POST',headers:jsonHeaders,body:JSON.stringify({notebook_ids})});
 export const getNotebook=(id:string)=>api<Notebook>(`/notebooks/${id}`);
 export const getStatus=()=>api<any>('/status');
 export const selectSource=(id:string,selected:boolean)=>api(`/sources/${id}/selection`,{method:'PATCH',headers:jsonHeaders,body:JSON.stringify({selected})});

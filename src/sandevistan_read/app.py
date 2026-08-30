@@ -15,12 +15,12 @@ from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import SUPPORTED_EXTENSIONS, sanitize_filename
 from .jobs import WORKER, enqueue
-from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete
+from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete, request_notebook_deletes
 from .observability import Reporter, present_job
 from .paths import PATHS
 from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_tts_provider, provider_by_id
 from .retrieval import EMBEDDINGS
-from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, LoginRequest, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizRequest, QuizSubmission, SourceSelection, SummaryRequest
+from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizRequest, QuizSubmission, SourceSelection, SummaryRequest
 from .security import VAULT
 from .services import grounded_generate, source_scope
 
@@ -115,6 +115,11 @@ def notebook_management(q: str = "", state: str = "all", page: int = Query(1, ge
 @api.post("/notebooks")
 def create_notebook(body: NotebookCreate):
     identifier, now = new_id("nb"), utc_now(); DB.execute("INSERT INTO notebooks(id,title,description,created_at,updated_at) VALUES(?,?,?,?,?)", (identifier, body.title, body.description, now, now)); return normalize(DB.fetchone("SELECT * FROM notebooks WHERE id=?", (identifier,)) or {})
+
+
+@api.post("/notebooks/batch-delete", status_code=202)
+def batch_delete_notebooks(body: NotebookBatchDelete):
+    return {"items": request_notebook_deletes(body.notebook_ids)}
 
 
 @api.patch("/notebooks/{notebook_id}")

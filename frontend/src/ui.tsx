@@ -62,10 +62,11 @@ type ConfirmDialogProps={
   onCancel:()=>void;
   onConfirm:()=>Promise<void>;
   requireText?:string;
+  items?:string[];
   danger?:boolean;
 };
 
-export function ConfirmDialog({title,description,confirmLabel,onCancel,onConfirm,requireText,danger=true}:ConfirmDialogProps){
+export function ConfirmDialog({title,description,confirmLabel,onCancel,onConfirm,requireText,items,danger=true}:ConfirmDialogProps){
   const[value,setValue]=useState('');
   const[busy,setBusy]=useState(false);
   async function submit(){
@@ -76,7 +77,8 @@ export function ConfirmDialog({title,description,confirmLabel,onCancel,onConfirm
     <span>{danger?'DANGER // CONFIRM ACTION':'CONFIRM ACTION'}</span>
     <h2>{title}</h2>
     <p>{description}</p>
-    {requireText!==undefined?<label>输入完整名称确认
+    {items?.length?<ul className="confirm-items">{items.map((item,index)=><li key={`${item}-${index}`}>{item}</li>)}</ul>:null}
+    {requireText!==undefined?<label>输入下方内容确认
       <input data-autofocus value={value} onChange={event=>setValue(event.target.value)} placeholder={requireText}/>
     </label>:null}
     <div className="confirm-actions">

@@ -52,6 +52,14 @@ export default function App(){
     else notify(message,'error');
   },[notify]);
 
+  const reconcileNotebooks=useCallback((list:Notebook[])=>{
+    setNotebooks(list);
+    setActiveId(current=>{
+      if(current&&list.some(item=>item.id===current))return current;
+      const next=list[0]?.id||'';persistNotebook(next);return next;
+    });
+  },[]);
+
   const initialize=useCallback(async()=>{
     setBootError('');setPhase('loading');
     try{
@@ -70,10 +78,11 @@ export default function App(){
 
   const loadGlobal=useCallback(async()=>{
     const[list,nextProviders]=await Promise.all([getNotebooks(),getProviders()]);
-    setNotebooks(list);setProviders(nextProviders);
-    if(!activeId||!list.some(item=>item.id===activeId)){const next=list[0]?.id||'';setActiveId(next);persistNotebook(next)}
+    reconcileNotebooks(list);setProviders(nextProviders);
     void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}));
-  },[activeId]);
+  },[reconcileNotebooks]);
+
+  const refreshNotebooks=useCallback(async()=>reconcileNotebooks(await getNotebooks()),[reconcileNotebooks]);
 
   const loadCurrent=useCallback(async(id:string,loadHistory=false)=>{
     const sequence=++loadSequence.current;
@@ -151,7 +160,7 @@ export default function App(){
   const studio=<StudioRail hasNotebook={Boolean(notebook)} selectedCount={selected.length} onCreate={onCreate} onOpen={setOpenedArtifact} artifacts={artifacts} jobs={jobs}/>;
   return <div className={`shell route-${route}`}>
     <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={setActiveId} onCreate={onCreateNotebook} onSettings={()=>setSettings(true)}/>
-    {route==='jobs'?<JobsPage onError={reportError}/>:route==='notebooks'?<NotebooksPage onError={reportError} onOpen={id=>{setActiveId(id);location.hash='workspace'}}/>:<section className="workspace-shell">
+    {route==='jobs'?<JobsPage onError={reportError}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{setActiveId(id);location.hash='workspace'}}/>:<section className="workspace-shell">
       <nav className="workspace-tabs" aria-label="工作区面板">
         <button className={workspacePanel==='chat'?'active':''} aria-pressed={workspacePanel==='chat'} onClick={()=>setWorkspacePanel('chat')}><MessageSquare/>对话</button>
         <button className={workspacePanel==='sources'?'active':''} aria-pressed={workspacePanel==='sources'} onClick={()=>setWorkspacePanel('sources')}><BookOpen/>资料 <b>{selected.length}</b></button>
