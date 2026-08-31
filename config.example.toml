@@ -23,6 +23,6 @@ ffmpeg = ""
 libreoffice = ""
 
 [development]
-ollama_url = "http://iollama:11434"
+ollama_url = "http://127.0.0.1:11434"
 ollama_model = "qwen3.5:2b"
-tts_url = "http://localhost:20810"
+tts_url = "http://127.0.0.1:20810"

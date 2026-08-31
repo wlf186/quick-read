@@ -1,0 +1,61 @@
+name: Windows smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache project downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            runtime/cache/uv
+            runtime/cache/pnpm-store
+            runtime/models
+          key: windows-bootstrap-${{ hashFiles('uv.lock', 'frontend/pnpm-lock.yaml', 'scripts/tools.lock.json') }}
+
+      - name: Bootstrap native Windows environment
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          .\scripts\bootstrap.ps1
+
+      - name: Verify installed media tools
+        shell: powershell
+        run: |
+          if (-not (Test-Path .tools\ffmpeg\bin\ffmpeg.exe)) { throw "FFmpeg was not installed" }
+          if (-not (Test-Path .tools\libreoffice\program\soffice.exe)) { throw "LibreOffice was not installed" }
+          .\.tools\ffmpeg\bin\ffmpeg.exe -version | Select-Object -First 1
+          .\.tools\libreoffice\program\soffice.exe --headless --version
+
+      - name: Run backend tests
+        shell: powershell
+        run: .\.venv\Scripts\python.exe -m pytest -q
+
+      - name: Check frontend
+        shell: powershell
+        run: corepack pnpm --dir frontend lint
+
+      - name: Start and probe application
+        shell: powershell
+        run: |
+          try {
+            .\scripts\start.ps1
+            $Status = Invoke-RestMethod http://127.0.0.1:20830/auth/status -TimeoutSec 10
+            if (-not $Status.authenticated) { throw "Local health probe was not authenticated" }
+          } finally {
+            .\scripts\stop.ps1
+          }

@@ -4,7 +4,7 @@
 
 ## 快速开始
 
-要求：Python 3.11–3.13、Node.js 20+、Corepack、Git、curl。引导脚本会下载经过 SHA-256 校验的 FFmpeg 9.0 LGPL 静态构建与 LibreOffice 26.2.5，并解压到项目内；不会调用系统包管理器或安装桌面组件。
+要求：Git、Node.js 20+ 和 Corepack（推荐 Node.js 24 LTS）；Linux/macOS 还需要 curl。引导脚本使用 `uv` 自动准备 Python 3.11–3.13，并下载经过 SHA-256 校验的 FFmpeg 9.0 LGPL 静态构建与 LibreOffice 26.2.5，全部解压到项目内；不会调用系统包管理器或安装桌面组件。
 
 Linux/macOS：
 
@@ -22,9 +22,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\start.ps1
 ```
 
+Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署、Ollama/云端 Provider/TTS 配置、更新备份和故障处理详见 [Windows 11 原生部署手册](docs/windows-deployment.md)。
+
 当前部署可在 `runtime/config.toml` 配置为监听 `0.0.0.0:20830`（需访问密钥）；本机浏览器打开 <http://127.0.0.1:20830>。停止服务运行 `scripts/stop.sh` 或 `scripts\stop.ps1`。
 
-首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://iollama:11434` 的 `qwen3.5:2b`，TTS 是 `http://localhost:20810`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
+首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://127.0.0.1:11434` 的 `qwen3.5:2b`，TTS 是 `http://127.0.0.1:20810`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
 
 ## Provider 配置
 

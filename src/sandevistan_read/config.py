@@ -100,9 +100,9 @@ class ToolConfig:
 
 @dataclass
 class DevelopmentConfig:
-    ollama_url: str = "http://iollama:11434"
+    ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:2b"
-    tts_url: str = "http://localhost:20810"
+    tts_url: str = "http://127.0.0.1:20810"
 
 
 @dataclass

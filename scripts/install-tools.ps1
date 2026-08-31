@@ -1,29 +1,22 @@
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$Lock = Get-Content (Join-Path $PSScriptRoot "tools.lock.json") -Raw | ConvertFrom-Json
+$LockPath = Join-Path $PSScriptRoot "tools.lock.json"
 $DownloadDir = Join-Path $ProjectRoot "runtime\cache\downloads"
 $TempRoot = Join-Path $ProjectRoot "runtime\tmp"
 $ToolsRoot = Join-Path $ProjectRoot ".tools"
+$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$Fetcher = Join-Path $PSScriptRoot "fetch-tool.py"
 New-Item -ItemType Directory -Force $DownloadDir,$TempRoot,$ToolsRoot | Out-Null
+if (-not (Test-Path $Python)) { throw "Python environment is missing. Run scripts\bootstrap.ps1 first." }
 
 $Architecture = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x86_64" }
 $Platform = "windows-$Architecture"
 
 function Get-VerifiedArchive($Tool) {
-    $Entry = $Lock.$Tool.$Platform
-    if (-not $Entry) { throw "Unsupported Windows platform: $Platform" }
-    $Name = Split-Path $Entry.url -Leaf
-    $Destination = Join-Path $DownloadDir $Name
-    if (Test-Path $Destination) {
-        $Actual = (Get-FileHash $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($Actual -ne $Entry.sha256) { Remove-Item $Destination -Force }
-    }
-    if (-not (Test-Path $Destination)) {
-        Write-Host "[$Tool] downloading $Name"
-        Invoke-WebRequest $Entry.url -OutFile $Destination
-    }
-    $Actual = (Get-FileHash $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($Actual -ne $Entry.sha256) { throw "[$Tool] SHA-256 verification failed" }
+    $Archive = & $Python $Fetcher --lock $LockPath --tool $Tool --platform $Platform --download-dir $DownloadDir
+    if ($LASTEXITCODE -ne 0) { throw "[$Tool] verified download failed with exit code $LASTEXITCODE" }
+    $Destination = ($Archive | Select-Object -Last 1).Trim()
+    if (-not $Destination -or -not (Test-Path $Destination)) { throw "[$Tool] downloader did not return an archive" }
     return $Destination
 }
 
@@ -61,6 +54,8 @@ if (-not (Test-Path $SofficeExe)) {
 }
 
 & $FfmpegExe -version | Select-Object -First 1
+if ($LASTEXITCODE -ne 0) { throw "FFmpeg verification failed with exit code $LASTEXITCODE" }
 $env:SAL_USE_VCLPLUGIN = "svp"
 & $SofficeExe --headless --version
+if ($LASTEXITCODE -ne 0) { throw "LibreOffice verification failed with exit code $LASTEXITCODE" }
 Write-Host "Project-local media tools are ready."

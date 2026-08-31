@@ -14,38 +14,9 @@ case "$(uname -m)" in
   *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-lock_value() {
-  "$PROJECT_ROOT/.venv/bin/python" - "$LOCK_FILE" "$1" "$PLATFORM" "$2" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    data = json.load(handle)
-print(data[sys.argv[2]][sys.argv[3]][sys.argv[4]])
-PY
-}
-
 download_verified() {
-  local tool="$1" url sha destination partial actual
-  url="$(lock_value "$tool" url)"
-  sha="$(lock_value "$tool" sha256)"
-  destination="$DOWNLOAD_DIR/${url##*/}"
-  partial="$destination.part"
-  if [[ -f "$destination" ]]; then
-    actual="$(sha256sum "$destination" | awk '{print $1}')"
-    if [[ "$actual" != "$sha" ]]; then
-      echo "[$tool] cached archive checksum mismatch; downloading again" >&2
-      unlink "$destination"
-    fi
-  fi
-  if [[ ! -f "$destination" ]]; then
-    echo "[$tool] downloading ${url##*/}" >&2
-    curl --fail --location --retry 6 --retry-all-errors --connect-timeout 20 --speed-time 30 --speed-limit 1024 --continue-at - --output "$partial" "$url"
-    actual="$(sha256sum "$partial" | awk '{print $1}')"
-    [[ "$actual" == "$sha" ]] || { echo "[$tool] SHA-256 verification failed" >&2; exit 1; }
-    mv "$partial" "$destination"
-  fi
-  actual="$(sha256sum "$destination" | awk '{print $1}')"
-  [[ "$actual" == "$sha" ]] || { echo "[$tool] SHA-256 verification failed" >&2; exit 1; }
-  printf '%s\n' "$destination"
+  "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/scripts/fetch-tool.py" \
+    --lock "$LOCK_FILE" --tool "$1" --platform "$PLATFORM" --download-dir "$DOWNLOAD_DIR"
 }
 
 if [[ ! -x "$TOOLS_ROOT/ffmpeg/bin/ffmpeg" ]]; then
