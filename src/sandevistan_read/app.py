@@ -18,11 +18,12 @@ from .jobs import WORKER, enqueue
 from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete, request_notebook_deletes
 from .observability import Reporter, present_job
 from .paths import PATHS
-from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_tts_provider, provider_by_id
+from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_chat_provider, probe_tts_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
 from .retrieval import EMBEDDINGS
-from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizRequest, QuizSubmission, SourceSelection, SummaryRequest
+from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSessionReview, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizAnswer, QuizRequest, QuizSubmission, SourceSelection, StudySessionCreate, SummaryRequest
 from .security import VAULT
 from .services import grounded_generate, source_scope
+from .study_sessions import answer_quiz, create_session, flashcards_csv, get_session, public_artifact, review_flashcard, suspend_flashcard
 
 
 @asynccontextmanager
@@ -35,8 +36,12 @@ async def lifespan(app: FastAPI):
             await probe_tts_provider(tts["id"], apply_defaults=True)
         except Exception:
             pass
+    refresh_task = asyncio.create_task(refresh_active_chat_capabilities())
     WORKER.start()
     yield
+    if not refresh_task.done():
+        refresh_task.cancel()
+    await asyncio.gather(refresh_task, return_exceptions=True)
     await WORKER.stop()
 
 
@@ -250,11 +255,24 @@ async def ask(notebook_id: str, body: ChatRequest):
             raise HTTPException(404, "当前笔记本中不存在该对话")
     else:
         conversation_id = new_id("conversation"); DB.execute("INSERT INTO conversations VALUES(?,?,?,?,?)", (conversation_id, notebook_id, body.question[:80], now, now))
-    DB.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)", (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", now))
+    DB.execute(
+        """INSERT INTO messages
+        (id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
+        (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", "{}", now),
+    )
     result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language)
-    message_id = new_id("message"); DB.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)", (message_id, conversation_id, "assistant", result["content"], json_dump(result["citations"]), result["scope_hash"], "complete", utc_now()))
+    context_usage = result.pop("context_usage", {})
+    metadata = {"context_usage": context_usage}
+    message_id = new_id("message")
+    DB.execute(
+        """INSERT INTO messages
+        (id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
+        (message_id, conversation_id, "assistant", result["content"], json_dump(result["citations"]), result["scope_hash"], "complete", json_dump(metadata), utc_now()),
+    )
     DB.execute("UPDATE conversations SET updated_at=? WHERE id=?", (utc_now(), conversation_id))
-    return {"id": message_id, "conversation_id": conversation_id, **result}
+    return {"id": message_id, "conversation_id": conversation_id, **result, "metadata": metadata}
 
 
 @api.get("/notebooks/{notebook_id}/conversations")
@@ -293,7 +311,7 @@ def artifacts(notebook_id: str, type: str | None = None):
     for item in output:
         if item.get("media_path"):
             item["media_url"] = f"/api/artifacts/{item['id']}/media"
-    return output
+    return [public_artifact(item) for item in output]
 
 
 @api.get("/artifacts/{artifact_id}")
@@ -304,7 +322,7 @@ def artifact(artifact_id: str):
     item = normalize(row)
     if item.get("media_path"):
         item["media_url"] = f"/api/artifacts/{item['id']}/media"
-    return item
+    return public_artifact(item)
 
 
 @api.get("/artifacts/{artifact_id}/media")
@@ -317,18 +335,80 @@ def artifact_media(artifact_id: str):
 
 @api.post("/artifacts/{artifact_id}/quiz/submit")
 def submit_quiz(artifact_id: str, body: QuizSubmission):
-    row = DB.fetchone("SELECT payload_json FROM artifacts WHERE id=? AND type='quiz'", (artifact_id,));
-    if not row: raise HTTPException(404, "题库不存在")
-    items = json_load(row["payload_json"], {}).get("items", []); correct = sum(1 for item in items if body.answers.get(item["id"]) == item["answer"]); score = correct / max(1, len(items)); DB.execute("INSERT INTO quiz_attempts VALUES(?,?,?,?,?)", (new_id("attempt"), artifact_id, json_dump(body.answers), score, utc_now())); return {"score": score, "correct": correct, "total": len(items)}
+    try:
+        session = create_session(artifact_id, "all")
+        session_ids = {item.get("id") for item in session["items"]}
+        unknown = set(body.answers) - session_ids
+        if unknown:
+            raise ValueError("提交包含不属于当前题库的题目")
+        response = None
+        for item_id, option_index in body.answers.items():
+            response = answer_quiz(session["id"], item_id, option_index)
+        latest = (response or {"session": get_session(session["id"])})["session"]
+        results = [item["result"] for item in latest["items"] if item.get("result")]
+        correct = sum(bool(item["correct"]) for item in results)
+        return {"session_id": session["id"], "score": correct / max(1, len(results)), "correct": correct, "total": len(results), "results": results}
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @api.post("/artifacts/{artifact_id}/flashcards/review")
 def review(artifact_id: str, body: FlashcardReview):
-    row = DB.fetchone("SELECT payload_json FROM artifacts WHERE id=? AND type='flashcard'", (artifact_id,))
-    cards = json_load(row["payload_json"], {}).get("items", []) if row else []
-    if not row or body.card_id not in {card.get("id") for card in cards}:
-        raise HTTPException(404, "闪卡不存在")
-    DB.execute("INSERT INTO flashcard_reviews VALUES(?,?,?,?,?)", (new_id("review"), artifact_id, body.card_id, body.rating, utc_now())); return {"ok": True}
+    try:
+        session_id = body.session_id or create_session(artifact_id, "all")["id"]
+        return {"ok": True, **review_flashcard(session_id, body.card_id, body.rating)}
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@api.post("/artifacts/{artifact_id}/study-sessions")
+def start_study_session(artifact_id: str, body: StudySessionCreate):
+    try:
+        return create_session(artifact_id, body.mode, body.shuffle)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@api.get("/study-sessions/{session_id}")
+def study_session(session_id: str):
+    try:
+        return get_session(session_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@api.post("/study-sessions/{session_id}/quiz-answer")
+def study_quiz_answer(session_id: str, body: QuizAnswer):
+    try:
+        return answer_quiz(session_id, body.item_id, body.option_index)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@api.post("/study-sessions/{session_id}/flashcard-review")
+def study_flashcard_review(session_id: str, body: FlashcardSessionReview):
+    try:
+        return review_flashcard(session_id, body.item_id, body.rating)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@api.delete("/artifacts/{artifact_id}/flashcards/{card_id}", status_code=204)
+def hide_flashcard(artifact_id: str, card_id: str):
+    try:
+        suspend_flashcard(artifact_id, card_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return Response(status_code=204)
+
+
+@api.get("/artifacts/{artifact_id}/flashcards.csv")
+def export_flashcards(artifact_id: str):
+    try:
+        content = flashcards_csv(artifact_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return Response(content=content, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=flashcards.csv"})
 
 
 @api.get("/jobs")
@@ -389,7 +469,10 @@ def batch_purge(job_ids: list[str] = Body(..., embed=True)):
 def providers():
     rows = []
     for row in DB.fetchall("SELECT * FROM provider_profiles ORDER BY role,name"):
-        has_api_key = bool(row.get("secret_enc")); item = normalize(row); item.pop("secret_enc", None); item["has_api_key"] = has_api_key; rows.append(item)
+        has_api_key = bool(row.get("secret_enc")); item = normalize(row); item.pop("secret_enc", None); item["has_api_key"] = has_api_key
+        if item.get("role") in {"main", "vlm"}:
+            item.setdefault("capabilities", {})["study_generation"] = study_generation_profile(item)
+        rows.append(item)
     return rows
 
 
@@ -524,12 +607,12 @@ async def probe_provider(provider_id: str):
     row = DB.fetchone("SELECT role FROM provider_profiles WHERE id=?", (provider_id,))
     if not row:
         raise HTTPException(404, "Provider 不存在")
-    if row["role"] != "tts":
-        raise HTTPException(409, "仅 TTS Provider 支持能力探测")
     try:
-        return await probe_tts_provider(provider_id, apply_defaults=True)
+        if row["role"] == "tts":
+            return await probe_tts_provider(provider_id, apply_defaults=True)
+        return await probe_chat_provider(provider_id, apply=True)
     except Exception as exc:
-        raise HTTPException(502, f"TTS 能力探测失败：{exc}") from exc
+        raise HTTPException(502, f"Provider 能力探测失败：{exc}") from exc
 
 
 app.mount("/api", api)

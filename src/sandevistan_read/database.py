@@ -137,6 +137,7 @@ class Database:
             citations_json TEXT NOT NULL DEFAULT '[]',
             scope_hash TEXT,
             state TEXT NOT NULL DEFAULT 'complete',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
@@ -195,6 +196,8 @@ class Database:
             artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
             answers_json TEXT NOT NULL,
             score REAL NOT NULL,
+            session_id TEXT,
+            results_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS flashcard_reviews (
@@ -204,6 +207,31 @@ class Database:
             rating TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS study_sessions (
+            id TEXT PRIMARY KEY,
+            artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            item_ids_json TEXT NOT NULL,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_study_sessions_artifact ON study_sessions(artifact_id, kind, status, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS flashcard_states (
+            artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+            card_id TEXT NOT NULL,
+            fsrs_json TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            last_rating TEXT,
+            suspended INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(artifact_id, card_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_flashcard_states_due ON flashcard_states(artifact_id, suspended, due_at);
         """
         with self.connect() as connection:
             connection.executescript(schema)
@@ -213,6 +241,8 @@ class Database:
             )
             connection.commit()
         self._migrate_v2()
+        self._migrate_v3()
+        self._migrate_v4()
         with self.transaction() as connection:
             connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
                 WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
@@ -303,6 +333,77 @@ class Database:
             connection.execute("UPDATE jobs SET display_name=CASE kind WHEN 'ingest' THEN '文档解析' WHEN 'summary' THEN '生成摘要' WHEN 'quiz' THEN 'Quiz 题库' WHEN 'flashcard' THEN 'Flashcard 闪卡' WHEN 'podcast' THEN '双人音频播客' ELSE kind END WHERE display_name='' OR display_name IS NULL")
             connection.execute("UPDATE jobs SET stage_code=CASE WHEN state='complete' THEN 'complete' WHEN state='failed' THEN 'failed' WHEN state='cancelled' THEN 'cancelled' WHEN state='running' THEN 'recovering' ELSE 'queued' END")
             connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(2, ?)", (utc_now(),))
+
+    def _migrate_v3(self) -> None:
+        """Persist per-message generation metadata without rewriting history."""
+        current = self.fetchone("SELECT MAX(version) AS version FROM schema_versions") or {}
+        if int(current.get("version") or 0) >= 3:
+            return
+        if self.path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = PATHS.backups / f"sandevistan-read.pre-v3.{stamp}.db"
+            source = sqlite3.connect(self.path)
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        with self.transaction() as connection:
+            message_columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+            if "metadata_json" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+            connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(3, ?)", (utc_now(),))
+
+    def _migrate_v4(self) -> None:
+        """Add resumable study sessions and FSRS state while preserving study history."""
+        current = self.fetchone("SELECT MAX(version) AS version FROM schema_versions") or {}
+        if int(current.get("version") or 0) >= 4:
+            return
+        if self.path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = PATHS.backups / f"sandevistan-read.pre-v4.{stamp}.db"
+            source = sqlite3.connect(self.path)
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        with self.transaction() as connection:
+            attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(quiz_attempts)")}
+            if "session_id" not in attempt_columns:
+                connection.execute("ALTER TABLE quiz_attempts ADD COLUMN session_id TEXT")
+            if "results_json" not in attempt_columns:
+                connection.execute("ALTER TABLE quiz_attempts ADD COLUMN results_json TEXT NOT NULL DEFAULT '{}'")
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS study_sessions (
+                    id TEXT PRIMARY KEY,
+                    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    item_ids_json TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_study_sessions_artifact ON study_sessions(artifact_id, kind, status, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS flashcard_states (
+                    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                    card_id TEXT NOT NULL,
+                    fsrs_json TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    last_rating TEXT,
+                    suspended INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(artifact_id, card_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flashcard_states_due ON flashcard_states(artifact_id, suspended, due_at);
+            """)
+            connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(4, ?)", (utc_now(),))
 
     def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
         with self.transaction() as connection:

@@ -1,7 +1,7 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {BookOpen,Headphones,MessageSquare} from 'lucide-react';
-import {ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SourceRail,StudioRail} from './components';
-import {authStatus,ask,createArtifact,createNotebook,createProvider,deleteSource,getArtifacts,getConversations,getJobs,getMessages,getNotebook,getNotebooks,getProviders,getStatus,inspectProvider,login,reviewFlashcard,selectSource,submitQuiz,updateProvider,upload,type Artifact,type Citation,type Job,type Notebook,type PodcastOptions,type Provider,type ProviderDraft,type ProviderInspection,type Source} from './api';
+import {ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SourceRail,StudioRail,StudyCreateModal} from './components';
+import {authStatus,ask,createArtifact,createNotebook,createProvider,deleteSource,getArtifacts,getConversations,getJobs,getMessages,getNotebook,getNotebooks,getProviders,getStatus,inspectProvider,login,reviewFlashcard,selectSource,submitQuiz,updateProvider,upload,type Artifact,type Citation,type Job,type Notebook,type PodcastOptions,type Provider,type ProviderDraft,type ProviderInspection,type Source,type StudyOptions} from './api';
 import {JobsPage,NotebooksPage} from './management';
 import {SettingsDrawer} from './provider_settings';
 import {Overlay} from './ui';
@@ -36,6 +36,7 @@ export default function App(){
   const[openedArtifact,setOpenedArtifact]=useState<Artifact|null>(null);
   const[settings,setSettings]=useState(false);
   const[podcastOpen,setPodcastOpen]=useState(false);
+  const[studyCreate,setStudyCreate]=useState<'quiz'|'flashcard'|null>(null);
   const[tabletStudio,setTabletStudio]=useState(false);
   const[workspacePanel,setWorkspacePanel]=useState<WorkspacePanel>('chat');
   const[artifacts,setArtifacts]=useState<Artifact[]>([]);
@@ -100,7 +101,7 @@ export default function App(){
 
   useEffect(()=>{void initialize()},[initialize]);
   useEffect(()=>{
-    const update=()=>{setRoute(routeFromHash());setCitation(null);setOpenedArtifact(null);setSettings(false);setPodcastOpen(false);setTabletStudio(false)};
+    const update=()=>{setRoute(routeFromHash());setCitation(null);setOpenedArtifact(null);setSettings(false);setPodcastOpen(false);setStudyCreate(null);setTabletStudio(false)};
     window.addEventListener('hashchange',update);return()=>window.removeEventListener('hashchange',update);
   },[]);
   useEffect(()=>{if(phase==='ready'){persistNotebook(activeId);void loadCurrent(activeId,true).catch(reportError)}},[activeId,loadCurrent,phase,reportError]);
@@ -132,7 +133,12 @@ export default function App(){
     if(!notebook){notify('请先新建或选择一个 Notebook','error');return}
     if(!selected.length){notify('请先选择至少一份已完成索引的资料','error');return}
     if(type==='podcasts'){setPodcastOpen(true);return}
+    if(type==='quiz'||type==='flashcards'){setStudyCreate(type==='quiz'?'quiz':'flashcard');return}
     try{await createArtifact(notebook.id,type,selected);notify('生成任务已进入本地队列','success');await loadCurrent(notebook.id)}catch(error){reportError(error)}
+  }
+  async function onCreateStudy(options:StudyOptions){
+    if(!notebook||!studyCreate)throw new Error('NO_NOTEBOOK');
+    try{await createArtifact(notebook.id,studyCreate==='flashcard'?'flashcards':'quiz',selected,options);setStudyCreate(null);notify(`${studyCreate==='quiz'?'QUIZ':'FLASHCARD'} · 正在构建知识蓝图并核验证据`,'success');await loadCurrent(notebook.id)}catch(error){reportError(error);throw error}
   }
   async function onCreatePodcast(options:PodcastOptions){
     if(!notebook)throw new Error('NO_NOTEBOOK');
@@ -157,6 +163,7 @@ export default function App(){
   if(phase==='locked')return <LoginScreen error={loginError} onLogin={async key=>{try{await login(key);setLoginError('');await initialize()}catch(error){const message=error instanceof Error?error.message:'认证失败';setLoginError(message);throw error}}}/>;
 
   const ttsProvider=providers.find(provider=>provider.role==='tts'&&provider.active);
+  const mainProvider=providers.find(provider=>provider.role==='main'&&provider.active);
   const studio=<StudioRail hasNotebook={Boolean(notebook)} selectedCount={selected.length} onCreate={onCreate} onOpen={setOpenedArtifact} artifacts={artifacts} jobs={jobs}/>;
   return <div className={`shell route-${route}`}>
     <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={setActiveId} onCreate={onCreateNotebook} onSettings={()=>setSettings(true)}/>
@@ -177,6 +184,7 @@ export default function App(){
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
     {settings?<SettingsDrawer status={status} providers={providers} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration}/>:null}
     {podcastOpen?<PodcastCreateModal provider={ttsProvider} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
+    {studyCreate?<StudyCreateModal kind={studyCreate} provider={mainProvider} sourceCount={selected.length} onClose={()=>setStudyCreate(null)} onCreate={onCreateStudy}/>:null}
     {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}><button className="drawer-close" data-autofocus onClick={()=>setTabletStudio(false)}>关闭 ×</button>{studio}</Overlay>:null}
     {toast?<div className={`toast toast-${toast.tone}`} role={toast.tone==='error'?'alert':'status'}><span>{toast.message}</span><button aria-label="关闭提示" onClick={()=>setToast(undefined)}>×</button></div>:null}
   </div>;

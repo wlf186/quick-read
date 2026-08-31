@@ -6,14 +6,35 @@ import re
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
+from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items
 from .database import DB, json_load
-from .providers import chat
+from .providers import PromptBuild, budgeted_chat
 from .retrieval import retrieve
 from .services import _evenly_spaced, scope_hash, source_scope
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
 SENTENCE_PATTERN = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n+")
+
+
+def _segment_prompt_build(
+    budget: PromptBudget,
+    *,
+    prefix: str,
+    items: list[dict[str, Any]],
+    renderer: Callable[[dict[str, Any]], str],
+    group_key: Callable[[dict[str, Any]], str] | None = None,
+) -> PromptBuild:
+    empty = [{"role": "user", "content": prefix}]
+    available = max(0, budget.input_tokens - estimate_messages_tokens(empty, budget.image_tokens_per_image) - 8)
+    packed = pack_items(items, renderer, available, group_key=group_key)
+    return PromptBuild(
+        [{"role": "user", "content": prefix + "\n".join(packed.texts)}],
+        packed.total,
+        len(packed.items),
+        packed.truncated,
+        {"items": packed.items},
+    )
 
 
 def resolve_podcast_language(source_ids: list[str], requested: str) -> str:
@@ -175,22 +196,38 @@ def _fallback_outline(cards: list[dict[str, Any]], language: str) -> list[dict[s
     return chapters
 
 
-async def create_podcast_outline(cards: list[dict[str, Any]], language: str, focus: str) -> tuple[list[dict[str, Any]], bool]:
+async def create_podcast_outline(cards: list[dict[str, Any]], language: str, focus: str, trace: ContextUsage | None = None) -> tuple[list[dict[str, Any]], bool]:
     language_rule = "只使用简体中文" if language != "en" else "Use English only"
-    compact = "\n".join(f"[{card['id']}] {card['filename']} · {card['content'][:520]}" for card in cards)
-    prompt = f"""你是严格依据资料的深度播客主编。{language_rule}。
+    prompt_prefix = f"""你是严格依据资料的深度播客主编。{language_rule}。
 只规划结构，不写脚本。把证据组织成 4 到 8 个逻辑递进的主题；优先解释机制、因果、反直觉点和资料内案例。禁止加入资料外背景。
 输出严格 JSON：{{"chapters":[{{"title":"","purpose":"","evidence_ids":["E1"]}}]}}。
 每章使用 3 到 8 个证据编号；只能使用已有 E 编号；多份资料时必须覆盖每一份。用户关注：{focus or '整体深度解读'}
 
 证据：
-{compact}"""
+"""
     valid_ids = {card["id"] for card in cards}
     source_by_id = {card["id"]: card["source_id"] for card in cards}
     try:
-        raw = await chat([{"role": "user", "content": prompt}], json_mode=True, max_tokens=2500, temperature=0.2)
+        generated = await budgeted_chat(
+            lambda budget: _segment_prompt_build(
+                budget,
+                prefix=prompt_prefix,
+                items=cards,
+                renderer=lambda card: f"[{card['id']}] {card['filename']} · {card['content'][:520]}",
+                group_key=lambda card: str(card["source_id"]),
+            ),
+            json_mode=True,
+            max_tokens=2500,
+            minimum_output_tokens=256,
+            temperature=0.2,
+            trace=trace,
+        )
+        raw = generated.content
+        valid_ids = {card["id"] for card in generated.build.metadata["items"]}
         candidate = _extract_json(raw).get("chapters") or []
     except Exception:
+        if trace:
+            trace.mark_fallback()
         candidate = []
     chapters: list[dict[str, Any]] = []
     for item in candidate[:8]:
@@ -315,34 +352,57 @@ def _safe_chapter_turns(cards: list[dict[str, Any]], target: int, language: str)
     return turns[:target]
 
 
-async def _critic_invalid_indexes(turns: list[dict[str, Any]], cards: list[dict[str, Any]], language: str) -> set[int]:
-    evidence = "\n".join(f"[{card['id']}] {card['content'][:900]}" for card in cards)
+async def _critic_invalid_indexes(turns: list[dict[str, Any]], cards: list[dict[str, Any]], language: str, trace: ContextUsage | None = None) -> set[int]:
     transcript = "\n".join(f"{index}: {turn['text']} ({','.join(turn['citation_ids'])})" for index, turn in enumerate(turns))
-    prompt = f"""你是事实审校器。逐条判断播客文本是否能被它标注的证据直接支持。反问或过渡可以通过；逻辑矛盾、资料外数字/实体、错误因果必须判为不支持。
+    prompt_prefix = f"""你是事实审校器。逐条判断播客文本是否能被它标注的证据直接支持。反问或过渡可以通过；逻辑矛盾、资料外数字/实体、错误因果必须判为不支持。
 只输出 JSON：{{"invalid_indexes":[0]}}。不要改写文本。语言={language}。
-证据：
-{evidence}
 文本：
-{transcript}"""
+{transcript}
+证据：
+"""
     try:
-        raw = await chat([{"role": "user", "content": prompt}], json_mode=True, max_tokens=800, temperature=0.0)
+        raw = (await budgeted_chat(
+            lambda budget: _segment_prompt_build(
+                budget,
+                prefix=prompt_prefix,
+                items=cards,
+                renderer=lambda card: f"[{card['id']}] {card['content'][:900]}",
+            ),
+            json_mode=True,
+            max_tokens=800,
+            minimum_output_tokens=128,
+            temperature=0.0,
+            trace=trace,
+        )).content
         values = _extract_json(raw).get("invalid_indexes") or []
         return {int(value) for value in values if isinstance(value, int) or str(value).isdigit()}
     except Exception:
         return set()
 
 
-async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str) -> set[int]:
-    evidence = "\n".join(f"{index}: {pair['support_quote']}" for index, pair in enumerate(pairs))
+async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str, trace: ContextUsage | None = None) -> set[int]:
     answers = "\n".join(f"{index}: {pair['answer']}" for index, pair in enumerate(pairs))
-    prompt = f"""你是严格的翻译忠实度审校器。逐项比较原文摘录与回答。回答必须只是摘录的忠实翻译或压缩改述；若新增因果、绝对化结论、实体、数字或摘录没有的判断，就判为不支持。
+    prompt_prefix = f"""你是严格的翻译忠实度审校器。逐项比较原文摘录与回答。回答必须只是摘录的忠实翻译或压缩改述；若新增因果、绝对化结论、实体、数字或摘录没有的判断，就判为不支持。
 只输出 JSON：{{"invalid_indexes":[0]}}。语言={language}。
-原文摘录：
-{evidence}
 回答：
-{answers}"""
+{answers}
+原文摘录：
+"""
+    indexed_pairs = [{**pair, "index": index} for index, pair in enumerate(pairs)]
     try:
-        raw = await chat([{"role": "user", "content": prompt}], json_mode=True, max_tokens=700, temperature=0.0)
+        raw = (await budgeted_chat(
+            lambda budget: _segment_prompt_build(
+                budget,
+                prefix=prompt_prefix,
+                items=indexed_pairs,
+                renderer=lambda pair: f"{pair['index']}: {pair['support_quote']}",
+            ),
+            json_mode=True,
+            max_tokens=700,
+            minimum_output_tokens=128,
+            temperature=0.0,
+            trace=trace,
+        )).content
         values = _extract_json(raw).get("invalid_indexes") or []
         return {int(value) for value in values if isinstance(value, int) or str(value).isdigit()}
     except Exception:
@@ -355,6 +415,7 @@ async def create_chapter_turns(
     target: int,
     language: str,
     episode_context: str,
+    trace: ContextUsage | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     cards = [cards_by_id[evidence_id] for evidence_id in chapter["evidence_ids"] if evidence_id in cards_by_id]
     language_rule = "只用自然的简体中文口语" if language != "en" else "Use natural spoken English only"
@@ -402,24 +463,38 @@ async def create_chapter_turns(
         available = [item for item in quote_bank if item["id"] not in attempted_ids]
         if not available:
             break
-        context = "\n".join(f"[{item['id']}|{item['evidence_id']}] {item['text']}" for item in available)
         used = ", ".join(sorted(attempted_ids)) or "（无）"
-        prompt = f"""你是严格依据资料的播客事实编辑。{language_rule}。只依据下列证据，不得补充常识、联想、评价或资料外因果。
+        prompt_prefix = f"""你是严格依据资料的播客事实编辑。{language_rule}。只依据下列证据，不得补充常识、联想、评价或资料外因果。
 输出严格 JSON：{{"pairs":[{{"quote_id":"Q1","answer":""}}]}}。
-生成 {remaining} 项，每项选择一个尚未使用的 Q 编号。answer 只能忠实翻译该 Q 摘录中的一个明确事实，原文过长时才压缩；不能提出问题。中文播客的 answer 必须是简体中文，不能直接复制英文原句；中文 25–90 字，英文 8–40 词。技术术语宁可保留英文也不要猜译；nonce 译为“随机数（nonce）”或“计数值（nonce）”，不得译为“非空值”。不要报幕、不要念编号。
+每项选择一个尚未使用的 Q 编号。answer 只能忠实翻译该 Q 摘录中的一个明确事实，原文过长时才压缩；不能提出问题。中文播客的 answer 必须是简体中文，不能直接复制英文原句；中文 25–90 字，英文 8–40 词。技术术语宁可保留英文也不要猜译；nonce 译为“随机数（nonce）”或“计数值（nonce）”，不得译为“非空值”。不要报幕、不要念编号。
 本章：{chapter['title']}；目的：{chapter['purpose']}；前文：{episode_context}
 不要再使用这些摘录：
 {used}
 预切分的逐字原文摘录（Q 编号 | 引用编号）：
-{context}"""
+"""
         try:
-            raw = await chat(
-                [{"role": "user", "content": prompt}],
+            def build(budget: PromptBudget) -> PromptBuild:
+                requested = max(1, min(remaining, max(1, (budget.output_tokens - 120) // 160)))
+                prefix = prompt_prefix.replace(
+                    "每项选择一个尚未使用的 Q 编号。",
+                    f"生成 {requested} 项，每项选择一个尚未使用的 Q 编号。",
+                )
+                return _segment_prompt_build(
+                    budget,
+                    prefix=prefix,
+                    items=available,
+                    renderer=lambda item: f"[{item['id']}|{item['evidence_id']}] {item['text']}",
+                )
+
+            generated = await budgeted_chat(
+                build,
                 json_mode=True,
                 max_tokens=min(4200, max(1600, remaining * 240)),
+                minimum_output_tokens=256,
                 temperature=0.25,
+                trace=trace,
             )
-            candidates = _extract_json(raw).get("pairs") or []
+            candidates = _extract_json(generated.content).get("pairs") or []
         except Exception:
             candidates = []
         new_pairs: list[dict[str, Any]] = []
@@ -478,7 +553,10 @@ async def create_chapter_turns(
             if any(_similar(item["text"], previous["text"]) > 0.78 for previous in accepted):
                 continue
             accepted.append(item)
-    return accepted[:target], generated_count < max(4, round(target * 0.8))
+    degraded = generated_count < max(4, round(target * 0.8))
+    if degraded and trace:
+        trace.mark_fallback()
+    return accepted[:target], degraded
 
 
 def _quality_metrics(
@@ -526,7 +604,8 @@ async def build_podcast_script(
         raise ValueError("资料内容不足，无法生成深度播客")
     if progress:
         progress("规划节目主题", 0.14)
-    chapters, outline_degraded = await create_podcast_outline(cards, language, focus)
+    context_usage = ContextUsage()
+    chapters, outline_degraded = await create_podcast_outline(cards, language, focus, context_usage)
     duration_mode = payload.get("duration_mode") or ("fixed" if payload.get("minutes") else "auto")
     requested_minutes = int(payload.get("minutes") or 0) or None
     target_minutes = requested_minutes if duration_mode == "fixed" and requested_minutes else estimate_auto_minutes(len(chapters), len(cards))
@@ -548,7 +627,7 @@ async def build_podcast_script(
             progress(f"编写章节 {chapter_index + 1}/{len(chapters)}", 0.17 + 0.20 * chapter_index / max(1, len(chapters)))
         episode_context = "；".join(covered_titles[-4:]) or ("这是节目开篇" if language != "en" else "This opens the episode")
         chapter_turns, chapter_degraded = await create_chapter_turns(
-            chapter, cards_by_id, chapter_targets[chapter_index], language, episode_context
+            chapter, cards_by_id, chapter_targets[chapter_index], language, episode_context, context_usage
         )
         start_index = len(turns)
         for item in chapter_turns:
@@ -565,6 +644,8 @@ async def build_podcast_script(
     citations = [{**citation, "id": remap[citation["id"]]} for citation in used_citations]
     for turn in turns:
         turn["citation_ids"] = [remap[value] for value in turn["citation_ids"] if value in remap]
+    if degraded:
+        context_usage.mark_fallback()
     script = "\n".join(f"{turn['speaker']}: {turn['text']} {' '.join(f'[{value}]' for value in turn['citation_ids'])}" for turn in turns)
     return {
         "version": 2,
@@ -577,5 +658,6 @@ async def build_podcast_script(
         "script": script,
         "citations": citations,
         "degraded": degraded,
+        "context_usage": context_usage.as_dict(),
         "quality": _quality_metrics(turns, citations, target_minutes, total_target),
     }

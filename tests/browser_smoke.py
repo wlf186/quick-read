@@ -86,7 +86,15 @@ def main() -> None:
                         "latency_ms": 42,
                         "catalog_supported": True,
                         "models": models,
-                        "capabilities": {},
+                        "capabilities": {
+                            "token_limits": {
+                                "model_context_tokens": 32768,
+                                "effective_context_tokens": 8192,
+                                "max_output_tokens": 2048,
+                                "context_source": "provider_metadata",
+                                "output_source": "provider_metadata",
+                            }
+                        },
                         "recommended": None,
                         "warning": None if selected else "连接成功，请选择或填写模型",
                         "error": None,
@@ -111,6 +119,12 @@ def main() -> None:
         settings.get_by_role("button", name="连接并读取模型").click()
         settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
         assert settings.get_by_text(re.compile("2 个模型 · 42 ms")).is_visible()
+        assert settings.get_by_text(re.compile("理论最大 32,768 · 运行 8,192 · 输出 2,048")).is_visible()
+        assert settings.get_by_role("button", name="验证并启用").is_enabled()
+        settings.get_by_label("上下文窗口覆盖（tokens）").fill("16384")
+        settings.get_by_label("最大输出覆盖（tokens）").fill("2048")
+        settings.get_by_role("button", name="连接并读取模型").click()
+        settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
         assert_no_horizontal_overflow(page)
         page.screenshot(path="/tmp/sandevistan-read-provider-desktop.png")
@@ -121,6 +135,16 @@ def main() -> None:
         assert settings.get_by_role("button", name="添加 Provider").is_visible()
         page.keyboard.press("Escape")
         assert settings.count() == 0
+
+        page.locator(".studio-cards button").filter(has_text="Quiz 题库").click()
+        study_create = page.get_by_role("dialog", name="生成理解型 Quiz")
+        assert study_create.is_visible()
+        assert study_create.get_by_label("数量").is_visible()
+        assert study_create.get_by_label("难度").is_visible()
+        assert study_create.get_by_label("输出语言").is_visible()
+        assert study_create.get_by_label("定制要求").is_visible()
+        page.keyboard.press("Escape")
+        assert study_create.count() == 0
 
         page.locator(".studio-cards button").filter(has_text="双人音频").click()
         podcast_create = page.get_by_role("dialog", name="生成双人深度播客")
@@ -142,12 +166,82 @@ def main() -> None:
         page.keyboard.press("Escape")
         assert artifact_dialog.count() == 0
 
+        study_kind = {"value": "quiz"}
+        citation = {"id": "S1", "filename": "qa-source.pdf", "locator": {"page": 1}, "quote": "可核验的原文证据。", "source_id": "qa-source"}
+
+        def study_session(route) -> None:
+            kind = study_kind["value"]
+            item = (
+                {
+                    "id": "q1",
+                    "question": "根据资料，哪个选项正确描述了核心关系？",
+                    "options": ["正确关系", "相反关系", "无关关系", "过度概括"],
+                    "hint": "留意因果方向。",
+                    "difficulty": "medium",
+                    "cognitive_level": "understand",
+                    "learning_objective": "区分资料中的核心因果关系",
+                }
+                if kind == "quiz"
+                else {
+                    "id": "f1",
+                    "front": "资料中的核心概念是什么？",
+                    "back": "核心概念的准确说明。",
+                    "explanation": "资料原文直接支持该定义。",
+                    "difficulty": "medium",
+                    "card_type": "concept",
+                    "citation_details": [citation],
+                }
+            )
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "id": f"qa-{kind}", "artifact_id": f"artifact-{kind}", "kind": kind,
+                "mode": "all" if kind == "quiz" else "due", "status": "active", "items": [item],
+                "progress": {"current": 0, "total": 1}, "created_at": "2026-08-31T00:00:00Z", "updated_at": "2026-08-31T00:00:00Z",
+            }))
+
+        def quiz_answer(route) -> None:
+            item = {
+                "id": "q1", "question": "根据资料，哪个选项正确描述了核心关系？",
+                "options": ["正确关系", "相反关系", "无关关系", "过度概括"],
+                "hint": "留意因果方向。", "difficulty": "medium", "cognitive_level": "understand",
+                "learning_objective": "区分资料中的核心因果关系",
+                "result": {"correct": True, "selected_index": 0, "answer_index": 0, "explanation": "资料明确给出了这一关系。", "citation_details": [citation]},
+            }
+            session = {"id": "qa-quiz", "artifact_id": "artifact-quiz", "kind": "quiz", "mode": "all", "status": "complete", "items": [item], "progress": {"current": 1, "total": 1}, "created_at": "2026-08-31T00:00:00Z", "updated_at": "2026-08-31T00:01:00Z"}
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"result": item["result"], "session": session}))
+
+        def flashcard_review(route) -> None:
+            item = {"id": "f1", "front": "资料中的核心概念是什么？", "back": "核心概念的准确说明。", "explanation": "资料原文直接支持该定义。", "difficulty": "medium", "card_type": "concept", "citation_details": [citation], "review": {"rating": "good", "due": "2026-09-07T00:00:00Z"}}
+            session = {"id": "qa-flashcard", "artifact_id": "artifact-flashcard", "kind": "flashcard", "mode": "due", "status": "complete", "items": [item], "progress": {"current": 1, "total": 1}, "created_at": "2026-08-31T00:00:00Z", "updated_at": "2026-08-31T00:01:00Z"}
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"session": session}))
+
+        page.route(re.compile(r".*/api/artifacts/[^/]+/study-sessions$"), study_session)
+        page.route("**/api/study-sessions/qa-quiz/quiz-answer", quiz_answer)
+        page.route("**/api/study-sessions/qa-flashcard/flashcard-review", flashcard_review)
+
+        quiz_artifact = page.locator(".artifact").filter(has_text=re.compile("Quiz|测验|题库"))
+        assert quiz_artifact.count() > 0
+        quiz_artifact.first.click()
+        quiz_dialog = page.get_by_role("dialog", name=re.compile("Quiz|测验|题库"))
+        quiz_dialog.locator(".quiz-options button").first.click()
+        quiz_dialog.get_by_role("button", name="提示").click()
+        assert quiz_dialog.get_by_text("留意因果方向。").is_visible()
+        quiz_dialog.get_by_role("button", name="检查答案").click()
+        quiz_dialog.get_by_text("回答正确").wait_for()
+        assert quiz_dialog.get_by_text("资料明确给出了这一关系。").is_visible()
+        assert quiz_dialog.get_by_text("完成 · 1/1").is_visible()
+        page.screenshot(path="/tmp/sandevistan-read-quiz-desktop.png")
+        page.keyboard.press("Escape")
+
+        study_kind["value"] = "flashcard"
         page.locator(".artifact").filter(has_text="闪卡组").click()
         card = page.locator(".flash-card")
-        assert card.is_visible()
+        card.wait_for()
         before = card.inner_text()
         card.click()
         assert card.inner_text() != before
+        page.get_by_role("button", name="良好").click()
+        page.get_by_text("本轮复习完成").wait_for()
+        page.screenshot(path="/tmp/sandevistan-read-flashcard-desktop.png")
         page.keyboard.press("Escape")
 
         page.goto(f"{BASE_URL}/#jobs", wait_until="networkidle")

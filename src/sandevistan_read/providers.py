@@ -6,6 +6,7 @@ import re
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -13,10 +14,32 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 
 from .database import DB, json_dump, json_load, utc_now
+from .context_budget import (
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    DEFAULT_IMAGE_TOKENS,
+    MIN_OUTPUT_WINDOW_TOKENS,
+    RETRY_SCALES,
+    ContextUsage,
+    PromptBudget,
+    TokenLimits,
+    estimate_messages_tokens,
+    is_context_error,
+    positive_int,
+    prompt_budget,
+    truncate_text_tokens,
+    validate_token_overrides,
+)
 from .security import VAULT
 
 
 class ProviderError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "provider_error", status: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+class ContextOverflowError(ProviderError):
     pass
 
 
@@ -108,6 +131,210 @@ def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+CONTEXT_LIMIT_FIELDS = ("context_window_tokens", "context_window", "context_length", "max_context_length", "max_model_len")
+OUTPUT_LIMIT_FIELDS = ("max_output_tokens", "max_completion_tokens")
+LIMIT_CONTAINERS = ("token_limits", "limits", "capabilities", "top_provider", "metadata", "details")
+
+
+def _limit_from_metadata(payload: dict[str, Any], fields: tuple[str, ...]) -> int | None:
+    candidates = [payload]
+    candidates.extend(payload.get(name) for name in LIMIT_CONTAINERS if isinstance(payload.get(name), dict))
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for field_name in fields:
+            value = positive_int(candidate.get(field_name))
+            if value:
+                return value
+    return None
+
+
+def _catalog_token_limits(payload: dict[str, Any]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    context = _limit_from_metadata(payload, CONTEXT_LIMIT_FIELDS)
+    max_input = _limit_from_metadata(payload, ("max_input_tokens",))
+    max_output = _limit_from_metadata(payload, OUTPUT_LIMIT_FIELDS)
+    if context:
+        result["model_context_tokens"] = context
+    if max_input:
+        result["max_input_tokens"] = max_input
+    if max_output:
+        result["max_output_tokens"] = max_output
+    return result
+
+
+def _ollama_show_limits(payload: dict[str, Any]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    model_info = payload.get("model_info") or {}
+    contexts = [positive_int(value) for key, value in model_info.items() if str(key).endswith(".context_length")]
+    contexts = [value for value in contexts if value]
+    if contexts:
+        result["model_context_tokens"] = max(contexts)
+    image_values = [positive_int(value) for key, value in model_info.items() if str(key).endswith(".mm.tokens_per_image")]
+    image_values = [value for value in image_values if value]
+    if image_values:
+        result["image_tokens_per_image"] = max(image_values)
+    parameters = str(payload.get("parameters") or "")
+    match = re.search(r"(?:^|\n)\s*num_ctx\s+(\d+)\b", parameters)
+    if match:
+        result["modelfile_context_tokens"] = int(match.group(1))
+    return result
+
+
+def _parameter_count(payload: dict[str, Any], model: str = "") -> int | None:
+    model_info = payload.get("model_info") or {}
+    for key, value in model_info.items():
+        if str(key).endswith(".parameter_count"):
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                return count
+    details = payload.get("details") or {}
+    text = str(details.get("parameter_size") or model)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([bBmM])\b", text)
+    if not match:
+        return None
+    scale = 1_000_000_000 if match.group(2).lower() == "b" else 1_000_000
+    return round(float(match.group(1)) * scale)
+
+
+def study_generation_profile(provider: dict[str, Any]) -> dict[str, Any]:
+    """Select a transparent study pipeline tier without confusing context size with model quality."""
+    config = provider.get("config") or {}
+    requested = str(config.get("study_generation_tier") or "auto")
+    if requested not in {"auto", "lite", "full"}:
+        requested = "auto"
+    capabilities = provider.get("capabilities") or {}
+    model_profile = capabilities.get("model_profile") or {}
+    parameter_count = model_profile.get("parameter_count")
+    try:
+        parameter_count = int(parameter_count) if parameter_count else None
+    except (TypeError, ValueError):
+        parameter_count = None
+    limits = TokenLimits.from_provider(provider)
+    if requested != "auto":
+        tier, source = requested, "manual"
+        reason = "Provider 人工指定"
+    else:
+        constraints: list[str] = []
+        if limits.effective_context_tokens < 8192:
+            constraints.append("上下文小于 8K")
+        if limits.max_output_tokens < 1536:
+            constraints.append("输出小于 1.5K")
+        if parameter_count is not None and parameter_count < 7_000_000_000:
+            constraints.append("参数量小于 7B")
+        tier = "lite" if constraints else "full"
+        source = "auto"
+        reason = "、".join(constraints) if constraints else "上下文与模型能力满足完整审校管线"
+    return {
+        "tier": tier,
+        "source": source,
+        "reason": reason,
+        "parameter_count": parameter_count,
+        "supports_difficulties": ["easy", "medium", "mixed"] if tier == "lite" else ["easy", "medium", "hard", "mixed"],
+    }
+
+
+def _effective_token_limits(
+    provider: dict[str, Any],
+    detected: dict[str, int],
+    *,
+    context_source: str | None = None,
+) -> dict[str, Any]:
+    config = provider.get("config") or {}
+    validate_token_overrides(config)
+    model_max = positive_int(detected.get("model_context_tokens"))
+    manual_context = positive_int(config.get("context_window_tokens"))
+    if manual_context and model_max and manual_context > model_max:
+        raise ProviderError(f"人工上下文窗口 {manual_context} 超过模型报告的最大值 {model_max}")
+    if manual_context:
+        effective, selected_context_source = manual_context, "manual"
+    else:
+        runtime = positive_int(detected.get("runtime_context_tokens"))
+        modelfile = positive_int(detected.get("modelfile_context_tokens"))
+        provider_context = positive_int(detected.get("provider_context_tokens"))
+        effective = runtime or modelfile or provider_context or DEFAULT_CONTEXT_WINDOW_TOKENS
+        selected_context_source = (
+            "ollama_runtime" if runtime else "ollama_modelfile" if modelfile else context_source or "provider_metadata" if provider_context else "fallback"
+        )
+    if model_max:
+        effective = min(effective, model_max)
+    manual_output = positive_int(config.get("max_output_tokens"))
+    detected_output = positive_int(detected.get("max_output_tokens"))
+    if manual_output and manual_output >= effective:
+        raise ProviderError("人工最大输出必须小于有效上下文窗口")
+    max_output = manual_output or detected_output or max(MIN_OUTPUT_WINDOW_TOKENS, min(4096, effective // 4))
+    max_output = min(max_output, effective - 1)
+    return {
+        "model_context_tokens": model_max,
+        "effective_context_tokens": effective,
+        "max_input_tokens": positive_int(detected.get("max_input_tokens")),
+        "max_output_tokens": max_output,
+        "context_source": selected_context_source,
+        "output_source": "manual" if manual_output else "provider_metadata" if detected_output else "derived",
+        "image_tokens_per_image": positive_int(detected.get("image_tokens_per_image")) or DEFAULT_IMAGE_TOKENS,
+        "probed_at": utc_now(),
+    }
+
+
+async def _discover_chat_capabilities(provider: dict[str, Any], models: list[dict[str, Any]]) -> dict[str, Any]:
+    model = str(provider.get("model") or "").strip()
+    if provider.get("role") not in {"main", "vlm"} or not model:
+        return {}
+    selected = next((item for item in models if item.get("id") == model), {})
+    detected = dict(selected.get("token_limits") or {})
+    headers = _headers(provider)
+    if provider["kind"] == "ollama":
+        model_profile: dict[str, Any] = {}
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            show_result, running_result = await asyncio.gather(
+                client.post(f"{provider['base_url']}/api/show", json={"model": model, "verbose": False}, headers=headers),
+                client.get(f"{provider['base_url']}/api/ps", headers=headers),
+                return_exceptions=True,
+            )
+        if isinstance(show_result, httpx.Response) and show_result.is_success and len(show_result.content) <= MAX_CATALOG_BYTES:
+            show_payload = show_result.json()
+            if isinstance(show_payload, dict):
+                detected.update(_ollama_show_limits(show_payload))
+                parameter_count = _parameter_count(show_payload, model)
+                if parameter_count:
+                    model_profile["parameter_count"] = parameter_count
+                details = show_payload.get("details") or {}
+                if details.get("quantization_level"):
+                    model_profile["quantization"] = details["quantization_level"]
+        if isinstance(running_result, httpx.Response) and running_result.is_success and len(running_result.content) <= MAX_CATALOG_BYTES:
+            for item in (running_result.json().get("models") or []):
+                if isinstance(item, dict) and model in {item.get("model"), item.get("name")}:
+                    running_context = positive_int(item.get("context_length"))
+                    if running_context:
+                        detected["runtime_context_tokens"] = running_context
+                    break
+        capabilities = {"token_limits": _effective_token_limits(provider, detected), "model_profile": model_profile}
+        capabilities["study_generation"] = study_generation_profile({**provider, "capabilities": capabilities})
+        return capabilities
+
+    if selected:
+        detail_url = f"{provider['base_url']}/v1/models/{quote(model, safe='')}"
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+                response = await client.get(detail_url, headers=headers)
+            if response.is_success and len(response.content) <= MAX_CATALOG_BYTES:
+                detail = response.json()
+                if isinstance(detail, dict):
+                    detail_limits = _catalog_token_limits(detail)
+                    for key, value in detail_limits.items():
+                        detected.setdefault(key, value)
+        except (httpx.HTTPError, ValueError):
+            pass
+    if detected.get("model_context_tokens"):
+        detected.setdefault("provider_context_tokens", detected["model_context_tokens"])
+    capabilities = {"token_limits": _effective_token_limits(provider, detected, context_source="provider_metadata")}
+    capabilities["study_generation"] = study_generation_profile({**provider, "capabilities": capabilities})
+    return capabilities
+
+
 async def _provider_catalog(provider: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     base_url = provider["base_url"]
     headers = _headers(provider)
@@ -145,6 +372,7 @@ async def _provider_catalog(provider: dict[str, Any]) -> tuple[bool, list[dict[s
             "id": identifier,
             "name": str(item.get("name") or identifier),
             "details": item.get("details") or {"owned_by": item.get("owned_by")},
+            "token_limits": _catalog_token_limits(item),
         }
     return True, sorted(models_by_id.values(), key=lambda item: item["id"].lower()), {}, None
 
@@ -196,9 +424,10 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
             message: dict[str, Any] = {"role": "user", "content": "只回复 OK"}
             if role == "vlm":
                 message["images"] = [TEST_IMAGE_BASE64]
+            limits = TokenLimits.from_provider(provider)
             response = await client.post(
                 f"{provider['base_url']}/api/chat",
-                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 4}},
+                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 4, "num_ctx": limits.effective_context_tokens}},
                 headers=headers,
             )
         else:
@@ -248,6 +477,7 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         provider["model"] = model
         provider["config"]["compute_device"] = recommended.get("compute_device")
     warning = None
+    context_warning = None
     eligible = supported and bool(model) and model in model_ids
     if not supported:
         warning = "服务可连接，但不支持实时模型清单；请手填模型并执行深度验证"
@@ -255,15 +485,25 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         warning = "连接成功，请选择或填写模型"
     elif model not in model_ids:
         warning = "当前模型未出现在实时清单中；可手填后执行深度验证"
+    def verification_error(**kwargs: Any) -> dict[str, Any]:
+        failure = _inspection_error(started=started, connection_ok=True, stage="verification", **kwargs)
+        failure.update({"catalog_supported": supported, "models": models, "capabilities": capabilities, "recommended": recommended})
+        return failure
+    if provider["role"] in {"main", "vlm"} and model:
+        try:
+            capabilities.update(await _discover_chat_capabilities(provider, models))
+            provider["capabilities"] = capabilities
+        except (ValueError, ProviderError) as exc:
+            return verification_error(code="invalid_context_limits", message=str(exc), hint="调整上下文或最大输出覆盖值")
+        token_limits = capabilities.get("token_limits") or {}
+        if token_limits.get("context_source") == "fallback":
+            context_warning = "Provider 未报告上下文窗口，当前按 4K 安全预算运行；可在模型设置中人工覆盖"
+            warning = f"{warning}；{context_warning}" if warning else context_warning
     if provider["kind"] == "openai_tts":
         config = provider["config"]
         if not str(config.get("host_a") or "").strip() or not str(config.get("host_b") or "").strip():
             eligible = False
             warning = "OpenAI TTS 启用前需要配置两位主持人的音色"
-    def verification_error(**kwargs: Any) -> dict[str, Any]:
-        failure = _inspection_error(started=started, connection_ok=True, stage="verification", **kwargs)
-        failure.update({"catalog_supported": supported, "models": models, "capabilities": capabilities, "recommended": recommended})
-        return failure
     if mode == "deep":
         try:
             await _deep_verify(provider)
@@ -274,9 +514,9 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
             return verification_error(code="verification_failed", message=f"模型调用失败（HTTP {status}）", hint="检查模型、能力和角色是否匹配", upstream_status=status)
         except (httpx.HTTPError, ProviderError) as exc:
             return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、音色、设备及 Provider 日志")
-        eligible, warning = True, None
+        eligible, warning = True, context_warning
     return {
-        "status": "passed" if eligible else "warning",
+        "status": "warning" if warning else "passed" if eligible else "warning",
         "connection_ok": True,
         "activation_eligible": eligible,
         "latency_ms": round((time.perf_counter() - started) * 1000),
@@ -296,6 +536,8 @@ def active_provider(role: str) -> dict[str, Any] | None:
     row["capabilities"] = json_load(row.pop("capabilities_json"), {})
     row["config"] = json_load(row.pop("config_json"), {})
     row["api_key"] = VAULT.decrypt(row.pop("secret_enc", "")) if row.get("secret_enc") else ""
+    if role in {"main", "vlm"}:
+        row["capabilities"]["study_generation"] = study_generation_profile(row)
     return row
 
 
@@ -307,7 +549,113 @@ def provider_by_id(provider_id: str) -> dict[str, Any] | None:
     row["config"] = json_load(row.pop("config_json"), {})
     secret = row.pop("secret_enc", "")
     row["api_key"] = VAULT.decrypt(secret) if secret else ""
+    if row.get("role") in {"main", "vlm"}:
+        row["capabilities"]["study_generation"] = study_generation_profile(row)
     return row
+
+
+@dataclass
+class ChatCompletion:
+    content: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish_reason: str | None = None
+
+
+@dataclass
+class PromptBuild:
+    messages: list[dict[str, Any]]
+    total_segments: int = 0
+    included_segments: int = 0
+    truncated_segments: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BudgetedCompletion:
+    content: str
+    build: PromptBuild
+    budget: PromptBudget
+    finish_reason: str | None = None
+
+
+def _chat_provider(role: str) -> dict[str, Any]:
+    provider = active_provider(role)
+    if not provider and role == "vlm":
+        provider = active_provider("main")
+    if not provider:
+        raise ProviderError(f"No active {role} provider")
+    return provider
+
+
+def _provider_response_error(response: httpx.Response) -> ProviderError:
+    code, message = "upstream_error", f"Provider 返回 HTTP {response.status_code}"
+    try:
+        payload = response.json()
+        error = payload.get("error", payload) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            code = str(error.get("code") or error.get("type") or code)
+            message = str(error.get("message") or error.get("detail") or message)
+        elif error:
+            message = str(error)
+    except ValueError:
+        pass
+    if is_context_error(response.status_code, code, message):
+        return ContextOverflowError(message, code=code, status=response.status_code)
+    return ProviderError(message, code=code, status=response.status_code)
+
+
+async def _chat_once(
+    provider: dict[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    json_mode: bool,
+    timeout: float,
+    max_tokens: int,
+    temperature: float,
+) -> ChatCompletion:
+    headers: dict[str, str] = {}
+    if provider["api_key"]:
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+    limits = TokenLimits.from_provider(provider)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if provider["kind"] == "ollama":
+            payload: dict[str, Any] = {
+                "model": provider["model"],
+                "messages": messages,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": limits.effective_context_tokens},
+            }
+            if json_mode:
+                payload["format"] = "json"
+            response = await client.post(f"{provider['base_url'].rstrip('/')}/api/chat", json=payload, headers=headers)
+            if not response.is_success:
+                raise _provider_response_error(response)
+            result = response.json()
+            return ChatCompletion(
+                str(result.get("message", {}).get("content", "")),
+                positive_int(result.get("prompt_eval_count")),
+                positive_int(result.get("eval_count")),
+                str(result.get("done_reason") or "") or None,
+            )
+        if provider["kind"] == "openai":
+            payload = {"model": provider["model"], "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
+            if not response.is_success:
+                raise _provider_response_error(response)
+            result = response.json()
+            usage = result.get("usage") or {}
+            choice = result["choices"][0]
+            return ChatCompletion(
+                str(choice["message"]["content"] or ""),
+                positive_int(usage.get("prompt_tokens")),
+                positive_int(usage.get("completion_tokens")),
+                str(choice.get("finish_reason") or "") or None,
+            )
+    raise ProviderError(f"Provider {provider['kind']} cannot serve chat")
 
 
 async def chat(
@@ -319,36 +667,68 @@ async def chat(
     max_tokens: int = 1400,
     temperature: float = 0.15,
 ) -> str:
-    provider = active_provider(role)
-    if not provider and role == "vlm":
-        provider = active_provider("main")
-    if not provider:
-        raise ProviderError(f"No active {role} provider")
-    headers: dict[str, str] = {}
-    if provider["api_key"]:
-        headers["Authorization"] = f"Bearer {provider['api_key']}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if provider["kind"] == "ollama":
-            payload: dict[str, Any] = {
-                "model": provider["model"],
-                "messages": messages,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": temperature, "num_predict": max_tokens},
-            }
-            if json_mode:
-                payload["format"] = "json"
-            response = await client.post(f"{provider['base_url'].rstrip('/')}/api/chat", json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json().get("message", {}).get("content", "")
-        if provider["kind"] == "openai":
-            payload = {"model": provider["model"], "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-            if json_mode:
-                payload["response_format"] = {"type": "json_object"}
-            response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-    raise ProviderError(f"Provider {provider['kind']} cannot serve chat")
+    provider = _chat_provider(role)
+    limits = TokenLimits.from_provider(provider)
+    budget = prompt_budget(limits, max_tokens, min(128, max_tokens), 1.0)
+    estimated = estimate_messages_tokens(messages, limits.image_tokens_per_image)
+    if estimated > budget.input_tokens:
+        raise ContextOverflowError(
+            f"本地估算输入 {estimated} tokens 超过安全预算 {budget.input_tokens}", code="local_context_budget", status=422
+        )
+    return (await _chat_once(provider, messages, json_mode=json_mode, timeout=timeout, max_tokens=budget.output_tokens, temperature=temperature)).content
+
+
+async def budgeted_chat(
+    builder: Callable[[PromptBudget], PromptBuild],
+    *,
+    role: str = "main",
+    json_mode: bool = False,
+    timeout: float = 180,
+    max_tokens: int = 1400,
+    minimum_output_tokens: int = 128,
+    temperature: float = 0.15,
+    trace: ContextUsage | None = None,
+) -> BudgetedCompletion:
+    provider = _chat_provider(role)
+    limits = TokenLimits.from_provider(provider)
+    last_error: ContextOverflowError | None = None
+    for attempt, scale in enumerate(RETRY_SCALES, start=1):
+        budget = prompt_budget(limits, max_tokens, minimum_output_tokens, scale)
+        build = builder(budget)
+        estimated = estimate_messages_tokens(build.messages, budget.image_tokens_per_image)
+        if estimated > budget.input_tokens:
+            raise ContextOverflowError(
+                f"提示构建结果 {estimated} tokens 超过安全预算 {budget.input_tokens}", code="local_context_budget", status=422
+            )
+        try:
+            completion = await _chat_once(
+                provider,
+                build.messages,
+                json_mode=json_mode,
+                timeout=timeout,
+                max_tokens=budget.output_tokens,
+                temperature=temperature,
+            )
+        except ContextOverflowError as exc:
+            last_error = exc
+            continue
+        if trace:
+            trace.record(
+                limits=limits,
+                requested_output=max_tokens,
+                output_tokens=budget.output_tokens,
+                attempts=attempt,
+                estimated_prompt=estimated,
+                actual_prompt=completion.prompt_tokens,
+                actual_completion=completion.completion_tokens,
+                total_segments=build.total_segments,
+                included_segments=build.included_segments,
+                truncated_segments=build.truncated_segments,
+            )
+            if completion.finish_reason in {"length", "max_tokens"}:
+                trace.output_limited_calls += 1
+        return BudgetedCompletion(completion.content, build, budget, completion.finish_reason)
+    raise last_error or ContextOverflowError("Provider 上下文窗口不足", code="context_window_exceeded", status=422)
 
 
 async def describe_image(path: Path, nearby_text: str) -> str:
@@ -356,12 +736,19 @@ async def describe_image(path: Path, nearby_text: str) -> str:
     if not provider or not provider.get("capabilities", {}).get("vision"):
         return ""
     encoded = base64.b64encode(path.read_bytes()).decode()
-    prompt = "仅描述图中可验证的文字、图表关系和版面信息；不要补充图外事实。附近提取文本：\n" + nearby_text[:3000]
-    if provider["kind"] == "ollama":
-        messages = [{"role": "user", "content": prompt, "images": [encoded]}]
-    else:
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}]}]
-    return await chat(messages, role="vlm")
+    prefix = "仅描述图中可验证的文字、图表关系和版面信息；不要补充图外事实。附近提取文本：\n"
+
+    def build(budget: PromptBudget) -> PromptBuild:
+        text_budget = max(0, budget.input_tokens - budget.image_tokens_per_image - estimate_messages_tokens([{"role": "user", "content": prefix}]))
+        nearby, clipped = truncate_text_tokens(nearby_text, text_budget)
+        prompt = prefix + nearby
+        if provider["kind"] == "ollama":
+            messages = [{"role": "user", "content": prompt, "images": [encoded]}]
+        else:
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}]}]
+        return PromptBuild(messages, 1, 1, int(clipped))
+
+    return (await budgeted_chat(build, role="vlm", max_tokens=700, minimum_output_tokens=128)).content
 
 
 async def health(role: str, provider_id: str | None = None) -> dict[str, Any]:
@@ -376,6 +763,36 @@ async def health(role: str, provider_id: str | None = None) -> dict[str, Any]:
         "latency_ms": inspection.get("latency_ms"),
         "status": inspection.get("status"),
     }
+
+
+async def probe_chat_provider(provider_id: str, *, apply: bool = True) -> dict[str, Any]:
+    provider = provider_by_id(provider_id)
+    if not provider:
+        raise ProviderError("Provider does not exist")
+    if provider["role"] not in {"main", "vlm"}:
+        raise ProviderError("Only MAIN or VLM providers expose chat token limits")
+    inspection = await inspect_provider(provider, "catalog")
+    discovered = inspection.get("capabilities") or {}
+    token_limits = discovered.get("token_limits")
+    if apply and token_limits:
+        merged = dict(provider.get("capabilities") or {})
+        merged.update(discovered)
+        DB.execute(
+            "UPDATE provider_profiles SET capabilities_json=?,updated_at=? WHERE id=?",
+            (json_dump(merged), utc_now(), provider_id),
+        )
+    return {"ok": bool(inspection.get("connection_ok")), **inspection}
+
+
+async def refresh_active_chat_capabilities() -> None:
+    providers = [provider for role in ("main", "vlm") if (provider := active_provider(role))]
+    pending = []
+    for provider in providers:
+        token_limits = (provider.get("capabilities") or {}).get("token_limits") or {}
+        if not token_limits.get("probed_at"):
+            pending.append(probe_chat_provider(provider["id"], apply=True))
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _quality_score(model: dict[str, Any]) -> tuple[float, int, str]:

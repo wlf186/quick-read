@@ -46,15 +46,18 @@ def test_provider_role_kind_and_base_url_are_normalized() -> None:
 @pytest.mark.asyncio
 async def test_ollama_catalog_is_normalized_without_empty_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/tags"
         assert "authorization" not in request.headers
-        return httpx.Response(200, json={"models": [{"name": "qwen:latest", "model": "qwen:latest", "details": {"parameter_size": "2B"}}]})
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen:latest", "model": "qwen:latest", "details": {"parameter_size": "2B"}}]})
+        return httpx.Response(404)
 
     mock_client(monkeypatch, handler)
     result = await providers.inspect_provider(candidate())
-    assert result["status"] == "passed"
+    assert result["status"] == "warning"
     assert result["activation_eligible"] is True
     assert result["models"][0]["id"] == "qwen:latest"
+    assert result["capabilities"]["token_limits"]["effective_context_tokens"] == 4096
+    assert result["capabilities"]["token_limits"]["context_source"] == "fallback"
 
 
 @pytest.mark.asyncio
@@ -84,7 +87,41 @@ async def test_deep_verification_can_replace_missing_catalog(monkeypatch: pytest
     catalog = await providers.inspect_provider(profile, "catalog")
     verified = await providers.inspect_provider(profile, "deep")
     assert catalog["status"] == "warning" and catalog["activation_eligible"] is False
-    assert verified["status"] == "passed" and verified["activation_eligible"] is True
+    assert verified["status"] == "warning" and verified["activation_eligible"] is True
+    assert verified["capabilities"]["token_limits"]["context_source"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_ollama_distinguishes_model_runtime_and_output_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"model_info": {"qwen.context_length": 32768}, "parameters": "num_ctx 8192"})
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": "qwen:latest", "context_length": 6144}]})
+        raise AssertionError(request.url.path)
+
+    mock_client(monkeypatch, handler)
+    result = await providers.inspect_provider(candidate())
+    limits = result["capabilities"]["token_limits"]
+    assert result["status"] == "passed"
+    assert limits["model_context_tokens"] == 32768
+    assert limits["effective_context_tokens"] == 6144
+    assert limits["max_output_tokens"] == 1536
+    assert limits["context_source"] == "ollama_runtime"
+
+
+def test_context_overrides_are_validated() -> None:
+    with pytest.raises(ValidationError, match="最大输出必须小于上下文窗口"):
+        ProviderCreate(
+            name="Broken",
+            role="main",
+            kind="openai",
+            base_url="https://example.com",
+            model="chat",
+            config={"context_window_tokens": 4096, "max_output_tokens": 4096},
+        )
 
 
 @pytest.mark.asyncio

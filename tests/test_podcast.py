@@ -1,8 +1,9 @@
-import json
+from types import SimpleNamespace
 
 import pytest
 
 from sandevistan_read import podcast
+from sandevistan_read.context_budget import PromptBudget
 from sandevistan_read.schemas import PodcastRequest
 
 
@@ -29,20 +30,11 @@ def test_safe_turns_are_short_traceable_dialogue() -> None:
 
 @pytest.mark.asyncio
 async def test_chapter_generation_rejects_duplicates_and_unsupported_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
-    generated = {
-        "turns": [
-            {"speaker": "A", "text": "资料提出了双重支付问题。", "citation_ids": ["E1"]},
-            {"speaker": "B", "text": "攻击者拥有 51% 算力就绝对无法追上。", "citation_ids": ["E1"]},
-            {"speaker": "A", "text": "资料提出了双重支付问题。", "citation_ids": ["E1"]},
-        ]
-    }
+    async def fake_budgeted_chat(builder, **kwargs):
+        build = builder(PromptBudget(4096, 2600, 900, 2048, 1.0))
+        return SimpleNamespace(content='{"pairs":[]}', build=build)
 
-    async def fake_chat(messages, **kwargs):
-        if "事实审校器" in messages[0]["content"]:
-            return json.dumps({"invalid_indexes": []})
-        return json.dumps(generated, ensure_ascii=False)
-
-    monkeypatch.setattr(podcast, "chat", fake_chat)
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_budgeted_chat)
     cards = {"E1": {"id": "E1", "content": "系统必须解决双重支付问题，并以工作量证明建立公开的交易顺序。"}}
     chapter = {"title": "双重支付", "purpose": "解释问题", "evidence_ids": ["E1"]}
     turns, degraded = await podcast.create_chapter_turns(chapter, cards, 6, "zh-CN", "节目开篇")

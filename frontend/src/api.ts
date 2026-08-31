@@ -8,8 +8,12 @@ export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:n
 export type Artifact={id:string;type:'summary'|'quiz'|'flashcard'|'podcast';title:string;status:string;payload:Record<string,any>;citations:Citation[];media_url?:string;language:string};
 export type ProviderRole='main'|'vlm'|'tts';
 export type ProviderKind='ollama'|'openai'|'sandevistan_tts'|'openai_tts';
-export type Provider={id:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>;config:Record<string,any>};
-export type ProviderModel={id:string;name:string;installed?:boolean;devices?:Array<{id:string;available:boolean;precision?:string;reason?:string}>;controls?:Record<string,any>;details?:Record<string,any>};
+export type StudyDifficulty='easy'|'medium'|'hard'|'mixed';
+export type StudyOptions={count:number;difficulty:StudyDifficulty;language:'auto'|'zh-CN'|'en';custom_prompt:string};
+export type StudySession={id:string;artifact_id:string;kind:'quiz'|'flashcard';mode:'all'|'missed'|'due'|'same';status:'active'|'complete';items:Array<Record<string,any>>;progress:{current:number;total:number};created_at:string;updated_at:string};
+export type TokenLimits={model_context_tokens?:number|null;effective_context_tokens:number;max_input_tokens?:number|null;max_output_tokens:number;context_source:'manual'|'ollama_runtime'|'ollama_modelfile'|'provider_metadata'|'fallback'|string;output_source:'manual'|'provider_metadata'|'derived'|string;image_tokens_per_image?:number;probed_at?:string};
+export type Provider={id:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>&{study_generation?:{tier:'lite'|'full';source:string;reason:string;parameter_count?:number|null;supports_difficulties:string[]}};config:Record<string,any>};
+export type ProviderModel={id:string;name:string;installed?:boolean;devices?:Array<{id:string;available:boolean;precision?:string;reason?:string}>;controls?:Record<string,any>;details?:Record<string,any>;token_limits?:Partial<TokenLimits>};
 export type ProviderInspection={status:'passed'|'warning'|'failed';connection_ok:boolean;activation_eligible:boolean;latency_ms:number;catalog_supported:boolean;models:ProviderModel[];capabilities:Record<string,any>;recommended?:{model?:string;compute_device?:string}|null;warning?:string|null;error?:{code:string;stage:string;message:string;hint:string;upstream_status?:number|null}|null};
 export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:Record<string,any>};
 export type PodcastOptions={duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
@@ -34,7 +38,7 @@ export async function upload(id:string,files:FileList|File[]){const body=new For
 export const ask=(id:string,question:string,source_ids:string[],conversation_id?:string)=>api<any>(`/notebooks/${id}/chat`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,language:'auto'})});
 export const getConversations=(id:string)=>api<any[]>(`/notebooks/${id}/conversations`);
 export const getMessages=(id:string)=>api<any[]>(`/conversations/${id}/messages`);
-export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions)=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify(type==='podcasts'?{source_ids,...options}:{source_ids,count:type==='quiz'?10:20,language:'auto'})});
+export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions)=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options})});
 export const getArtifacts=(id:string)=>api<Artifact[]>(`/notebooks/${id}/artifacts`);
 export const getArtifact=(id:string)=>api<Artifact>(`/artifacts/${id}`);
 export const getJobsPage=(params:Record<string,string|number|undefined>={})=>{const query=new URLSearchParams();Object.entries(params).forEach(([key,value])=>value!==undefined&&query.set(key,String(value)));return api<Page<Job>>(`/jobs?${query}`)};
@@ -49,6 +53,12 @@ export const retryNotebookCleanup=(id:string)=>api(`/notebooks/${id}/cleanup/ret
 export const getSummary=(id:string)=>api<any>(`/notebooks/${id}/summary`);
 export const submitQuiz=(id:string,answers:Record<string,number>)=>api<any>(`/artifacts/${id}/quiz/submit`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({answers})});
 export const reviewFlashcard=(id:string,card_id:string,rating:string)=>api<any>(`/artifacts/${id}/flashcards/review`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({card_id,rating})});
+export const createStudySession=(id:string,mode:'all'|'missed'|'due'|'same'='all',shuffle=false)=>api<StudySession>(`/artifacts/${id}/study-sessions`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({mode,shuffle})});
+export const getStudySession=(id:string)=>api<StudySession>(`/study-sessions/${id}`);
+export const answerQuizItem=(id:string,item_id:string,option_index:number)=>api<{result:Record<string,any>;session:StudySession}>(`/study-sessions/${id}/quiz-answer`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({item_id,option_index})});
+export const reviewStudyCard=(id:string,item_id:string,rating:'again'|'hard'|'good'|'easy')=>api<any>(`/study-sessions/${id}/flashcard-review`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({item_id,rating})});
+export const suspendFlashcard=(artifactId:string,cardId:string)=>api<void>(`/artifacts/${artifactId}/flashcards/${cardId}`,{method:'DELETE'});
+export const flashcardsCsvUrl=(artifactId:string)=>`/api/artifacts/${artifactId}/flashcards.csv`;
 export const getProviders=()=>api<Provider[]>('/providers');
 export const createProvider=(body:Record<string,any>)=>api<{id:string;active:boolean;inspection?:ProviderInspection}>('/providers',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
 export const updateProvider=(id:string,body:Record<string,any>)=>api(`/providers/${id}`,{method:'PATCH',headers:jsonHeaders,body:JSON.stringify(body)});

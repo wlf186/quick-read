@@ -12,11 +12,13 @@ from typing import Any, Awaitable, Callable
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .config import CONFIG
 from .paths import PATHS
-from .providers import active_provider, synthesize
+from .providers import active_provider, study_generation_profile, synthesize
 from .podcast import build_podcast_script
-from .services import ingest_source, make_structured, make_summary
+from .services import ingest_source, make_summary
+from .study import generate_study_artifact
 from .observability import LABELS, Reporter
 from .cleanup import process_cleanup_operations, register_resource
+from .context_budget import TokenLimits
 
 
 def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_id: str | None = None) -> dict[str, Any]:
@@ -24,7 +26,19 @@ def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_
     source_count = len(payload.get("source_ids") or []) or (1 if payload.get("source_id") else 0)
     workload = {"source_count": source_count, "count": payload.get("count"), "minutes": payload.get("minutes"), "bucket": "single" if source_count <= 1 else "small_multi" if source_count <= 4 else "large_multi"}
     provider = active_provider("tts" if kind == "podcast" else "main") if kind != "ingest" else None
+    context_provider = active_provider("main") if kind not in {"ingest"} else None
     profile = {"kind": provider.get("kind") if provider else "local", "model": provider.get("model") if provider else CONFIG.models.embedding, "device": (provider.get("config") or {}).get("compute_device") if provider else "local"}
+    if context_provider:
+        limits = TokenLimits.from_provider(context_provider)
+        profile["context"] = {
+            "provider": context_provider.get("name"),
+            "model": context_provider.get("model"),
+            "effective_context_tokens": limits.effective_context_tokens,
+            "max_output_tokens": limits.max_output_tokens,
+            "context_source": limits.context_source,
+        }
+        if kind in {"quiz", "flashcard"}:
+            profile["study_generation"] = study_generation_profile(context_provider)
     DB.execute("""INSERT INTO jobs
         (id,kind,state,stage,progress,notebook_id,parent_id,payload_json,result_json,error,retryable,cancel_requested,attempts,created_at,updated_at,started_at,finished_at,display_name,stage_code,stage_progress,progress_basis,activity_json,workload_json,execution_profile_json,processing_seconds)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -193,7 +207,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     register_resource("notebook", notebook_id, notebook_id, "podcast", out_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     DB.execute("UPDATE local_resources SET state='transferred',transferred_at=? WHERE owner_type='job' AND owner_id=?", (utc_now(), job_id))
-    return {"id": artifact_id, "media_url": f"/api/artifacts/{artifact_id}/media"}
+    return {"id": artifact_id, "media_url": f"/api/artifacts/{artifact_id}/media", "context_usage": generated.get("context_usage", {})}
 
 
 async def execute(job: dict[str, Any]) -> Any:
@@ -210,7 +224,17 @@ async def execute(job: dict[str, Any]) -> Any:
             cancel_check=lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job["id"],)) or {}).get("cancel_requested")),
         )
     if job["kind"] == "summary": return await make_summary(job["notebook_id"], payload.get("source_ids"), payload.get("language", "auto"), job["id"])
-    if job["kind"] in {"quiz", "flashcard"}: return await make_structured(job["notebook_id"], job["kind"], int(payload.get("count", 10)), payload.get("source_ids"), payload.get("language", "auto"), payload.get("difficulty", "mixed"), job["id"])
+    if job["kind"] in {"quiz", "flashcard"}:
+        return await generate_study_artifact(
+            job["notebook_id"],
+            job["kind"],
+            int(payload.get("count", 10)),
+            payload.get("source_ids"),
+            payload.get("language", "auto"),
+            payload.get("difficulty", "mixed"),
+            payload.get("custom_prompt", ""),
+            job["id"],
+        )
     if job["kind"] == "podcast": return await _podcast(job["notebook_id"], payload, job["id"])
     raise RuntimeError(f"未知任务类型: {job['kind']}")
 

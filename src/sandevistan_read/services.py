@@ -10,8 +10,9 @@ from typing import Any, Callable
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import chunk_blocks, parse_document
 from .paths import PATHS
-from .providers import ProviderError, chat, describe_image
-from .retrieval import EMBEDDINGS, retrieve, tokenize
+from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items, truncate_text_tokens
+from .providers import PromptBuild, ProviderError, budgeted_chat, describe_image
+from .retrieval import EMBEDDINGS, retrieve
 from .observability import Reporter
 
 
@@ -125,6 +126,56 @@ def _context(chunks: list[dict[str, Any]], labels: list[str] | None = None) -> t
     return "\n\n".join(lines), citations
 
 
+def _context_entry(chunk: dict[str, Any], label: str) -> str:
+    source = DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+    locator = chunk["locator"]
+    loc = f"第{locator['page']}页" if locator.get("page") else f"第{locator['slide']}张" if locator.get("slide") else locator.get("section") or "文档位置"
+    return f"[{label}] {source['filename']} · {loc}\n{chunk['content']}"
+
+
+def _context_citation(chunk: dict[str, Any], label: str) -> dict[str, Any]:
+    source = DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+    return {
+        "id": label,
+        "source_id": chunk["source_id"],
+        "chunk_id": chunk["id"],
+        "filename": source["filename"],
+        "locator": chunk["locator"],
+        "quote": chunk["content"][:260],
+    }
+
+
+def _evidence_prompt_build(
+    budget: PromptBudget,
+    *,
+    chunks: list[dict[str, Any]],
+    labels: list[str],
+    prefix: str,
+    suffix: str = "",
+    system: str | None = None,
+    ensure_source_coverage: bool = False,
+) -> PromptBuild:
+    empty_messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prefix + suffix}]
+    available = max(0, budget.input_tokens - estimate_messages_tokens(empty_messages, budget.image_tokens_per_image) - 8)
+    labeled = list(zip(labels, chunks))
+    packed = pack_items(
+        labeled,
+        lambda item: _context_entry(item[1], item[0]),
+        available,
+        group_key=(lambda item: str(item[1]["source_id"])) if ensure_source_coverage else None,
+    )
+    context = "\n\n".join(packed.texts)
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prefix + context + suffix}]
+    citations = [_context_citation(chunk, label) for label, chunk in packed.items]
+    return PromptBuild(
+        messages,
+        total_segments=packed.total,
+        included_segments=len(packed.items),
+        truncated_segments=packed.truncated,
+        metadata={"citations": citations, "chunks": [chunk for _, chunk in packed.items], "labels": [label for label, _ in packed.items], "context": context},
+    )
+
+
 def _grounding_issues(answer: str, valid_ids: set[str], prefix: str = "S") -> list[str]:
     issues: list[str] = []
     for marker in re.findall(rf"\[({prefix}\d+)\]", answer):
@@ -197,29 +248,59 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
     chunks = retrieve(notebook_id, query, ids, limit=max(12, min(20, len(ids) * 4)), ensure_source_coverage=len(ids) > 1)
     if not chunks:
         raise ValueError("当前范围没有可检索的内容")
-    context, citations = _context(chunks)
     language_rule = "使用中文" if language == "zh-CN" else "Use English" if language == "en" else "跟随用户问题及资料的主要语言"
-    prompt = f"""你是严格依据资料的研究助手。{language_rule}。
+    prompt_prefix = f"""你是严格依据资料的研究助手。{language_rule}。
 规则：只允许使用下方资料；每个事实陈述后必须标注一个或多个 [S1] 格式引用；资料不足就明确说无法从资料确认；禁止使用外部知识；不要编造引用。
 任务：{instruction}
 问题/主题：{query}
 
 资料：
-{context}
 """
+    labels = [f"S{index}" for index in range(1, len(chunks) + 1)]
+    trace = ContextUsage()
     try:
-        answer = await chat([{"role": "system", "content": "Ground every claim in supplied sources."}, {"role": "user", "content": prompt}], max_tokens=max_tokens)
+        generated = await budgeted_chat(
+            lambda budget: _evidence_prompt_build(
+                budget,
+                chunks=chunks,
+                labels=labels,
+                prefix=prompt_prefix,
+                system="Ground every claim in supplied sources.",
+                ensure_source_coverage=len(ids) > 1,
+            ),
+            max_tokens=max_tokens,
+            minimum_output_tokens=256,
+            trace=trace,
+        )
+        answer = generated.content
+        citations = list(generated.build.metadata["citations"])
+        context = str(generated.build.metadata["context"])
         valid_ids = {citation["id"] for citation in citations}
         issues = _grounding_issues(answer, valid_ids)
         if issues:
-            repair = f"""仅依据原资料重写下方回答。输出 3 到 6 个完整、简洁的句子，不要标题、编号或项目符号。每句话末尾必须紧跟一个或多个已有 [S数字] 引用。删除无法支持的陈述，不得把引用集中放到末尾，不得创造新引用。仅输出重写后的回答。
+            repair_prefix = f"""仅依据原资料重写下方回答。输出 3 到 6 个完整、简洁的句子，不要标题、编号或项目符号。每句话末尾必须紧跟一个或多个已有 [S数字] 引用。删除无法支持的陈述，不得把引用集中放到末尾，不得创造新引用。仅输出重写后的回答。
 问题：{query}
 问题列表：{'；'.join(issues[:12])}
 原回答：
-{answer}
-原资料：
-{context}"""
-            answer = await chat([{"role": "user", "content": repair}], max_tokens=max_tokens)
+"""
+
+            def repair_build(budget: PromptBudget) -> PromptBuild:
+                answer_budget = max(64, budget.input_tokens // 4)
+                clipped_answer, answer_clipped = truncate_text_tokens(answer, answer_budget)
+                return_build = _evidence_prompt_build(
+                    budget,
+                    chunks=list(generated.build.metadata["chunks"]),
+                    labels=list(generated.build.metadata["labels"]),
+                    prefix=repair_prefix + clipped_answer + "\n原资料：\n",
+                )
+                return_build.truncated_segments += int(answer_clipped)
+                return return_build
+
+            repaired = await budgeted_chat(repair_build, max_tokens=max_tokens, minimum_output_tokens=256, trace=trace)
+            answer = repaired.content
+            citations = list(repaired.build.metadata["citations"])
+            valid_ids = {citation["id"] for citation in citations}
+            context = str(repaired.build.metadata["context"])
         remaining = _grounding_issues(answer, valid_ids)
         used_sources = {citation["source_id"] for citation in citations if citation["id"] in set(re.findall(r"\[(S\d+)\]", answer))}
         coverage_requested = len(ids) > 1 and bool(re.search(r"每份|各份|分别|四份|所有文档|each (?:source|document)|all (?:sources|documents)", query, re.I))
@@ -232,6 +313,8 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
         else:
             degraded = False
     except Exception:
+        trace.mark_fallback()
+        context, citations = _context(chunks[: min(3, len(chunks))])
         answer = _extractive_fallback(citations, language)
         degraded = True
     used = {item for item in re.findall(r"\[(S\d+)\]", answer)}
@@ -240,7 +323,14 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
         valid = citations[:3]
         if valid:
             answer += "\n\n" + " ".join(f"[{item['id']}]" for item in valid)
-    return {"content": answer, "citations": valid, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded}
+    return {
+        "content": answer,
+        "citations": valid,
+        "scope_hash": scope_hash(ids),
+        "source_ids": ids,
+        "degraded": degraded,
+        "context_usage": trace.as_dict(),
+    }
 
 
 def _evenly_spaced(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -265,19 +355,35 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     _, citations = _context(representatives, labels)
     notes: list[str] = []
     degraded = False
-    total_batches = math.ceil(len(representatives) / 6)
-    for start in range(0, len(representatives), 6):
-        batch_number = start // 6 + 1
+    trace = ContextUsage()
+    cursor = 0
+    batch_number = 0
+    while cursor < len(representatives):
+        batch_number += 1
         if reporter:
             if reporter.cancelled():
                 raise RuntimeError("任务已取消")
-            reporter.update("summarize", f"分段提炼 {batch_number}/{total_batches}", 0.12 + 0.72 * (batch_number - 1) / max(1, total_batches), current=batch_number, total=total_batches, unit="批")
-        batch = representatives[start:start + 6]
-        batch_labels = labels[start:start + len(batch)]
-        context, _ = _context(batch, batch_labels)
-        prompt = f"只根据以下资料提炼 2 条有实质信息、可独立阅读的完整要点。不要使用外部知识，不要输出标题或引用标记。语言：{language}。\n{context}"
+            reporter.update("summarize", f"分段提炼 {cursor}/{len(representatives)}", 0.12 + 0.72 * cursor / max(1, len(representatives)), current=cursor, total=len(representatives), unit="段")
+        remaining = representatives[cursor:]
+        remaining_labels = labels[cursor:]
+        prefix = f"只根据以下资料提炼 2 条有实质信息、可独立阅读的完整要点。不要使用外部知识，不要输出标题或引用标记。语言：{language}。\n"
         try:
-            raw = await chat([{"role": "user", "content": prompt}], max_tokens=650)
+            generated = await budgeted_chat(
+                lambda budget: _evidence_prompt_build(
+                    budget,
+                    chunks=remaining,
+                    labels=remaining_labels,
+                    prefix=prefix,
+                ),
+                max_tokens=650,
+                minimum_output_tokens=128,
+                trace=trace,
+            )
+            raw = generated.content
+            batch = list(generated.build.metadata["chunks"])
+            batch_labels = list(generated.build.metadata["labels"])
+            if not batch:
+                raise ProviderError("上下文窗口无法容纳摘要资料")
             candidates: list[str] = []
             for line in raw.splitlines():
                 clean = re.sub(r"\[C\d+\]", "", line)
@@ -287,11 +393,17 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
             if not candidates:
                 clean = re.sub(r"\[C\d+\]", "", raw).strip()
                 candidates = [clean[:900]] if clean else []
+            if not candidates:
+                raise ProviderError("摘要模型未返回可用内容")
             suffix = " ".join(f"[{label}]" for label in batch_labels)
             notes.extend(f"- {line} {suffix}" for line in candidates[:2])
+            cursor += len(batch)
         except Exception:
             degraded = True
-            notes.extend(f"- {chunk['content'][:300]} [{label}]" for label, chunk in zip(batch_labels[:2], batch[:2]))
+            trace.mark_fallback()
+            chunk, label = representatives[cursor], labels[cursor]
+            notes.append(f"- {chunk['content'][:300]} [{label}]")
+            cursor += 1
     heading = "## Evidence-bound summary" if language == "en" else "## 可追溯摘要"
     answer = heading + "\n\n" + "\n".join(notes)
     used_c = [citation for citation in citations if citation["id"] in set(re.findall(r"\[(C\d+)\]", answer))]
@@ -302,7 +414,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     for old, new in remap.items():
         answer = answer.replace(f"[{old}]", f"[{new}]")
     output_citations = [{**citation, "id": remap[citation["id"]]} for citation in used_c]
-    return {"content": answer, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded}
+    return {"content": answer, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "context_usage": trace.as_dict()}
 
 
 async def make_summary(notebook_id: str, source_ids: list[str] | None, language: str, job_id: str | None = None) -> dict[str, Any]:
@@ -319,7 +431,7 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     summary_id = f"summary_{suffix}" if suffix else new_id("summary")
     artifact_id, now = (f"artifact_{suffix}" if suffix else new_id("artifact")), utc_now()
     DB.execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?)", (summary_id, notebook_id, result["scope_hash"], result["content"], json_dump(result["citations"]), now))
-    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"content": result["content"], "degraded": result["degraded"]}), json_dump(result["citations"]), None, now, now))
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"content": result["content"], "degraded": result["degraded"], "context_usage": result["context_usage"]}), json_dump(result["citations"]), None, now, now))
     result["id"] = summary_id
     result["artifact_id"] = artifact_id
     return result
@@ -349,6 +461,7 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
     reporter = Reporter(job_id) if job_id else None
     items: list[dict[str, Any]] = []
     degraded = False
+    trace = ContextUsage()
     citation_by_label = {citation["id"]: citation for citation in citations}
     while len(items) < count:
         batch_count = min(5, count - len(items))
@@ -361,7 +474,6 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
         window = interleaved[batch_index::total_batches] or interleaved
         window = window[:12]
         window_labels = [label_by_chunk[chunk["id"]] for chunk in window]
-        context, _ = _context(window, window_labels)
         citation_suffix = " ".join(f"[{label}]" for label in window_labels)
         if kind == "quiz":
             schema = '{"items":[{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}]}'
@@ -369,7 +481,6 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
         else:
             schema = '{"items":[{"front":"...","back":"..."}]}'
             task = f"生成恰好{batch_count}张不重复的高质量闪卡。"
-        prompt = f"只根据资料生成内容，不要输出引用标记。{task} 仅输出合法JSON：{schema}\n资料：\n{context}"
         accepted: list[dict[str, Any]] = []
         if kind == "quiz":
             for index in range(batch_count):
@@ -397,37 +508,29 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
                 accepted.append({"question": question, "options": options, "answer": answer, "explanation": f"正确选项直接摘自该位置原文。 [{label}]", "citations": [label]})
         for _ in ([] if kind == "quiz" else range(3)):
             try:
-                raw = await chat([{"role": "user", "content": prompt}], json_mode=True, max_tokens=1800)
+                def flashcard_build(budget: PromptBudget) -> PromptBuild:
+                    requested_count = max(1, min(batch_count, (budget.output_tokens - 100) // 180))
+                    build = _evidence_prompt_build(
+                        budget,
+                        chunks=window,
+                        labels=window_labels,
+                        prefix=f"只根据资料生成内容，不要输出引用标记。生成恰好{requested_count}张不重复的高质量闪卡。仅输出合法JSON：{schema}\n资料：\n",
+                        ensure_source_coverage=len(ids) > 1,
+                    )
+                    build.metadata["requested_count"] = requested_count
+                    return build
+
+                generated = await budgeted_chat(
+                    flashcard_build,
+                    json_mode=True,
+                    max_tokens=1800,
+                    minimum_output_tokens=256,
+                    trace=trace,
+                )
+                raw = generated.content
+                used_labels = list(generated.build.metadata["labels"])
+                citation_suffix = " ".join(f"[{label}]" for label in used_labels)
                 candidate = json.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("items", [])
-                if kind == "quiz":
-                    audit = f"""仅根据资料审核并修正题目。保证每题四个选项互不重复且只有一个正确答案；answer 必须准确指向正确选项；explanation 必须明确说明该选项为什么正确。保留恰好 {batch_count} 题，仅输出同结构合法 JSON。
-资料：
-{context}
-待审核：
-{json.dumps({'items': candidate}, ensure_ascii=False)}"""
-                    checked = await chat([{"role": "user", "content": audit}], json_mode=True, max_tokens=1800)
-                    candidate = json.loads(checked[checked.find("{"):checked.rfind("}") + 1]).get("items", [])
-                    key_prompt = f"""只根据资料为下列 {len(candidate)} 道单选题选择唯一最佳答案。按题目顺序仅输出 JSON：{{"answers":[0,1,2]}}，数组值只能是 0 到 3。
-资料：
-{context}
-题目：
-{json.dumps([{'question': item.get('question'), 'options': item.get('options')} for item in candidate], ensure_ascii=False)}"""
-                    try:
-                        keyed = await chat([{"role": "user", "content": key_prompt}], json_mode=True, max_tokens=500)
-                        answers = json.loads(keyed[keyed.find("{"):keyed.rfind("}") + 1]).get("answers", [])
-                        if len(answers) == len(candidate) and all(answer in range(4) for answer in answers):
-                            for item, answer in zip(candidate, answers):
-                                item["answer"] = answer
-                    except Exception:
-                        pass
-                    for item in candidate:
-                        if not isinstance(item.get("options"), list) or item.get("answer") not in range(4):
-                            continue
-                        evidence_tokens = {token for token in tokenize(str(item.get("explanation", ""))) if len(token) > 1}
-                        scores = [len(evidence_tokens & {token for token in tokenize(str(option)) if len(token) > 1}) for option in item["options"]]
-                        best = max(range(4), key=scores.__getitem__)
-                        if scores[best] >= 2 and scores[best] > scores[item["answer"]]:
-                            item["answer"] = best
             except Exception:
                 candidate = []
             for item in candidate:
@@ -438,20 +541,10 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
                 existing = {re.sub(r"\W+", "", str(entry.get(identity_field, ""))).lower() for entry in (*items, *accepted)}
                 if not identity or identity in existing:
                     continue
-                if kind == "quiz":
-                    if not isinstance(item.get("question"), str) or not isinstance(item.get("options"), list) or len(item["options"]) != 4 or not all(isinstance(option, str) and option.strip() for option in item["options"]) or item.get("answer") not in range(4):
-                        continue
-                    option_keys = [re.sub(r"^[A-Da-d][.、:)：\s-]*|\W+", "", option).lower() for option in item["options"]]
-                    if len(set(option_keys)) != 4:
-                        continue
-                    if not isinstance(item.get("explanation"), str):
-                        continue
-                    item["explanation"] = re.sub(r"\[S\d+\]", "", item["explanation"]).strip() + " " + citation_suffix
-                elif not isinstance(item.get("front"), str) or not isinstance(item.get("back"), str):
+                if not isinstance(item.get("front"), str) or not isinstance(item.get("back"), str):
                     continue
-                else:
-                    item["back"] = re.sub(r"\[S\d+\]", "", item["back"]).strip() + " " + citation_suffix
-                item["citations"] = window_labels
+                item["back"] = re.sub(r"\[S\d+\]", "", item["back"]).strip() + " " + citation_suffix
+                item["citations"] = used_labels
                 accepted.append(item)
                 if len(accepted) == batch_count:
                     break
@@ -459,8 +552,8 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
                 break
         if len(accepted) != batch_count:
             degraded = True
-            accepted = []
-            for index in range(batch_count):
+            trace.mark_fallback()
+            for index in range(len(accepted), batch_count):
                 label = window_labels[index % len(window_labels)]
                 citation = citation_by_label[label]
                 excerpt = re.sub(r"\s+", " ", citation["quote"]).strip()[:180]
@@ -476,7 +569,7 @@ async def make_structured(notebook_id: str, kind: str, count: int, source_ids: l
         for offset, item in enumerate(accepted, start=start):
             item["id"] = f"q{offset}" if kind == "quiz" else f"c{offset}"
             items.append(item)
-    payload = {"items": items, "degraded": degraded}
+    payload = {"items": items, "degraded": degraded, "context_usage": trace.as_dict()}
     if reporter:
         reporter.update("persist", "保存题库" if kind == "quiz" else "保存闪卡", 0.94, current=count, total=count, unit="题" if kind == "quiz" else "张")
     artifact_id = f"artifact_{job_id.removeprefix('job_')}" if job_id else new_id("artifact")

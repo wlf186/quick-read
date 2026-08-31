@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
+from .context_budget import validate_token_overrides
+
 
 class NotebookCreate(BaseModel):
     title: str = Field(min_length=1, max_length=160)
@@ -26,12 +28,20 @@ class SourceSelection(BaseModel):
 ProviderRole = Literal["main", "vlm", "tts"]
 ProviderKind = Literal["ollama", "openai", "sandevistan_tts", "openai_tts"]
 ProviderValidationMode = Literal["catalog", "deep"]
+StudyDifficulty = Literal["easy", "medium", "hard", "mixed"]
 
 
 def _validate_provider_pair(role: str, kind: str) -> None:
     allowed = {"main": {"ollama", "openai"}, "vlm": {"ollama", "openai"}, "tts": {"sandevistan_tts", "openai_tts"}}
     if kind not in allowed.get(role, set()):
         raise ValueError(f"{role.upper()} 角色不支持 {kind} Provider")
+
+
+def _validate_provider_config(config: dict[str, Any]) -> None:
+    validate_token_overrides(config)
+    tier = config.get("study_generation_tier", "auto")
+    if tier not in {"auto", "lite", "full"}:
+        raise ValueError("学习生成档位必须是 auto、lite 或 full")
 
 
 class ProviderCreate(BaseModel):
@@ -49,6 +59,7 @@ class ProviderCreate(BaseModel):
     @model_validator(mode="after")
     def validate_provider_pair(self):
         _validate_provider_pair(self.role, self.kind)
+        _validate_provider_config(self.config)
         return self
 
 
@@ -61,6 +72,12 @@ class ProviderUpdate(BaseModel):
     config: dict[str, Any] | None = None
     active: bool | None = None
     validation_mode: ProviderValidationMode = "catalog"
+
+    @model_validator(mode="after")
+    def validate_context_overrides(self):
+        if self.config is not None:
+            validate_token_overrides(self.config)
+        return self
 
 
 class ProviderInspectionRequest(BaseModel):
@@ -76,6 +93,7 @@ class ProviderInspectionRequest(BaseModel):
     @model_validator(mode="after")
     def validate_provider_pair(self):
         _validate_provider_pair(self.role, self.kind)
+        _validate_provider_config(self.config)
         return self
 
 
@@ -94,14 +112,17 @@ class SummaryRequest(BaseModel):
 class QuizRequest(BaseModel):
     source_ids: list[str] | None = None
     count: int = Field(default=10, ge=1, le=30)
-    difficulty: Literal["easy", "medium", "hard", "mixed"] = "mixed"
+    difficulty: StudyDifficulty = "mixed"
     language: Literal["auto", "zh-CN", "en"] = "auto"
+    custom_prompt: str = Field(default="", max_length=1000)
 
 
 class FlashcardRequest(BaseModel):
     source_ids: list[str] | None = None
     count: int = Field(default=20, ge=1, le=50)
+    difficulty: StudyDifficulty = "mixed"
     language: Literal["auto", "zh-CN", "en"] = "auto"
+    custom_prompt: str = Field(default="", max_length=1000)
 
 
 class PodcastRequest(BaseModel):
@@ -123,12 +144,34 @@ class PodcastRequest(BaseModel):
 
 
 class QuizSubmission(BaseModel):
-    answers: dict[str, int]
+    answers: dict[str, int] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_answers(self) -> "QuizSubmission":
+        if any(answer not in range(4) for answer in self.answers.values()):
+            raise ValueError("Quiz 选项必须是 0 到 3")
+        return self
+
+
+class StudySessionCreate(BaseModel):
+    mode: Literal["all", "missed", "due", "same"] = "all"
+    shuffle: bool = False
+
+
+class QuizAnswer(BaseModel):
+    item_id: str = Field(min_length=1, max_length=120)
+    option_index: int = Field(ge=0, le=3)
+
+
+class FlashcardSessionReview(BaseModel):
+    item_id: str = Field(min_length=1, max_length=120)
+    rating: Literal["again", "hard", "good", "easy"]
 
 
 class FlashcardReview(BaseModel):
     card_id: str
-    rating: Literal["again", "hard", "mastered"]
+    rating: Literal["again", "hard", "good", "easy", "mastered"]
+    session_id: str | None = None
 
 
 class LoginRequest(BaseModel):
