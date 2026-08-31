@@ -3,18 +3,61 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
-from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items
+from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items
 from .database import DB, json_load
-from .providers import PromptBuild, budgeted_chat
-from .retrieval import retrieve
+from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
+from .retrieval import retrieve, tokenize
 from .services import _evenly_spaced, scope_hash, source_scope
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
 SENTENCE_PATTERN = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n+")
+PODCAST_ENGINE_VERSION = 3
+NONFACTUAL_ACTS = {"intro", "bridge", "question", "acknowledgement", "outro"}
+FACTUAL_ACTS = {"frame", "explain", "evidence", "example", "challenge", "synthesis"}
+ALLOWED_DIALOGUE_ACTS = NONFACTUAL_ACTS | FACTUAL_ACTS
+GENERIC_STEMS = (
+    "这条材料明确说明了什么",
+    "如果不做资料外推演",
+    "原文是怎样把",
+    "资料给出的直接线索是",
+    "what does this passage establish",
+    "without going beyond the text",
+)
+
+
+class PodcastQualityError(RuntimeError):
+    def __init__(self, message: str, report: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.report = report or {"passed": False, "reason": message}
+
+
+@dataclass
+class EpisodeMemory:
+    thesis: str
+    covered_claim_ids: list[str] = field(default_factory=list)
+    chapter_summaries: list[dict[str, str]] = field(default_factory=list)
+    open_hook: str = ""
+    last_turns: list[dict[str, Any]] = field(default_factory=list)
+    last_speaker: str | None = None
+
+    def prompt_payload(self, recent_limit: int) -> dict[str, Any]:
+        return {
+            "episode_thesis": self.thesis,
+            "covered_claim_ids": self.covered_claim_ids[-24:],
+            "chapter_summaries": self.chapter_summaries[-6:],
+            "open_hook": self.open_hook,
+            "recent_dialogue": [
+                {"speaker": turn["speaker"], "text": turn["text"], "dialogue_act": turn["dialogue_act"]}
+                for turn in self.last_turns[-recent_limit:]
+            ],
+            "last_speaker": self.last_speaker,
+        }
 
 
 def _segment_prompt_build(
@@ -65,7 +108,7 @@ def estimate_auto_minutes(chapter_count: int, evidence_count: int) -> int:
 def target_turn_count(minutes: int) -> int:
     # Reference NotebookLM episodes average roughly 6–8 short speaker turns per
     # minute.  Shorter turns sound conversational and avoid dense TTS monologues.
-    return max(30, min(200, round(minutes * 8)))
+    return max(24, min(160, round(minutes * 6.5)))
 
 
 def _with_locator(row: dict[str, Any]) -> dict[str, Any]:
@@ -180,6 +223,33 @@ def _extract_json(raw: str) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
+    """Recover only complete turn objects from a possibly truncated JSON list."""
+    parsed = _extract_json(raw)
+    if isinstance(parsed.get("turns"), list):
+        return parsed["turns"]
+    match = re.search(r'"turns"\s*:\s*\[', raw)
+    if not match:
+        return None
+    decoder = json.JSONDecoder()
+    position = match.end()
+    recovered: list[dict[str, Any]] = []
+    while position < len(raw):
+        while position < len(raw) and (raw[position].isspace() or raw[position] == ","):
+            position += 1
+        if position >= len(raw) or raw[position] == "]":
+            break
+        try:
+            value, consumed = decoder.raw_decode(raw[position:])
+        except json.JSONDecodeError:
+            break
+        if not isinstance(value, dict):
+            break
+        recovered.append(value)
+        position += consumed
+    return recovered or None
 
 
 def _fallback_outline(cards: list[dict[str, Any]], language: str) -> list[dict[str, Any]]:
@@ -559,30 +629,620 @@ async def create_chapter_turns(
     return accepted[:target], degraded
 
 
-def _quality_metrics(
-    turns: list[dict[str, Any]], citations: list[dict[str, Any]], target_minutes: int, requested_turns: int | None = None
+def build_claim_ledger(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create compact, source-addressable claims without asking the model to invent facts."""
+    claims: list[dict[str, Any]] = []
+    for card in cards:
+        candidates = []
+        for sentence in _sentences(card["content"]):
+            text = re.sub(r"\s+", " ", sentence).strip()
+            latin = re.findall(r"[A-Za-z]", text)
+            starts_with_fragment = bool(latin) and len(latin) >= len(text.replace(" ", "")) * 0.6 and text[:1].islower()
+            if 24 <= len(text) <= 320 and not starts_with_fragment and not text.lower().startswith(("references ", "bibliography ")):
+                candidates.append(text)
+            if len(candidates) >= 2:
+                break
+        if not candidates and card["content"]:
+            candidates = [str(card["content"])[:260]]
+        for text in candidates:
+            claims.append(
+                {
+                    "id": f"C{len(claims) + 1}",
+                    "text": text,
+                    "evidence_ids": [card["id"]],
+                    "source_id": card["source_id"],
+                    "filename": card["filename"],
+                    "locator": card.get("locator") or {},
+                }
+            )
+            if len(claims) >= 48:
+                return claims
+    return claims
+
+
+def _fallback_episode_plan(claims: list[dict[str, Any]], language: str) -> dict[str, Any]:
+    chapter_count = max(2, min(6, round(math.sqrt(max(1, len(claims))))))
+    size = max(1, math.ceil(len(claims) / chapter_count))
+    chapters = []
+    for start in range(0, len(claims), size):
+        group = claims[start : start + size]
+        first = group[0]
+        locator = first.get("locator") or {}
+        topic = str(locator.get("section") or first.get("filename") or "资料主线")[:64]
+        number = len(chapters) + 1
+        title = f"{number}. {topic}" if language != "en" else f"{number}. {topic}"
+        chapters.append(
+            {
+                "id": f"chapter_{number}",
+                "title": title,
+                "purpose": group[0]["text"][:180],
+                "claim_ids": [claim["id"] for claim in group],
+                "bridge_in": "承接上一部分的结论" if number > 1 and language != "en" else "Build on the previous conclusion" if number > 1 else "",
+                "bridge_out": "由当前结论引出下一层问题" if language != "en" else "Use this conclusion to open the next question",
+            }
+        )
+        if len(chapters) >= 6:
+            break
+    thesis = claims[0]["text"][:220] if claims else ("资料深度解读" if language != "en" else "A grounded deep dive")
+    return {"episode_thesis": thesis, "chapters": chapters, "fallback": True}
+
+
+async def create_episode_plan(
+    claims: list[dict[str, Any]], language: str, focus: str, trace: ContextUsage | None = None
+) -> tuple[dict[str, Any], bool]:
+    language_rule = "只使用自然的简体中文" if language != "en" else "Use natural spoken English only"
+    target = max(3, min(6, round(math.sqrt(max(1, len(claims))))))
+    prompt_prefix = f"""你是资料型播客的总编。{language_rule}。只规划一条能从问题逐步走向结论的叙事主线，不写对话，不补充资料外事实。
+角色固定：HOST_A 负责综合和解释，HOST_B 负责追问、澄清和检验推论。规划 {target} 个逻辑递进章节；每个 claim 只在真正相关的章节使用，不要为了覆盖来源而塞入无关内容。
+输出 JSON：{{"episode_thesis":"","chapters":[{{"title":"","purpose":"","claim_ids":["C1"],"bridge_in":"如何承接上一章","bridge_out":"留给下一章的问题"}}]}}。
+用户关注：{focus or '整体深度解读'}
+可用主张：
+"""
+    try:
+        generated = await budgeted_chat(
+            lambda budget: _segment_prompt_build(
+                budget,
+                prefix=prompt_prefix,
+                items=claims,
+                renderer=lambda claim: f"[{claim['id']}|{claim['filename']}] {claim['text']}",
+                group_key=lambda claim: str(claim["source_id"]),
+            ),
+            json_mode=True,
+            max_tokens=1800,
+            minimum_output_tokens=384,
+            temperature=0.15,
+            trace=trace,
+        )
+        parsed = _extract_json(generated.content)
+        available = {claim["id"] for claim in generated.build.metadata["items"]}
+        chapters = []
+        used: set[str] = set()
+        for item in parsed.get("chapters") or []:
+            if not isinstance(item, dict):
+                continue
+            claim_ids = [str(value) for value in item.get("claim_ids") or [] if str(value) in available and str(value) not in used]
+            title = str(item.get("title") or "").strip()
+            purpose = str(item.get("purpose") or "").strip()
+            if not title or not purpose or not claim_ids:
+                continue
+            used.update(claim_ids)
+            chapters.append(
+                {
+                    "id": f"chapter_{len(chapters) + 1}",
+                    "title": title[:120],
+                    "purpose": purpose[:300],
+                    "claim_ids": claim_ids[:10],
+                    "bridge_in": str(item.get("bridge_in") or "")[:220],
+                    "bridge_out": str(item.get("bridge_out") or "")[:220],
+                }
+            )
+            if len(chapters) >= 8:
+                break
+        thesis = str(parsed.get("episode_thesis") or "").strip()
+        if len(chapters) >= 2 and thesis:
+            return {"episode_thesis": thesis[:400], "chapters": chapters, "fallback": False}, False
+    except Exception:
+        pass
+    if trace:
+        trace.mark_fallback()
+    return _fallback_episode_plan(claims, language), True
+
+
+def podcast_generation_profile() -> dict[str, Any]:
+    provider = active_provider("main")
+    if not provider:
+        raise ValueError("请先启用 MAIN Provider")
+    limits = TokenLimits.from_provider(provider)
+    study_profile = study_generation_profile(provider)
+    tier = "lite" if limits.effective_context_tokens < 8192 or limits.max_output_tokens < 1536 or study_profile["tier"] == "lite" else "full"
+    return {
+        "tier": tier,
+        "provider": provider.get("name"),
+        "model": provider.get("model"),
+        "effective_context_tokens": limits.effective_context_tokens,
+        "max_output_tokens": limits.max_output_tokens,
+        "scene_turns": 4 if tier == "lite" else 7,
+        "recent_turns": 4 if tier == "lite" else 8,
+    }
+
+
+def _speaker(value: Any) -> str:
+    normalized = str(value or "").upper().replace("PERSON", "HOST_").replace("HOST__", "HOST_")
+    return {"A": "HOST_A", "B": "HOST_B", "1": "HOST_A", "2": "HOST_B", "HOST_1": "HOST_A", "HOST_2": "HOST_B"}.get(normalized, normalized)
+
+
+def _claim_evidence_text(claim_ids: list[str], claims_by_id: dict[str, dict[str, Any]], cards_by_id: dict[str, dict[str, Any]]) -> str:
+    values = []
+    for claim_id in claim_ids:
+        claim = claims_by_id[claim_id]
+        values.append(claim["text"])
+        values.extend(cards_by_id[evidence_id]["content"] for evidence_id in claim["evidence_ids"] if evidence_id in cards_by_id)
+    return " ".join(values)
+
+
+def _is_duplicate(text: str, turns: list[dict[str, Any]]) -> bool:
+    return any(_similar(text, turn["text"]) >= 0.84 for turn in turns)
+
+
+def _infer_claim_id(text: str, claims_by_id: dict[str, dict[str, Any]]) -> str | None:
+    target = set(tokenize(text))
+    if not target:
+        return None
+    ranked = []
+    for claim_id, claim in claims_by_id.items():
+        support = set(tokenize(str(claim["text"])))
+        score = len(target & support) / max(1, min(len(target), len(support)))
+        ranked.append((score, claim_id))
+    ranked.sort(reverse=True)
+    if not ranked or ranked[0][0] < 0.25:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.04:
+        return None
+    return ranked[0][1]
+
+
+def validate_scene_turns(
+    raw_turns: Any,
+    claims_by_id: dict[str, dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    *,
+    last_speaker: str | None,
+    existing_turns: list[dict[str, Any]],
+    language: str,
+    expected_count: int,
+    scene_kind: str = "chapter",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(raw_turns, list):
+        return [], ["模型没有返回 turns 数组"]
+    accepted: list[dict[str, Any]] = []
+    issues: list[str] = []
+    previous = last_speaker
+    for index, source in enumerate(raw_turns[: expected_count + 2]):
+        if len(accepted) >= expected_count:
+            break
+        if not isinstance(source, dict):
+            issues.append(f"第 {index + 1} 轮不是对象")
+            continue
+        supplied_speaker = _speaker(source.get("speaker"))
+        text = _normalize_text(str(source.get("text") or ""))
+        act = str(source.get("dialogue_act") or "").lower()
+        claim_ids = list(dict.fromkeys(str(value).upper() for value in source.get("claim_ids") or [] if str(value).upper() in claims_by_id))
+        expected_speaker = "HOST_B" if previous == "HOST_A" else "HOST_A"
+        if supplied_speaker not in {"HOST_A", "HOST_B"}:
+            issues.append(f"第 {index + 1} 轮说话人无效")
+            continue
+        speaker = expected_speaker
+        if act not in ALLOWED_DIALOGUE_ACTS:
+            issues.append(f"第 {index + 1} 轮 dialogue_act 无效")
+            continue
+        if (scene_kind == "intro" and act == "outro") or (scene_kind in {"chapter", "boundary_repair"} and act in {"intro", "outro"}):
+            issues.append(f"第 {index + 1} 轮 dialogue_act 不适合 {scene_kind}")
+            continue
+        minimum = 8 if language != "en" else 4
+        maximum = 150 if language != "en" else 320
+        if len(text) < minimum or len(text) > maximum:
+            issues.append(f"第 {index + 1} 轮长度不合格")
+            continue
+        lowered = text.lower()
+        if any(stem in lowered for stem in GENERIC_STEMS):
+            issues.append(f"第 {index + 1} 轮使用机械模板")
+            continue
+        if not claim_ids:
+            inferred = _infer_claim_id(text, claims_by_id)
+            if inferred:
+                claim_ids = [inferred]
+        factual = act in FACTUAL_ACTS or bool(claim_ids) or bool(NUMBER_PATTERN.search(text))
+        if factual and not claim_ids:
+            issues.append(f"第 {index + 1} 轮包含事实但没有 claim_id")
+            continue
+        evidence_ids = list(
+            dict.fromkeys(
+                evidence_id
+                for claim_id in claim_ids
+                for evidence_id in claims_by_id[claim_id]["evidence_ids"]
+                if evidence_id in cards_by_id
+            )
+        )
+        if claim_ids and not _numbers_supported(text, _claim_evidence_text(claim_ids, claims_by_id, cards_by_id)):
+            issues.append(f"第 {index + 1} 轮包含资料不支持的数字")
+            continue
+        if _is_duplicate(text, existing_turns + accepted):
+            issues.append(f"第 {index + 1} 轮与已有内容重复")
+            continue
+        accepted.append(
+            {
+                "speaker": speaker,
+                "text": text,
+                "dialogue_act": act,
+                "claim_ids": claim_ids,
+                "citation_ids": evidence_ids,
+                "safe": False,
+            }
+        )
+        previous = speaker
+    required = max(2, expected_count - 1)
+    if len(accepted) < required:
+        issues.append(f"有效轮次不足：{len(accepted)}/{required}")
+    return accepted[:expected_count], issues
+
+
+def _scene_instruction(scene_kind: str, language: str) -> str:
+    if language == "en":
+        return {
+            "intro": "Open with the episode's central question and the two hosts' complementary perspectives; do not preview every answer.",
+            "chapter": "Advance one coherent line of reasoning. Each turn must directly answer, qualify, or build on the immediately previous turn.",
+            "outro": "Resolve the central question using only claims already discussed, then close naturally without introducing new facts.",
+            "boundary_repair": "Rewrite this chapter opening so it responds directly to the preceding exchange and then enters the planned topic.",
+        }[scene_kind]
+    return {
+        "intro": "用核心问题开场，让两位主持人的互补视角自然出现；不要提前罗列所有答案。",
+        "chapter": "沿一条推理主线推进；每一轮必须直接回应、修正或承接紧邻的上一轮。",
+        "outro": "只用已经讨论过的主张回应开场问题，自然收束，不引入任何新事实。",
+        "boundary_repair": "重写本章开头，使其先回应上一段真实对话，再自然进入规划主题。",
+    }[scene_kind]
+
+
+async def _draft_scene(
+    *,
+    scene_kind: str,
+    chapter: dict[str, Any],
+    claims: list[dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    memory: EpisodeMemory,
+    existing_turns: list[dict[str, Any]],
+    target: int,
+    language: str,
+    profile: dict[str, Any],
+    trace: ContextUsage,
+    repair_feedback: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    language_rule = "只输出自然的简体中文口语" if language != "en" else "Use natural spoken English only"
+    start_speaker = "HOST_B" if memory.last_speaker == "HOST_A" else "HOST_A"
+    memory_json = json.dumps(memory.prompt_payload(profile["recent_turns"]), ensure_ascii=False)
+    feedback = "；".join(repair_feedback or [])
+    prompt_prefix = f"""你是严格资料内的双人播客编剧。{language_rule}。HOST_A 是主讲与综合者，HOST_B 是敏锐的追问与澄清者；双方都要听见并回应上一轮，使用自然的“接住并推进”方式，禁止机械采访和孤立事实罗列。
+{_scene_instruction(scene_kind, language)}
+生成 {target} 轮，从 {start_speaker} 开始并严格交替。中文每轮约 35–95 字；英文每轮约 12–35 词。事实、数字、案例、判断必须填写真正支持它的 claim_ids；问句、开场或回应只要复述了资料事实，也必须填 claim_ids。只有“那这意味着什么？”这类完全不含事实的纯承接才可以为空。不得使用资料外常识、轶事或类比，不得念出编号，不得提前结束节目。
+输出 JSON：{{"turns":[{{"speaker":"HOST_A|HOST_B","dialogue_act":"intro|frame|bridge|question|acknowledgement|explain|evidence|example|challenge|synthesis|outro","text":"","claim_ids":["C1"]}}]}}。claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。
+剧集记忆：{memory_json}
+当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。
+{f'上次草稿问题，必须修复：{feedback}' if feedback else ''}
+允许使用的主张：
+"""
+    generated = await budgeted_chat(
+        lambda budget: _segment_prompt_build(
+            budget,
+            prefix=prompt_prefix,
+            items=claims,
+            renderer=lambda claim: f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
+            group_key=lambda claim: str(claim["source_id"]),
+        ),
+        json_mode=True,
+        max_tokens=min(2200, max(700, target * 210)),
+        minimum_output_tokens=min(512, max(256, target * 100)),
+        temperature=0.45,
+        trace=trace,
+    )
+    available_claims = {claim["id"]: claim for claim in generated.build.metadata["items"]}
+    raw_turns = _extract_turns(generated.content)
+    if not isinstance(raw_turns, list):
+        reason = f"（结束原因：{generated.finish_reason}）" if generated.finish_reason else ""
+        return [], [f"模型没有返回可解析的 turns 数组{reason}"]
+    validated, issues = validate_scene_turns(
+        raw_turns,
+        available_claims,
+        cards_by_id,
+        last_speaker=memory.last_speaker,
+        existing_turns=existing_turns,
+        language=language,
+        expected_count=target,
+        scene_kind=scene_kind,
+    )
+    return validated, issues
+
+
+async def _audit_scene(
+    turns: list[dict[str, Any]],
+    claims_by_id: dict[str, dict[str, Any]],
+    memory: EpisodeMemory,
+    language: str,
+    trace: ContextUsage,
+) -> dict[str, Any]:
+    used = list(dict.fromkeys(claim_id for turn in turns for claim_id in turn["claim_ids"]))
+    transcript = "\n".join(
+        f"{index}: {turn['speaker']} [{turn['dialogue_act']}] {turn['text']} claims={','.join(turn['claim_ids']) or '-'}"
+        for index, turn in enumerate(turns)
+    )
+    previous = "\n".join(f"{turn['speaker']}: {turn['text']}" for turn in memory.last_turns[-4:]) or "（节目开篇）"
+    prompt_prefix = f"""你是严格的播客场景审校员。检查：每个事实是否只来自其 claim；第一轮是否自然回应前文；轮次之间是否前言搭后语；HOST_A/HOST_B 角色是否稳定；是否有重复或机械套话。纯过渡可以无 claim。
+只输出 JSON：{{"verdict":"pass|fail","invalid_indexes":[],"scores":{{"grounding":5,"continuity":5,"roles":5,"repetition":5}},"issues":[]}}。5=优秀、4=可发布、1=严重失败；没有问题时必须给 pass 和 4–5 分，不能在 issues 为空时给低分。纯承接问句或寒暄没有事实时可以不带 claim，不能仅因此判错。语言={language}。
+前文：
+{previous}
+待审场景：
+{transcript}
+主张：
+"""
+    try:
+        generated = await budgeted_chat(
+            lambda budget: _segment_prompt_build(
+                budget,
+                prefix=prompt_prefix,
+                items=[claims_by_id[claim_id] for claim_id in used if claim_id in claims_by_id],
+                renderer=lambda claim: f"[{claim['id']}] {claim['text']}",
+            ),
+            json_mode=True,
+            max_tokens=700,
+            minimum_output_tokens=160,
+            temperature=0.0,
+            trace=trace,
+        )
+        result = _extract_json(generated.content)
+        scores = result.get("scores") or {}
+        invalid = [int(value) for value in result.get("invalid_indexes") or [] if str(value).isdigit() and 0 <= int(value) < len(turns)]
+        issues = [str(value)[:240] for value in result.get("issues") or []][:8]
+        verdict = str(result.get("verdict") or "").lower()
+        deterministic_defaults = {"grounding": 5 if not invalid else 2, "continuity": 4, "roles": 5, "repetition": 5}
+        normalized_scores = {
+            name: int(scores[name]) if str(scores.get(name, "")).isdigit() and 1 <= int(scores[name]) <= 5 else deterministic_defaults[name]
+            for name in deterministic_defaults
+        }
+        if not invalid and not issues and verdict != "fail" and min(normalized_scores.values(), default=0) < 4:
+            normalized_scores = deterministic_defaults
+        passed = verdict != "fail" and not invalid and not issues and min(normalized_scores.values(), default=0) >= 4
+        return {"passed": passed, "invalid_indexes": invalid, "scores": normalized_scores, "issues": issues}
+    except Exception as exc:
+        return {"passed": False, "invalid_indexes": [], "scores": {}, "issues": [f"审校调用失败：{type(exc).__name__}"]}
+
+
+async def create_linked_scene(
+    *,
+    scene_kind: str,
+    chapter: dict[str, Any],
+    claims: list[dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    memory: EpisodeMemory,
+    existing_turns: list[dict[str, Any]],
+    target: int,
+    language: str,
+    profile: dict[str, Any],
+    trace: ContextUsage,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    claims_by_id = {claim["id"]: claim for claim in claims}
+    draft: list[dict[str, Any]] = []
+    deterministic_issues: list[str] = []
+    try:
+        draft, deterministic_issues = await _draft_scene(
+            scene_kind=scene_kind,
+            chapter=chapter,
+            claims=claims,
+            cards_by_id=cards_by_id,
+            memory=memory,
+            existing_turns=existing_turns,
+            target=target,
+            language=language,
+            profile=profile,
+            trace=trace,
+        )
+    except Exception as exc:
+        deterministic_issues = [f"场景生成失败：{type(exc).__name__}"]
+    audit = await _audit_scene(draft, claims_by_id, memory, language, trace) if draft else {"passed": False, "issues": []}
+    if deterministic_issues or not audit.get("passed"):
+        feedback = deterministic_issues + list(audit.get("issues") or [])
+        if audit.get("invalid_indexes"):
+            feedback.append(f"问题轮次：{audit['invalid_indexes']}")
+        try:
+            repaired, repair_issues = await _draft_scene(
+                scene_kind=scene_kind,
+                chapter=chapter,
+                claims=claims,
+                cards_by_id=cards_by_id,
+                memory=memory,
+                existing_turns=existing_turns,
+                target=target,
+                language=language,
+                profile=profile,
+                trace=trace,
+                repair_feedback=feedback or ["提升事实忠实度、上下文承接和角色稳定性"],
+            )
+        except Exception as exc:
+            repaired, repair_issues = [], [f"场景修复失败：{type(exc).__name__}"]
+        repaired_audit = await _audit_scene(repaired, claims_by_id, memory, language, trace) if repaired else {"passed": False, "issues": []}
+        if not repair_issues and repaired_audit.get("passed"):
+            return repaired, {**repaired_audit, "repaired": True}
+        report = {
+            "passed": False,
+            "stage": scene_kind,
+            "deterministic_issues": repair_issues or deterministic_issues,
+            "audit": repaired_audit,
+        }
+        raise PodcastQualityError(f"{chapter.get('title') or scene_kind} 未通过场景质量检查", report)
+    return draft, {**audit, "repaired": False}
+
+
+def _update_memory(memory: EpisodeMemory, turns: list[dict[str, Any]], chapter: dict[str, Any], recent_limit: int) -> None:
+    for turn in turns:
+        for claim_id in turn["claim_ids"]:
+            if claim_id not in memory.covered_claim_ids:
+                memory.covered_claim_ids.append(claim_id)
+    substantive = [turn["text"] for turn in turns if turn["claim_ids"]]
+    if substantive:
+        memory.chapter_summaries.append({"title": str(chapter.get("title") or ""), "summary": " ".join(substantive[-2:])[:360]})
+    memory.open_hook = str(chapter.get("bridge_out") or "")
+    memory.last_turns = (memory.last_turns + turns)[-recent_limit:]
+    memory.last_speaker = turns[-1]["speaker"] if turns else memory.last_speaker
+
+
+async def _audit_episode(
+    turns: list[dict[str, Any]], chapters: list[dict[str, Any]], thesis: str, language: str, trace: ContextUsage
+) -> dict[str, Any]:
+    boundaries = []
+    for index in range(1, len(chapters)):
+        previous, current = chapters[index - 1], chapters[index]
+        left = turns[max(previous["turn_start"], previous["turn_end"] - 1) : previous["turn_end"] + 1]
+        right = turns[current["turn_start"] : min(current["turn_end"] + 1, current["turn_start"] + 2)]
+        boundaries.append(
+            {
+                "index": index,
+                "from": previous["title"],
+                "to": current["title"],
+                "dialogue": " | ".join(f"{turn['speaker']}: {turn['text']}" for turn in left + right),
+            }
+        )
+    prompt = f"""你是整集播客主编。根据章节边界判断整集是否围绕同一核心问题递进，跨章是否自然，主持人角色是否一致，是否反复重启话题或重复套话。只输出 JSON：{{"verdict":"pass|fail","scores":{{"grounding":5,"coherence":5,"roles":5,"repetition":5,"completeness":5}},"invalid_boundaries":[],"issues":[]}}。5=优秀、4=可发布、1=严重失败；没有问题时必须给 pass 和 4–5 分。语言={language}。核心命题：{thesis}
+章节边界：{json.dumps(boundaries, ensure_ascii=False)}
+"""
+    try:
+        generated = await budgeted_chat(
+            lambda budget: PromptBuild([{"role": "user", "content": prompt}], len(boundaries), len(boundaries), 0),
+            json_mode=True,
+            max_tokens=650,
+            minimum_output_tokens=160,
+            temperature=0.0,
+            trace=trace,
+        )
+        parsed = _extract_json(generated.content)
+        scores = parsed.get("scores") or {}
+        invalid = [int(value) for value in parsed.get("invalid_boundaries") or [] if str(value).isdigit() and 0 < int(value) < len(chapters)]
+        issues = [str(value)[:240] for value in parsed.get("issues") or []][:8]
+        verdict = str(parsed.get("verdict") or "").lower()
+        names = ("grounding", "coherence", "roles", "repetition", "completeness")
+        normalized = {name: int(scores[name]) if str(scores.get(name, "")).isdigit() and 1 <= int(scores[name]) <= 5 else 4 for name in names}
+        if not invalid and not issues and verdict != "fail" and min(normalized.values(), default=0) < 4:
+            normalized = {name: 4 for name in names}
+        return {
+            "passed": verdict != "fail" and not invalid and not issues and min(normalized.values(), default=0) >= 4,
+            "scores": normalized,
+            "invalid_boundaries": invalid,
+            "issues": issues,
+        }
+    except Exception as exc:
+        return {"passed": False, "scores": {}, "invalid_boundaries": [], "issues": [f"整集审校失败：{type(exc).__name__}"]}
+
+
+async def _repair_episode_boundaries(
+    turns: list[dict[str, Any]],
+    chapters: list[dict[str, Any]],
+    claims_by_id: dict[str, dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    episode_audit: dict[str, Any],
+    thesis: str,
+    language: str,
+    profile: dict[str, Any],
+    trace: ContextUsage,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    repaired = list(turns)
+    audits: list[dict[str, Any]] = []
+    for boundary_index in list(episode_audit.get("invalid_boundaries") or [])[:2]:
+        if boundary_index <= 0 or boundary_index >= len(chapters):
+            continue
+        previous, chapter = chapters[boundary_index - 1], chapters[boundary_index]
+        start = int(chapter["turn_start"])
+        replace_count = min(2, int(chapter["turn_end"]) - start + 1)
+        if replace_count < 2:
+            continue
+        previous_turns = repaired[max(0, int(previous["turn_end"]) - 3) : int(previous["turn_end"]) + 1]
+        memory = EpisodeMemory(
+            thesis,
+            open_hook=str(previous.get("bridge_out") or ""),
+            last_turns=previous_turns,
+            last_speaker=previous_turns[-1]["speaker"] if previous_turns else None,
+        )
+        chapter_claims = [claims_by_id[value] for value in chapter.get("claim_ids") or [] if value in claims_by_id]
+        existing = repaired[:start] + repaired[start + replace_count :]
+        boundary_turns, boundary_audit = await create_linked_scene(
+            scene_kind="boundary_repair",
+            chapter=chapter,
+            claims=chapter_claims,
+            cards_by_id=cards_by_id,
+            memory=memory,
+            existing_turns=existing,
+            target=replace_count,
+            language=language,
+            profile=profile,
+            trace=trace,
+        )
+        repaired[start : start + replace_count] = boundary_turns
+        audits.append(boundary_audit)
+    return repaired, audits
+
+
+def _content_minutes(turns: list[dict[str, Any]]) -> float:
+    joined = " ".join(turn["text"] for turn in turns)
+    cjk_chars = len(re.findall(r"[\u3400-\u9fff]", joined))
+    latin_words = len(re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", joined))
+    return cjk_chars / 270 + latin_words / 150 + len(turns) * 0.45 / 60
+
+
+def _repeated_stem_ratio(turns: list[dict[str, Any]]) -> float:
+    stems = [re.sub(r"[“\"].*", "", turn["text"])[:24] for turn in turns if turn["dialogue_act"] == "question"]
+    if not stems:
+        return 0.0
+    repeated = sum(count - 1 for count in Counter(stems).values() if count > 1)
+    return repeated / len(stems)
+
+
+def _quality_metrics_v3(
+    turns: list[dict[str, Any]], citations: list[dict[str, Any]], target_minutes: int, requested_turns: int,
+    episode_audit: dict[str, Any], scene_audits: list[dict[str, Any]], selected_source_ids: list[str]
 ) -> dict[str, Any]:
     a_chars = sum(len(turn["text"]) for turn in turns if turn["speaker"] == "HOST_A")
     b_chars = sum(len(turn["text"]) for turn in turns if turn["speaker"] == "HOST_B")
     total = max(1, a_chars + b_chars)
-    valid_ids = {citation["id"] for citation in citations}
-    joined = " ".join(turn["text"] for turn in turns)
-    cjk_chars = len(re.findall(r"[\u3400-\u9fff]", joined))
-    latin_words = len(re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", joined))
-    estimated_minutes = cjk_chars / 270 + latin_words / 150 + len(turns) * 0.45 / 60
-    requested_turns = requested_turns or target_turn_count(target_minutes)
-    return {
+    estimated = _content_minutes(turns)
+    factual = [turn for turn in turns if turn["dialogue_act"] in FACTUAL_ACTS or turn["claim_ids"]]
+    source_coverage = len({citation["source_id"] for citation in citations})
+    duplicate_pairs = sum(_similar(left["text"], right["text"]) >= 0.84 for index, left in enumerate(turns) for right in turns[index + 1 :])
+    report = {
+        "passed": False,
         "target_minutes": target_minutes,
-        "estimated_minutes": round(estimated_minutes, 1),
+        "estimated_minutes": round(estimated, 2),
+        "duration_ratio": round(estimated / max(1, target_minutes), 3),
         "target_turn_count": requested_turns,
-        "completion_ratio": round(min(1.0, len(turns) / max(1, requested_turns)), 3),
         "turn_count": len(turns),
         "host_a_ratio": round(a_chars / total, 3),
         "host_b_ratio": round(b_chars / total, 3),
-        "questions": sum("?" in turn["text"] or "？" in turn["text"] for turn in turns),
-        "all_turns_cited": all(turn["citation_ids"] and set(turn["citation_ids"]) <= valid_ids for turn in turns),
-        "safe_fallback_turns": sum(bool(turn.get("safe")) for turn in turns),
+        "factual_turns": len(factual),
+        "uncited_factual_turns": sum(not turn["citation_ids"] for turn in factual),
+        "bridge_turns": sum(turn["dialogue_act"] in NONFACTUAL_ACTS and not turn["claim_ids"] for turn in turns),
+        "all_factual_turns_cited": all(turn["citation_ids"] for turn in factual),
+        "duplicate_pairs": duplicate_pairs,
+        "repeated_stem_ratio": round(_repeated_stem_ratio(turns), 3),
+        "source_coverage": source_coverage,
+        "selected_sources": len(selected_source_ids),
+        "scene_repairs": sum(bool(audit.get("repaired")) for audit in scene_audits),
+        "scene_scores": [audit.get("scores") for audit in scene_audits],
+        "episode_audit": episode_audit,
+        "safe_fallback_turns": 0,
     }
+    report["passed"] = bool(
+        0.85 <= report["duration_ratio"] <= 1.20
+        and 0.30 <= report["host_a_ratio"] <= 0.70
+        and report["uncited_factual_turns"] == 0
+        and report["duplicate_pairs"] == 0
+        and report["repeated_stem_ratio"] <= 0.10
+        and episode_audit.get("passed")
+    )
+    return report
 
 
 async def build_podcast_script(
@@ -603,61 +1263,138 @@ async def build_podcast_script(
     if len(cards) < 2:
         raise ValueError("资料内容不足，无法生成深度播客")
     if progress:
-        progress("规划节目主题", 0.14)
+        progress("提取可引用主张", 0.12)
     context_usage = ContextUsage()
-    chapters, outline_degraded = await create_podcast_outline(cards, language, focus, context_usage)
+    claims = build_claim_ledger(cards)
+    if len(claims) < 2:
+        raise ValueError("资料中缺少足够的可验证主张")
+    if progress:
+        progress("规划递进式剧集结构", 0.16)
+    episode_plan, outline_degraded = await create_episode_plan(claims, language, focus, context_usage)
+    chapters = episode_plan["chapters"]
     duration_mode = payload.get("duration_mode") or ("fixed" if payload.get("minutes") else "auto")
     requested_minutes = int(payload.get("minutes") or 0) or None
     target_minutes = requested_minutes if duration_mode == "fixed" and requested_minutes else estimate_auto_minutes(len(chapters), len(cards))
-    total_target = (
-        max(24, round(target_minutes * 6.5)) if duration_mode == "fixed" else target_turn_count(target_minutes)
-    )
-    chapter_targets = [4 for _ in chapters]
-    cursor = 0
-    while sum(chapter_targets) < total_target:
-        chapter_targets[cursor % len(chapter_targets)] += 2
-        cursor += 1
+    total_target = target_turn_count(target_minutes)
+    intro_target, outro_target = (3, 3) if total_target < 60 else (4, 4)
+    body_target = max(len(chapters) * 3, total_target - intro_target - outro_target)
+    chapter_targets = [body_target // len(chapters) for _ in chapters]
+    for index in range(body_target % len(chapters)):
+        chapter_targets[index] += 1
     cards_by_id = {card["id"]: card for card in cards}
+    claims_by_id = {claim["id"]: claim for claim in claims}
+    profile = podcast_generation_profile()
     turns: list[dict[str, Any]] = []
-    degraded = outline_degraded
-    covered_titles: list[str] = []
+    memory = EpisodeMemory(episode_plan["episode_thesis"])
     chapter_payloads: list[dict[str, Any]] = []
+    scene_audits: list[dict[str, Any]] = []
+
+    intro_claims = [claims_by_id[value] for value in chapters[0]["claim_ids"][:3] if value in claims_by_id]
+    intro_chapter = {"title": "节目开场" if language != "en" else "Introduction", "purpose": episode_plan["episode_thesis"], "bridge_in": "", "bridge_out": chapters[0].get("bridge_in") or chapters[0]["purpose"]}
+    intro_turns, intro_audit = await create_linked_scene(
+        scene_kind="intro", chapter=intro_chapter, claims=intro_claims, cards_by_id=cards_by_id, memory=memory,
+        existing_turns=turns, target=intro_target, language=language, profile=profile, trace=context_usage,
+    )
+    turns.extend(intro_turns)
+    scene_audits.append(intro_audit)
+    _update_memory(memory, intro_turns, intro_chapter, profile["recent_turns"])
+
     for chapter_index, chapter in enumerate(chapters):
         if progress:
-            progress(f"编写章节 {chapter_index + 1}/{len(chapters)}", 0.17 + 0.20 * chapter_index / max(1, len(chapters)))
-        episode_context = "；".join(covered_titles[-4:]) or ("这是节目开篇" if language != "en" else "This opens the episode")
-        chapter_turns, chapter_degraded = await create_chapter_turns(
-            chapter, cards_by_id, chapter_targets[chapter_index], language, episode_context, context_usage
-        )
+            progress(f"连贯续写章节 {chapter_index + 1}/{len(chapters)}", 0.20 + 0.34 * chapter_index / max(1, len(chapters)))
         start_index = len(turns)
-        for item in chapter_turns:
-            item["speaker"] = "HOST_A" if len(turns) % 2 == 0 else "HOST_B"
-            item["id"] = f"turn_{len(turns) + 1}"
-            item["chapter_id"] = chapter["id"]
-            turns.append(item)
+        chapter_claims = [claims_by_id[value] for value in chapter["claim_ids"] if value in claims_by_id]
+        remaining = chapter_targets[chapter_index]
+        while remaining > 0:
+            batch = min(profile["scene_turns"], remaining)
+            if batch == 1:
+                batch = 2
+            scene_turns, scene_audit = await create_linked_scene(
+                scene_kind="chapter", chapter=chapter, claims=chapter_claims, cards_by_id=cards_by_id, memory=memory,
+                existing_turns=turns, target=batch, language=language, profile=profile, trace=context_usage,
+            )
+            turns.extend(scene_turns)
+            scene_audits.append(scene_audit)
+            _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
+            remaining -= len(scene_turns)
+            if len(scene_turns) < batch:
+                raise PodcastQualityError(f"{chapter['title']} 有效内容不足", {"passed": False, "stage": "chapter_length"})
         chapter_payloads.append({**chapter, "turn_start": start_index, "turn_end": len(turns) - 1})
-        covered_titles.append(chapter["title"])
-        degraded = degraded or chapter_degraded
+
+    # A short draft may be expanded once, but only with claims the episode has
+    # not covered yet. This preserves the requested duration without falling
+    # back to generic banter or repeating an earlier explanation.
+    if _content_minutes(turns) < target_minutes * 0.72:
+        unused_claims = [claim for claim in claims if claim["id"] not in memory.covered_claim_ids]
+        if unused_claims:
+            expansion_claims = unused_claims[: max(2, profile["scene_turns"])]
+            expansion_chapter = {
+                **chapters[-1],
+                "purpose": (
+                    f"{chapters[-1]['purpose']}；补齐尚未讨论但与核心命题直接相关的证据"
+                    if language != "en"
+                    else f"{chapters[-1]['purpose']}; cover remaining evidence directly relevant to the thesis"
+                ),
+                "claim_ids": [claim["id"] for claim in expansion_claims],
+            }
+            expansion_turns, expansion_audit = await create_linked_scene(
+                scene_kind="chapter", chapter=expansion_chapter, claims=expansion_claims,
+                cards_by_id=cards_by_id, memory=memory, existing_turns=turns,
+                target=max(2, profile["scene_turns"]), language=language, profile=profile,
+                trace=context_usage,
+            )
+            turns.extend(expansion_turns)
+            scene_audits.append(expansion_audit)
+            _update_memory(memory, expansion_turns, expansion_chapter, profile["recent_turns"])
+            chapter_payloads[-1]["turn_end"] = len(turns) - 1
+
+    covered_claims = [claims_by_id[value] for value in memory.covered_claim_ids if value in claims_by_id]
+    outro_chapter = {"title": "节目结语" if language != "en" else "Conclusion", "purpose": episode_plan["episode_thesis"], "bridge_in": memory.open_hook, "bridge_out": ""}
+    outro_turns, outro_audit = await create_linked_scene(
+        scene_kind="outro", chapter=outro_chapter, claims=covered_claims[-8:], cards_by_id=cards_by_id, memory=memory,
+        existing_turns=turns, target=outro_target, language=language, profile=profile, trace=context_usage,
+    )
+    turns.extend(outro_turns)
+    scene_audits.append(outro_audit)
+    if progress:
+        progress("执行整集连贯性审校", 0.58)
+    episode_audit = await _audit_episode(turns, chapter_payloads, episode_plan["episode_thesis"], language, context_usage)
+    if not episode_audit.get("passed") and episode_audit.get("invalid_boundaries"):
+        turns, boundary_audits = await _repair_episode_boundaries(
+            turns, chapter_payloads, claims_by_id, cards_by_id, episode_audit, episode_plan["episode_thesis"],
+            language, profile, context_usage,
+        )
+        scene_audits.extend(boundary_audits)
+        episode_audit = await _audit_episode(turns, chapter_payloads, episode_plan["episode_thesis"], language, context_usage)
     used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     used_citations = [citation for citation in all_citations if citation["id"] in used_evidence]
     remap = {citation["id"]: f"S{index}" for index, citation in enumerate(used_citations, start=1)}
     citations = [{**citation, "id": remap[citation["id"]]} for citation in used_citations]
     for turn in turns:
         turn["citation_ids"] = [remap[value] for value in turn["citation_ids"] if value in remap]
-    if degraded:
+    for index, turn in enumerate(turns, start=1):
+        turn["id"] = f"turn_{index}"
+        turn["chapter_id"] = next((chapter["id"] for chapter in chapter_payloads if chapter["turn_start"] <= index - 1 <= chapter["turn_end"]), "intro" if index <= intro_target else "outro")
+    quality = _quality_metrics_v3(turns, citations, target_minutes, total_target, episode_audit, scene_audits, ids)
+    if not quality["passed"]:
+        raise PodcastQualityError("整集脚本未达到发布门槛", quality)
+    if outline_degraded:
         context_usage.mark_fallback()
     script = "\n".join(f"{turn['speaker']}: {turn['text']} {' '.join(f'[{value}]' for value in turn['citation_ids'])}" for turn in turns)
     return {
-        "version": 2,
+        "version": PODCAST_ENGINE_VERSION,
+        "engine": {**profile, "strategy": "linked_scenes", "version": PODCAST_ENGINE_VERSION},
         "language": language,
         "source_ids": ids,
         "scope_hash": scope_hash(ids),
         "duration": {"mode": duration_mode, "requested_minutes": requested_minutes, "target_minutes": target_minutes},
         "chapters": chapter_payloads,
+        "episode_plan": episode_plan,
         "turns": turns,
         "script": script,
         "citations": citations,
-        "degraded": degraded,
+        "degraded": outline_degraded,
         "context_usage": context_usage.as_dict(),
-        "quality": _quality_metrics(turns, citations, target_minutes, total_target),
+        "quality": quality,
+        "quality_report": quality,
     }

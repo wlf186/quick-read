@@ -13,7 +13,7 @@ from .database import DB, json_dump, json_load, new_id, utc_now
 from .config import CONFIG
 from .paths import PATHS
 from .providers import active_provider, study_generation_profile, synthesize
-from .podcast import build_podcast_script
+from .podcast import PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script
 from .services import ingest_source, make_summary
 from .study import generate_study_artifact
 from .observability import LABELS, Reporter
@@ -86,6 +86,9 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     provider = active_provider("tts")
     if not provider:
         raise RuntimeError("请先配置并启用 TTS provider")
+    main_provider = active_provider("main")
+    if not main_provider:
+        raise RuntimeError("请先配置并启用 MAIN provider")
     config = provider.get("config", {})
     suffix = job_id.removeprefix("job_")
     work_dir = PATHS.job_work / job_id
@@ -93,7 +96,16 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     register_resource("job", job_id, notebook_id, "podcast-work", work_dir)
     out_dir = PATHS.artifacts / f"podcast_{suffix}"
     manifest_path = work_dir / "manifest.json"
-    signature = hashlib.sha256(json_dump({"payload": payload, "model": provider.get("model"), "device": config.get("compute_device")}).encode()).hexdigest()
+    signature = hashlib.sha256(
+        json_dump(
+            {
+                "payload": payload,
+                "main": {"name": main_provider.get("name"), "model": main_provider.get("model"), "config": main_provider.get("config")},
+                "tts": {"name": provider.get("name"), "model": provider.get("model"), "device": config.get("compute_device")},
+                "script_engine": PODCAST_ENGINE_VERSION,
+            }
+        ).encode()
+    ).hexdigest()
 
     def save_manifest(value: dict[str, Any]) -> None:
         temporary = manifest_path.with_suffix(".tmp")
@@ -107,8 +119,12 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         def report(stage: str, progress: float) -> None:
             Reporter(job_id).update("script", stage, progress, current=progress, total=1, unit="阶段")
 
-        generated = await build_podcast_script(notebook_id, payload, progress=report)
-        manifest = {"version": 2, "signature": signature, "generated": generated}
+        try:
+            generated = await build_podcast_script(notebook_id, payload, progress=report)
+        except PodcastQualityError as exc:
+            save_manifest({"version": PODCAST_ENGINE_VERSION, "signature": signature, "quality_failure": exc.report})
+            raise RuntimeError(f"播客脚本未通过质量门槛：{exc}") from exc
+        manifest = {"version": PODCAST_ENGINE_VERSION, "signature": signature, "generated": generated}
         save_manifest(manifest)
 
     language = generated["language"]
