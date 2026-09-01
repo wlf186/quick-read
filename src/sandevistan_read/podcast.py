@@ -8,11 +8,12 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
-from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items
+from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items, structured_output_tokens
 from .database import DB, json_load
 from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
 from .retrieval import retrieve, tokenize
 from .services import _evenly_spaced, scope_hash, source_scope
+from .languages import resolve_output_language, text_matches_language
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
@@ -81,19 +82,7 @@ def _segment_prompt_build(
 
 
 def resolve_podcast_language(source_ids: list[str], requested: str) -> str:
-    if requested != "auto":
-        return requested
-    chinese = 0
-    english = 0
-    for source_id in source_ids:
-        row = DB.fetchone("SELECT filename,metadata_json FROM sources WHERE id=?", (source_id,)) or {}
-        metadata = json_load(row.get("metadata_json"), {})
-        declared = str(metadata.get("language", "")).lower()
-        if declared.startswith("en"):
-            english += 1
-        elif declared.startswith("zh") or re.search(r"[\u3400-\u9fff]", row.get("filename", "")):
-            chinese += 1
-    return "en" if english > chinese else "zh-CN"
+    return resolve_output_language(DB, source_ids, requested)[0]
 
 
 def estimate_auto_minutes(chapter_count: int, evidence_count: int) -> int:
@@ -225,12 +214,12 @@ def _extract_json(raw: str) -> dict[str, Any]:
         return {}
 
 
-def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
-    """Recover only complete turn objects from a possibly truncated JSON list."""
+def _extract_array(raw: str, key: str) -> list[dict[str, Any]] | None:
+    """Recover only complete objects from a possibly truncated JSON list."""
     parsed = _extract_json(raw)
-    if isinstance(parsed.get("turns"), list):
-        return parsed["turns"]
-    match = re.search(r'"turns"\s*:\s*\[', raw)
+    if isinstance(parsed.get(key), list):
+        return parsed[key]
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', raw)
     if not match:
         return None
     decoder = json.JSONDecoder()
@@ -250,6 +239,10 @@ def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
         recovered.append(value)
         position += consumed
     return recovered or None
+
+
+def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
+    return _extract_array(raw, "turns")
 
 
 def _fallback_outline(cards: list[dict[str, Any]], language: str) -> list[dict[str, Any]]:
@@ -708,7 +701,7 @@ async def create_episode_plan(
                 group_key=lambda claim: str(claim["source_id"]),
             ),
             json_mode=True,
-            max_tokens=1800,
+            max_tokens=structured_output_tokens(1800),
             minimum_output_tokens=384,
             temperature=0.15,
             trace=trace,
@@ -717,7 +710,7 @@ async def create_episode_plan(
         available = {claim["id"] for claim in generated.build.metadata["items"]}
         chapters = []
         used: set[str] = set()
-        for item in parsed.get("chapters") or []:
+        for item in _extract_array(generated.content, "chapters") or []:
             if not isinstance(item, dict):
                 continue
             claim_ids = [str(value) for value in item.get("claim_ids") or [] if str(value) in available and str(value) not in used]
@@ -843,6 +836,9 @@ def validate_scene_turns(
         if len(text) < minimum or len(text) > maximum:
             issues.append(f"第 {index + 1} 轮长度不合格")
             continue
+        if not text_matches_language(text, language):
+            issues.append(f"第 {index + 1} 轮语言不符合输出要求")
+            continue
         lowered = text.lower()
         if any(stem in lowered for stem in GENERIC_STEMS):
             issues.append(f"第 {index + 1} 轮使用机械模板")
@@ -880,7 +876,7 @@ def validate_scene_turns(
             }
         )
         previous = speaker
-    required = max(2, expected_count - 1)
+    required = max(1, expected_count - 1)
     if len(accepted) < required:
         issues.append(f"有效轮次不足：{len(accepted)}/{required}")
     return accepted[:expected_count], issues
@@ -938,8 +934,8 @@ async def _draft_scene(
             group_key=lambda claim: str(claim["source_id"]),
         ),
         json_mode=True,
-        max_tokens=min(2200, max(700, target * 210)),
-        minimum_output_tokens=min(512, max(256, target * 100)),
+        max_tokens=structured_output_tokens(min(3200, max(900, target * 400))),
+        minimum_output_tokens=min(768, max(256, target * 160)),
         temperature=0.45,
         trace=trace,
     )
@@ -1027,7 +1023,6 @@ async def create_linked_scene(
     profile: dict[str, Any],
     trace: ContextUsage,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    claims_by_id = {claim["id"]: claim for claim in claims}
     draft: list[dict[str, Any]] = []
     deterministic_issues: list[str] = []
     try:
@@ -1045,11 +1040,10 @@ async def create_linked_scene(
         )
     except Exception as exc:
         deterministic_issues = [f"场景生成失败：{type(exc).__name__}"]
-    audit = await _audit_scene(draft, claims_by_id, memory, language, trace) if draft else {"passed": False, "issues": []}
-    if deterministic_issues or not audit.get("passed"):
-        feedback = deterministic_issues + list(audit.get("issues") or [])
-        if audit.get("invalid_indexes"):
-            feedback.append(f"问题轮次：{audit['invalid_indexes']}")
+    if draft:
+        return draft, {"passed": not deterministic_issues, "partial": len(draft) < target, "deterministic_issues": deterministic_issues, "repaired": False}
+    if deterministic_issues:
+        feedback = deterministic_issues
         try:
             repaired, repair_issues = await _draft_scene(
                 scene_kind=scene_kind,
@@ -1066,17 +1060,15 @@ async def create_linked_scene(
             )
         except Exception as exc:
             repaired, repair_issues = [], [f"场景修复失败：{type(exc).__name__}"]
-        repaired_audit = await _audit_scene(repaired, claims_by_id, memory, language, trace) if repaired else {"passed": False, "issues": []}
-        if not repair_issues and repaired_audit.get("passed"):
-            return repaired, {**repaired_audit, "repaired": True}
+        if repaired:
+            return repaired, {"passed": not repair_issues, "partial": len(repaired) < target, "deterministic_issues": repair_issues, "repaired": True}
         report = {
             "passed": False,
             "stage": scene_kind,
             "deterministic_issues": repair_issues or deterministic_issues,
-            "audit": repaired_audit,
         }
         raise PodcastQualityError(f"{chapter.get('title') or scene_kind} 未通过场景质量检查", report)
-    return draft, {**audit, "repaired": False}
+    raise PodcastQualityError(f"{chapter.get('title') or scene_kind} 未返回可用内容", {"passed": False, "stage": scene_kind})
 
 
 def _update_memory(memory: EpisodeMemory, turns: list[dict[str, Any]], chapter: dict[str, Any], recent_limit: int) -> None:
@@ -1115,7 +1107,7 @@ async def _audit_episode(
         generated = await budgeted_chat(
             lambda budget: PromptBuild([{"role": "user", "content": prompt}], len(boundaries), len(boundaries), 0),
             json_mode=True,
-            max_tokens=650,
+            max_tokens=structured_output_tokens(650),
             minimum_output_tokens=160,
             temperature=0.0,
             trace=trace,
@@ -1130,7 +1122,8 @@ async def _audit_episode(
         if not invalid and not issues and verdict != "fail" and min(normalized.values(), default=0) < 4:
             normalized = {name: 4 for name in names}
         return {
-            "passed": verdict != "fail" and not invalid and not issues and min(normalized.values(), default=0) >= 4,
+            "passed": not invalid and min(normalized.values(), default=0) >= 4,
+            "verdict": verdict or "unspecified",
             "scores": normalized,
             "invalid_boundaries": invalid,
             "issues": issues,
@@ -1254,7 +1247,7 @@ async def build_podcast_script(
     ids = source_scope(notebook_id, payload.get("source_ids"))
     if not ids:
         raise ValueError("当前范围没有已就绪的文档")
-    language = resolve_podcast_language(ids, payload.get("language", "zh-CN"))
+    language, language_selection = resolve_output_language(DB, ids, payload.get("language", "zh-CN"))
     focus = str(payload.get("focus") or "").strip()
     if progress:
         progress("构建全篇证据地图", 0.08)
@@ -1284,6 +1277,8 @@ async def build_podcast_script(
     cards_by_id = {card["id"]: card for card in cards}
     claims_by_id = {claim["id"]: claim for claim in claims}
     profile = podcast_generation_profile()
+    planned_scene_blocks = 2 + sum(math.ceil(target / profile["scene_turns"]) for target in chapter_targets) + 1
+    context_usage.request_limit = 1 + 2 * planned_scene_blocks + 4
     turns: list[dict[str, Any]] = []
     memory = EpisodeMemory(episode_plan["episode_thesis"])
     chapter_payloads: list[dict[str, Any]] = []
@@ -1305,20 +1300,35 @@ async def build_podcast_script(
         start_index = len(turns)
         chapter_claims = [claims_by_id[value] for value in chapter["claim_ids"] if value in claims_by_id]
         remaining = chapter_targets[chapter_index]
+        consecutive_zero = 0
         while remaining > 0:
             batch = min(profile["scene_turns"], remaining)
-            if batch == 1:
-                batch = 2
-            scene_turns, scene_audit = await create_linked_scene(
-                scene_kind="chapter", chapter=chapter, claims=chapter_claims, cards_by_id=cards_by_id, memory=memory,
-                existing_turns=turns, target=batch, language=language, profile=profile, trace=context_usage,
-            )
+            try:
+                scene_turns, scene_audit = await create_linked_scene(
+                    scene_kind="chapter", chapter=chapter, claims=chapter_claims, cards_by_id=cards_by_id, memory=memory,
+                    existing_turns=turns, target=batch, language=language, profile=profile, trace=context_usage,
+                )
+            except PodcastQualityError:
+                consecutive_zero += 1
+                if consecutive_zero >= 2:
+                    raise PodcastQualityError(
+                        f"{chapter['title']} 连续两次没有可用内容",
+                        {"passed": False, "stage": "chapter_zero_yield", "context_usage": context_usage.as_dict()},
+                    )
+                continue
+            if not scene_turns:
+                consecutive_zero += 1
+                if consecutive_zero >= 2:
+                    raise PodcastQualityError(
+                        f"{chapter['title']} 连续两次没有可用内容",
+                        {"passed": False, "stage": "chapter_zero_yield", "context_usage": context_usage.as_dict()},
+                    )
+                continue
+            consecutive_zero = 0
             turns.extend(scene_turns)
             scene_audits.append(scene_audit)
             _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
             remaining -= len(scene_turns)
-            if len(scene_turns) < batch:
-                raise PodcastQualityError(f"{chapter['title']} 有效内容不足", {"passed": False, "stage": "chapter_length"})
         chapter_payloads.append({**chapter, "turn_start": start_index, "turn_end": len(turns) - 1})
 
     # A short draft may be expanded once, but only with claims the episode has
@@ -1377,6 +1387,7 @@ async def build_podcast_script(
         turn["chapter_id"] = next((chapter["id"] for chapter in chapter_payloads if chapter["turn_start"] <= index - 1 <= chapter["turn_end"]), "intro" if index <= intro_target else "outro")
     quality = _quality_metrics_v3(turns, citations, target_minutes, total_target, episode_audit, scene_audits, ids)
     if not quality["passed"]:
+        quality["context_usage"] = context_usage.as_dict()
         raise PodcastQualityError("整集脚本未达到发布门槛", quality)
     if outline_degraded:
         context_usage.mark_fallback()
@@ -1385,6 +1396,7 @@ async def build_podcast_script(
         "version": PODCAST_ENGINE_VERSION,
         "engine": {**profile, "strategy": "linked_scenes", "version": PODCAST_ENGINE_VERSION},
         "language": language,
+        "language_selection": language_selection,
         "source_ids": ids,
         "scope_hash": scope_hash(ids),
         "duration": {"mode": duration_mode, "requested_minutes": requested_minutes, "target_minutes": target_minutes},

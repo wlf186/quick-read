@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
 from sandevistan_read.database import Database, json_dump
 from sandevistan_read.context_budget import PromptBudget
 from sandevistan_read.providers import BudgetedCompletion, study_generation_profile
@@ -121,6 +123,53 @@ async def test_lite_quiz_generation_uses_model_items_without_template_fillers(tm
     assert all("直接出现在" not in item["question"] for item in result["payload"]["items"])
     assert [item["answer_index"] for item in result["payload"]["items"]] == [0, 1, 2]
     assert all(len(item["citations"]) == 1 for item in result["payload"]["items"])
+
+
+@pytest.mark.asyncio
+async def test_full_generation_keeps_one_recovery_after_candidate_round_limit(tmp_path, monkeypatch) -> None:
+    database = _study_database(tmp_path)
+    database.execute(
+        """INSERT INTO sources(id,notebook_id,revision_id,filename,media_type,size_bytes,sha256,blob_path,preview_path,state,selected,page_count,parser,error,metadata_json,created_at,updated_at)
+        VALUES('s1','n1','r1','source.md','text/markdown',100,'hash','blob',NULL,'ready',1,1,'text',NULL,'{}','now','now')"""
+    )
+    for index in range(4):
+        database.execute(
+            "INSERT INTO chunks(id,source_id,source_revision_id,ordinal,content,locator_json,embedding_json,checksum,created_at) VALUES(?,?,?,?,?,'{}','[]',?,'now')",
+            (f"ch{index}", "s1", "r1", index, f"核心机制证据 {index}，用于验证恢复流程。", f"h{index}"),
+        )
+    monkeypatch.setattr(study, "DB", database)
+    monkeypatch.setattr(study, "active_provider", lambda role: {"kind": "openai", "model": "full", "config": {"study_generation_tier": "full"}, "capabilities": {"token_limits": {"effective_context_tokens": 32768, "max_output_tokens": 8192}}})
+    async def fake_blueprint(*args):
+        return ([{"title": "机制", "objective": "理解机制", "difficulty": "medium", "citations": ["S1"]}] * 3, False)
+
+    monkeypatch.setattr(study, "_build_blueprint", fake_blueprint)
+    monkeypatch.setattr(study, "validate_quiz_item", lambda item, *args: (item, None))
+    monkeypatch.setattr(study, "_semantic_unique", lambda *args: True)
+    generated_calls = audit_calls = 0
+
+    async def fake_chat(builder, **kwargs):
+        nonlocal generated_calls, audit_calls
+        budget = PromptBudget(32768, 20000, 6000, 2048, 1.0)
+        build = builder(budget)
+        if "accepted_indexes" in build.messages[0]["content"]:
+            audit_calls += 1
+            indexes = [0, 1] if audit_calls == 1 else [0]
+            content = json.dumps({"accepted_indexes": indexes, "issues": []})
+        else:
+            generated_calls += 1
+            content = json.dumps({"items": [{
+                "question": f"机制问题 {generated_calls}", "options": ["甲", "乙", "丙", "丁"], "answer_index": 0,
+                "hint": "提示", "explanation": "核心机制证据用于验证恢复流程。", "citations": ["S1"],
+                "difficulty": "medium", "cognitive_level": "understand",
+            }]}, ensure_ascii=False)
+        return BudgetedCompletion(content, build, budget)
+
+    monkeypatch.setattr(study, "budgeted_chat", fake_chat)
+    result = await generate_study_artifact("n1", "quiz", 3, ["s1"], "zh-CN", "medium")
+    assert result["status"] == "ready"
+    assert generated_calls == 4
+    assert audit_calls == 2
+    assert result["payload"]["quality_report"]["stop_reason"] == "recovery_completed"
 
 
 def _study_database(tmp_path) -> Database:

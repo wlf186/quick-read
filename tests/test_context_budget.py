@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 
 from sandevistan_read import providers
-from sandevistan_read.context_budget import ContextUsage, TokenLimits, estimate_text_tokens, pack_items
+from sandevistan_read.context_budget import ContextUsage, TokenLimits, estimate_text_tokens, pack_items, structured_output_tokens
 from sandevistan_read.database import Database
 
 
@@ -22,6 +22,12 @@ def test_token_limits_apply_manual_overrides_and_conservative_defaults() -> None
     assert manual.effective_context_tokens == 16384
     assert manual.max_output_tokens == 2048
     assert manual.context_source == "manual"
+
+
+def test_structured_output_budget_includes_bounded_reasoning_headroom() -> None:
+    assert structured_output_tokens(700) == 1724
+    assert structured_output_tokens(1800) == 3600
+    assert structured_output_tokens(6000) == 10096
 
 
 def test_packing_preserves_source_coverage_within_budget() -> None:

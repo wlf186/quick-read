@@ -158,7 +158,11 @@ async def test_chat_uses_provider_temperature_override(monkeypatch: pytest.Monke
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert payload["temperature"] == expected
-        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+        assert "reasoning_effort" not in payload
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 30, "prompt_tokens_details": {"cached_tokens": 10}, "completion_tokens_details": {"reasoning_tokens": 20}},
+        })
 
     mock_client(monkeypatch, handler)
     profile = candidate(kind="openai", base_url="https://compatible.example.com", model="chat", config=config)
@@ -171,6 +175,9 @@ async def test_chat_uses_provider_temperature_override(monkeypatch: pytest.Monke
         temperature=0.25,
     )
     assert result.content == "OK"
+    assert result.reasoning_tokens == 20
+    assert result.cached_tokens == 10
+    assert result.temperature_source == ("provider" if config else "task_default")
 
 
 @pytest.mark.asyncio

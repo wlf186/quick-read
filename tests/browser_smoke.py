@@ -12,7 +12,7 @@ QA_NOTEBOOK = "QA 2026-08-28 · ALL 4"
 
 
 def authenticate(page: Page) -> None:
-    page.goto(BASE_URL, wait_until="networkidle")
+    page.goto(BASE_URL, wait_until="domcontentloaded")
     if page.get_by_text("访问授权", exact=True).is_visible():
         with (ROOT / "runtime/config.toml").open("rb") as handle:
             access_key = tomllib.load(handle)["security"]["access_key"]
@@ -253,7 +253,8 @@ def main() -> None:
         page.screenshot(path="/tmp/sandevistan-read-flashcard-desktop.png")
         page.keyboard.press("Escape")
 
-        page.goto(f"{BASE_URL}/#jobs", wait_until="networkidle")
+        page.goto(f"{BASE_URL}/#jobs", wait_until="domcontentloaded")
+        page.get_by_role("heading", name="任务记录").wait_for()
         assert page.get_by_role("heading", name="任务记录").is_visible()
         page.locator(".record-open").first.click()
         job_dialog = page.get_by_role("dialog", name=re.compile("任务详情"))
@@ -277,7 +278,8 @@ def main() -> None:
             )
 
         page.route("**/api/notebook-management?*", notebook_management)
-        page.goto(f"{BASE_URL}/#notebooks", wait_until="networkidle")
+        page.goto(f"{BASE_URL}/#notebooks", wait_until="domcontentloaded")
+        page.get_by_role("button", name="新建 Notebook").wait_for()
         page.get_by_role("button", name="新建 Notebook").click()
         create_dialog = page.get_by_role("dialog", name="新建 Notebook")
         assert create_dialog.is_visible()
@@ -321,7 +323,8 @@ def main() -> None:
 
         tablet = context.new_page()
         tablet.set_viewport_size({"width": 900, "height": 900})
-        tablet.goto(f"{BASE_URL}/#workspace", wait_until="networkidle")
+        tablet.goto(f"{BASE_URL}/#workspace", wait_until="domcontentloaded")
+        tablet.locator(".notebook-menu").wait_for()
         assert tablet.locator(".notebook-menu").is_visible()
         assert not tablet.locator(".workspace > .studio").is_visible()
         tablet.locator(".tablet-studio-trigger").click()
@@ -332,7 +335,8 @@ def main() -> None:
 
         mobile = context.new_page()
         mobile.set_viewport_size({"width": 390, "height": 844})
-        mobile.goto(f"{BASE_URL}/#workspace", wait_until="networkidle")
+        mobile.goto(f"{BASE_URL}/#workspace", wait_until="domcontentloaded")
+        mobile.locator(".notebook-menu").wait_for()
         assert_no_horizontal_overflow(mobile)
         assert mobile.locator(".notebook-menu").is_visible()
         mobile.get_by_role("button", name=re.compile("资料")).click()
@@ -355,7 +359,7 @@ def main() -> None:
         mobile.keyboard.press("Escape")
         assert mobile_settings.count() == 0
 
-        mobile.goto(f"{BASE_URL}/#jobs", wait_until="networkidle")
+        mobile.goto(f"{BASE_URL}/#jobs", wait_until="domcontentloaded")
         mobile.wait_for_function(
             "document.querySelector('.manage-table')?.getAttribute('aria-busy') === 'false'"
         )
@@ -364,7 +368,7 @@ def main() -> None:
         mobile.screenshot(path="/tmp/sandevistan-read-ui-jobs-mobile.png")
 
         mobile.route("**/api/notebook-management?*", notebook_management)
-        mobile.goto(f"{BASE_URL}/#notebooks", wait_until="networkidle")
+        mobile.goto(f"{BASE_URL}/#notebooks", wait_until="domcontentloaded")
         mobile.wait_for_function(
             "document.querySelector('.manage-table')?.getAttribute('aria-busy') === 'false' && "
             "document.querySelectorAll('.notebook-grid.manage-row').length === 3"

@@ -581,6 +581,10 @@ class ChatCompletion:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    temperature: float | None = None
+    temperature_source: str | None = None
 
 
 @dataclass
@@ -663,6 +667,8 @@ async def _chat_once(
                 positive_int(result.get("prompt_eval_count")),
                 positive_int(result.get("eval_count")),
                 str(result.get("done_reason") or "") or None,
+                temperature=request_temperature,
+                temperature_source="provider" if (provider.get("config") or {}).get("temperature") is not None else "task_default",
             )
         if provider["kind"] == "openai":
             payload = {"model": provider["model"], "messages": messages, "temperature": request_temperature, "max_tokens": max_tokens}
@@ -673,12 +679,18 @@ async def _chat_once(
                 raise _provider_response_error(response)
             result = response.json()
             usage = result.get("usage") or {}
+            completion_details = usage.get("completion_tokens_details") or {}
+            prompt_details = usage.get("prompt_tokens_details") or {}
             choice = result["choices"][0]
             return ChatCompletion(
                 str(choice["message"]["content"] or ""),
                 positive_int(usage.get("prompt_tokens")),
                 positive_int(usage.get("completion_tokens")),
                 str(choice.get("finish_reason") or "") or None,
+                positive_int(completion_details.get("reasoning_tokens")),
+                positive_int(prompt_details.get("cached_tokens")) or positive_int(usage.get("cached_tokens")),
+                request_temperature,
+                "provider" if (provider.get("config") or {}).get("temperature") is not None else "task_default",
             )
     raise ProviderError(f"Provider {provider['kind']} cannot serve chat")
 
@@ -726,6 +738,8 @@ async def budgeted_chat(
                 f"提示构建结果 {estimated} tokens 超过安全预算 {budget.input_tokens}", code="local_context_budget", status=422
             )
         try:
+            if trace:
+                trace.begin_request()
             completion = await _chat_once(
                 provider,
                 build.messages,
@@ -735,17 +749,27 @@ async def budgeted_chat(
                 temperature=temperature,
             )
         except ContextOverflowError as exc:
+            if trace:
+                trace.record_failure()
+                trace.overflow_retries += 1
             last_error = exc
             continue
+        except Exception:
+            if trace:
+                trace.record_failure()
+            raise
         if trace:
             trace.record(
                 limits=limits,
                 requested_output=max_tokens,
                 output_tokens=budget.output_tokens,
-                attempts=attempt,
                 estimated_prompt=estimated,
                 actual_prompt=completion.prompt_tokens,
                 actual_completion=completion.completion_tokens,
+                reasoning_tokens=completion.reasoning_tokens,
+                cached_tokens=completion.cached_tokens,
+                temperature=completion.temperature,
+                temperature_source=completion.temperature_source,
                 total_segments=build.total_segments,
                 included_segments=build.included_segments,
                 truncated_segments=build.truncated_segments,

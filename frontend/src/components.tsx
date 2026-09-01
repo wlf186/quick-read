@@ -6,6 +6,16 @@ import {CitationIndex,ConfirmDialog,Overlay,RichText} from './ui';
 const SUPPORTED_EXTENSIONS=new Set(['pdf','docx','pptx','epub','txt','md','markdown','html','htm']);
 const PODCAST_LANGUAGE_KEY='sread_podcast_language_v1';
 
+function artifactStatusText(item:Artifact){
+  const report=item.payload?.quality_report;
+  if(item.status==='partial'||report?.partial){
+    const generated=Number(report?.generated_count??item.payload?.turns?.length??0);
+    const requested=Number(report?.requested_count??report?.target_turn_count??0);
+    return requested>0?`PARTIAL · ${generated}/${requested}`:'PARTIAL';
+  }
+  return String(item.status||'ready').toUpperCase();
+}
+
 export function Logo(){return <div className="brand"><div className="mark"><Zap size={20}/></div><div><strong>SANDEVISTAN</strong><span>// READ</span></div></div>}
 
 export function LoginScreen({onLogin,error}:{onLogin:(key:string)=>Promise<void>;error:string}){
@@ -88,7 +98,7 @@ function etaText(job:Job){if(job.eta?.status==='learning')return `ETA 学习中 
 export function StudioRail({onCreate,onOpen,artifacts,jobs,hasNotebook,selectedCount}:{onCreate:(type:string)=>Promise<void>;onOpen:(artifact:Artifact)=>void;artifacts:Artifact[];jobs:Job[];hasNotebook:boolean;selectedCount:number}){
   const active=jobs.filter(job=>['running','queued','cancelling'].includes(job.state)).slice(0,3);const failed=jobs.filter(job=>job.state==='failed').slice(0,2);const disabled=!hasNotebook||selectedCount===0;
   return <aside className="studio panel" aria-label="Studio"><div className="panel-title"><span>STUDIO</span><em>{selectedCount} SELECTED</em></div><p className="studio-intro">将已选资料转化为可学习内容。</p>{disabled?<p className="studio-hint">{hasNotebook?'选择至少一份已索引资料后即可生成。':'先选择或新建 Notebook。'}</p>:null}<div className="studio-cards">{cards.map(([type,title,Icon,description])=><button key={type} disabled={disabled} onClick={()=>void onCreate(type)}><Icon/><span><b>{title}</b><small>{description}</small></span><Plus size={15}/></button>)}</div>
-    <div className="activity"><div className="panel-title"><span>输出记录</span><button className="inline-link" onClick={()=>{location.hash='jobs'}}>全部任务</button></div>{active.map(job=><button className="job job-button" key={job.id} onClick={()=>{location.hash='jobs'}}><span>{job.display_name||job.kind.toUpperCase()} · {Math.round(job.progress*100)}%</span><small>{job.stage}{job.stage_total?` · ${job.stage_current}/${job.stage_total}${job.stage_unit||''}`:''}</small><i><b style={{width:`${job.progress*100}%`}}/></i><small>{job.state==='queued'&&job.eta?.queue_position?`队列第 ${job.eta.queue_position} 位 · `:''}{etaText(job)}</small></button>)}{failed.map(job=><button className="job job-button failed-job" key={job.id} onClick={()=>{location.hash='jobs'}}><span>{job.kind.toUpperCase()} · FAILED</span><small>{job.error}</small></button>)}{artifacts.slice(0,6).map(item=><button className="artifact" key={item.id} onClick={()=>onOpen(item)}><FileText size={16}/><span><b>{item.title}</b><small>{item.type.toUpperCase()} · READY</small></span></button>)}{!artifacts.length&&!active.length?<p className="no-output">尚无生成内容</p>:null}</div>
+    <div className="activity"><div className="panel-title"><span>输出记录</span><button className="inline-link" onClick={()=>{location.hash='jobs'}}>全部任务</button></div>{active.map(job=><button className="job job-button" key={job.id} onClick={()=>{location.hash='jobs'}}><span>{job.display_name||job.kind.toUpperCase()} · {Math.round(job.progress*100)}%</span><small>{job.stage}{job.stage_total?` · ${job.stage_current}/${job.stage_total}${job.stage_unit||''}`:''}</small><i><b style={{width:`${job.progress*100}%`}}/></i><small>{job.state==='queued'&&job.eta?.queue_position?`队列第 ${job.eta.queue_position} 位 · `:''}{etaText(job)}</small></button>)}{failed.map(job=><button className="job job-button failed-job" key={job.id} onClick={()=>{location.hash='jobs'}}><span>{job.kind.toUpperCase()} · FAILED</span><small>{job.error}</small></button>)}{artifacts.slice(0,6).map(item=><button className="artifact" key={item.id} onClick={()=>onOpen(item)}><FileText size={16}/><span><b>{item.title}</b><small>{item.type.toUpperCase()} · {artifactStatusText(item)}</small></span></button>)}{!artifacts.length&&!active.length?<p className="no-output">尚无生成内容</p>:null}</div>
   </aside>;
 }
 

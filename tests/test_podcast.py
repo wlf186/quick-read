@@ -97,7 +97,7 @@ async def test_chapter_generation_rejects_duplicates_and_unsupported_numbers(mon
 
 
 @pytest.mark.asyncio
-async def test_linked_scene_repairs_a_bad_draft_once(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_linked_scene_repairs_a_bad_draft_without_per_scene_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"draft": 0, "audit": 0}
 
     async def fake_budgeted_chat(builder, **kwargs):
@@ -137,7 +137,7 @@ async def test_linked_scene_repairs_a_bad_draft_once(monkeypatch: pytest.MonkeyP
     )
     assert len(turns) == 2
     assert audit["passed"] is True and audit["repaired"] is True
-    assert calls == {"draft": 2, "audit": 1}
+    assert calls == {"draft": 2, "audit": 0}
 
 
 @pytest.mark.asyncio
@@ -203,6 +203,32 @@ async def test_build_podcast_script_emits_v3_linked_payload(monkeypatch: pytest.
 
 async def _async_value(value):
     return value
+
+
+@pytest.mark.asyncio
+async def test_episode_audit_treats_four_point_minor_notes_as_publishable(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_chat(builder, **kwargs):
+        build = builder(PromptBudget(8192, 6000, 1500, 2048, 1.0))
+        content = json.dumps({
+            "verdict": "fail",
+            "scores": {"grounding": 5, "coherence": 4, "roles": 5, "repetition": 5, "completeness": 5},
+            "invalid_boundaries": [],
+            "issues": ["A minor bridge could be more explicit."],
+        })
+        return SimpleNamespace(content=content, build=build)
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_chat)
+    turns = [
+        {"speaker": "HOST_A", "text": "First grounded point."},
+        {"speaker": "HOST_B", "text": "Second grounded point."},
+    ]
+    chapters = [
+        {"title": "One", "turn_start": 0, "turn_end": 0},
+        {"title": "Two", "turn_start": 1, "turn_end": 1},
+    ]
+    audit = await podcast._audit_episode(turns, chapters, "Thesis", "en", podcast.ContextUsage())
+    assert audit["passed"] is True
+    assert audit["issues"]
 
 
 def test_v3_quality_gate_rejects_underlength_episode() -> None:

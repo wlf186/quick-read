@@ -14,6 +14,7 @@ from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens
 from .providers import PromptBuild, ProviderError, budgeted_chat, describe_image
 from .retrieval import EMBEDDINGS, retrieve
 from .observability import Reporter
+from .languages import resolve_output_language
 
 
 def source_scope(notebook_id: str, requested: list[str] | None) -> list[str]:
@@ -421,6 +422,7 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     ids = source_scope(notebook_id, source_ids)
     if not ids:
         raise ValueError("当前范围没有已就绪的文档")
+    language, language_selection = resolve_output_language(DB, ids, language)
     reporter = Reporter(job_id) if job_id else None
     if reporter:
         reporter.update("collect", "构建全文证据采样", 0.06, current=0, total=len(ids), unit="份")
@@ -431,7 +433,9 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     summary_id = f"summary_{suffix}" if suffix else new_id("summary")
     artifact_id, now = (f"artifact_{suffix}" if suffix else new_id("artifact")), utc_now()
     DB.execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?)", (summary_id, notebook_id, result["scope_hash"], result["content"], json_dump(result["citations"]), now))
-    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"content": result["content"], "degraded": result["degraded"], "context_usage": result["context_usage"]}), json_dump(result["citations"]), None, now, now))
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"content": result["content"], "degraded": result["degraded"], "context_usage": result["context_usage"], "language_selection": language_selection}), json_dump(result["citations"]), None, now, now))
+    result["language"] = language
+    result["language_selection"] = language_selection
     result["id"] = summary_id
     result["artifact_id"] = artifact_id
     return result

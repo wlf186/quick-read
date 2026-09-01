@@ -8,11 +8,12 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, estimate_text_tokens, pack_items
+from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, estimate_text_tokens, pack_items, structured_output_tokens
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .observability import Reporter
 from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
 from .retrieval import EMBEDDINGS, retrieve, tokenize
+from .languages import resolve_output_language, text_matches_language
 
 
 BANNED_QUIZ_STEMS = ("直接出现在", "资料位置", "引用位置", "第几页", "哪一页")
@@ -120,6 +121,29 @@ def _json_object(raw: str) -> dict[str, Any]:
     return value
 
 
+def _json_array_items(raw: str, key: str) -> list[Any]:
+    try:
+        value = _json_object(raw).get(key)
+        if isinstance(value, list):
+            return value
+    except (ValueError, json.JSONDecodeError):
+        pass
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', raw)
+    if not match:
+        return []
+    decoder, position, recovered = json.JSONDecoder(), match.end(), []
+    while position < len(raw):
+        while position < len(raw) and (raw[position].isspace() or raw[position] == ","):
+            position += 1
+        try:
+            value, consumed = decoder.raw_decode(raw[position:])
+        except json.JSONDecodeError:
+            break
+        recovered.append(value)
+        position += consumed
+    return recovered
+
+
 def _local_blueprint(chunks: list[dict[str, Any]], labels: list[str], count: int, difficulty: str, tier: str) -> list[dict[str, Any]]:
     levels = _difficulty_sequence(count, difficulty, tier)
     blueprint = []
@@ -163,13 +187,13 @@ async def _build_blueprint(
         generated = await budgeted_chat(
             lambda budget: _evidence_build(budget, chunks, labels, prefix),
             json_mode=True,
-            max_tokens=min(1800, max(700, count * 110)),
+            max_tokens=structured_output_tokens(min(1800, max(700, count * 110))),
             minimum_output_tokens=384,
             trace=trace,
         )
         valid_labels = set(generated.build.metadata["labels"])
         concepts = []
-        for item in _json_object(generated.content).get("concepts", []):
+        for item in _json_array_items(generated.content, "concepts"):
             if not isinstance(item, dict):
                 continue
             refs = [str(value) for value in item.get("citations", []) if str(value) in valid_labels][:3]
@@ -275,7 +299,7 @@ def _candidate_prompt(kind: str, concepts: list[dict[str, Any]], count: int, lan
 资料：
 """
     return f"""你是严谨的闪卡设计师。{common}
-生成恰好 {count} 张原子化闪卡：一张只测一个知识点，正面必须能独立理解，背面简洁准确；不要写“资料要点”或“该位置包含什么”。可覆盖事实、概念、关系、比较与资料内应用。explanation 给出简短理解说明。仅输出 JSON：{{"items":[{{"learning_objective":"...","difficulty":"easy|medium|hard","card_type":"fact|concept|relationship|comparison|application","front":"...","back":"...","explanation":"...","citations":["S1"]}}]}}
+生成恰好 {count} 张原子化闪卡：一张只测一个知识点，正面必须能独立理解，背面简洁准确；不要写“资料要点”或“该位置包含什么”。中文 front/back/explanation 分别不超过 50/80/120 字；英文分别不超过 20/35/50 words。可覆盖事实、概念、关系、比较与资料内应用。explanation 给出简短理解说明。仅输出 JSON：{{"items":[{{"learning_objective":"...","difficulty":"easy|medium|hard","card_type":"fact|concept|relationship|comparison|application","front":"...","back":"...","explanation":"...","citations":["S1"]}}]}}
 资料：
 """
 
@@ -283,25 +307,28 @@ def _candidate_prompt(kind: str, concepts: list[dict[str, Any]], count: int, lan
 async def _audit_candidates(
     kind: str,
     candidates: list[dict[str, Any]],
-    chunks: list[dict[str, Any]],
-    labels: list[str],
+    evidence_by_label: dict[str, dict[str, Any]],
     trace: ContextUsage,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> tuple[list[int], list[str]]:
     if not candidates:
-        return [], labels, chunks
+        return [], []
     schema = "question/options/answer_index/hint/explanation/citations" if kind == "quiz" else "front/back/explanation/citations"
-    prefix = f"""你是独立证据审校员。逐项检查下列候选是否完全由资料支持、清晰、无歧义且满足 {schema}。Quiz 必须恰有一个正确答案且干扰项合理；闪卡必须只测一个知识点。修复可修复项，删除无法可靠修复项。不得新增资料外事实或引用。仅输出 JSON：{{"items":[...]}}。
+    prefix = f"""你是独立证据审校员。逐项检查下列候选是否完全由资料支持、清晰、无歧义且满足 {schema}。Quiz 必须恰有一个正确答案且干扰项合理；闪卡必须只测一个知识点。不得改写候选，只返回可发布项的零基索引。仅输出 JSON：{{"accepted_indexes":[0],"issues":["1: 原因"]}}。
 候选：{json.dumps(candidates, ensure_ascii=False)}
 资料：
 """
+    labels = list(dict.fromkeys(label for item in candidates for label in item.get("citations", []) if label in evidence_by_label))
+    chunks = [evidence_by_label[label] for label in labels]
     generated = await budgeted_chat(
         lambda budget: _evidence_build(budget, chunks, labels, prefix),
         json_mode=True,
-        max_tokens=1800,
+        max_tokens=structured_output_tokens(max(300, len(candidates) * 80)),
         minimum_output_tokens=384,
         trace=trace,
     )
-    return list(_json_object(generated.content).get("items", [])), list(generated.build.metadata["labels"]), list(generated.build.metadata["chunks"])
+    parsed = _json_object(generated.content)
+    indexes = [int(value) for value in parsed.get("accepted_indexes", []) if str(value).isdigit() and 0 <= int(value) < len(candidates)]
+    return list(dict.fromkeys(indexes)), [str(value)[:240] for value in parsed.get("issues", [])][:20]
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -345,6 +372,7 @@ async def generate_study_artifact(
     ids = _source_scope(notebook_id, source_ids)
     if not ids:
         raise ValueError("当前范围没有已就绪的文档")
+    language, language_selection = resolve_output_language(DB, ids, language)
     provider = active_provider("main")
     if not provider:
         raise ValueError("请先启用 MAIN Provider")
@@ -362,13 +390,20 @@ async def generate_study_artifact(
     if reporter:
         reporter.update("plan", "构建知识蓝图", 0.08, current=0, total=count, unit="项")
     blueprint, blueprint_fallback = await _build_blueprint(chunks, labels, count, difficulty, language, custom_prompt, tier, trace)
+    provisional: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
     rejected: Counter[str] = Counter()
     batch_size = 1 if tier == "lite" else 3
-    candidate_budget = max(count * 2, count + 3)
+    max_candidate_rounds = math.ceil(count / batch_size) + 2
     cursor = 0
-    while len(accepted) < count and cursor < candidate_budget:
-        batch_count = min(batch_size, count - len(accepted), candidate_budget - cursor)
+    candidate_rounds = 0
+    audit_rounds = 0
+    audit_fallback = False
+    consecutive_zero = 0
+    stop_reason = "candidate_round_limit"
+    validator: Callable[[Any, set[str], dict[str, dict[str, Any]]], tuple[dict[str, Any] | None, str | None]] = validate_quiz_item if kind == "quiz" else validate_flashcard_item
+    while len(provisional) < count and candidate_rounds < max_candidate_rounds and consecutive_zero < 2:
+        batch_count = min(batch_size, count - len(provisional))
         concepts = [blueprint[(cursor + offset) % len(blueprint)] for offset in range(batch_count)]
         concept_labels = list(dict.fromkeys(label for concept in concepts for label in concept.get("citations", [])))
         selected_pairs = [(label, evidence_by_label[label]) for label in concept_labels if label in evidence_by_label]
@@ -380,40 +415,94 @@ async def generate_study_artifact(
         selected_labels = [label for label, _ in selected_pairs]
         selected_chunks = [chunk for _, chunk in selected_pairs]
         if reporter:
-            reporter.update("generate", f"生成并核验 {len(accepted)}/{count}", 0.15 + 0.72 * len(accepted) / max(1, count), current=len(accepted), total=count, unit="项")
+            reporter.update("generate", f"生成候选 {len(provisional)}/{count}", 0.15 + 0.58 * len(provisional) / max(1, count), current=len(provisional), total=count, unit="项")
         try:
             generated = await budgeted_chat(
                 lambda budget: _evidence_build(budget, selected_chunks, selected_labels, _candidate_prompt(kind, concepts, batch_count, language, custom_prompt)),
                 json_mode=True,
-                max_tokens=1800,
+                max_tokens=structured_output_tokens(max(900, batch_count * (900 if kind == "quiz" else 500))),
                 minimum_output_tokens=320,
                 trace=trace,
             )
-            candidates = list(_json_object(generated.content).get("items", []))
+            candidates = _json_array_items(generated.content, "items")
             used_labels = list(generated.build.metadata["labels"])
             used_chunks = list(generated.build.metadata["chunks"])
-            if tier == "full":
-                candidates, used_labels, used_chunks = await _audit_candidates(kind, candidates, used_chunks, used_labels, trace)
         except Exception:
             candidates, used_labels, used_chunks = [], selected_labels, selected_chunks
             rejected["provider_or_json_error"] += batch_count
         valid_labels = set(used_labels)
         used_evidence = dict(zip(used_labels, used_chunks))
-        validator: Callable[[Any, set[str], dict[str, dict[str, Any]]], tuple[dict[str, Any] | None, str | None]] = validate_quiz_item if kind == "quiz" else validate_flashcard_item
+        yielded = 0
         for candidate in candidates:
             item, reason = validator(candidate, valid_labels, used_evidence)
             if not item:
                 rejected[reason or "invalid"] += 1
                 continue
-            if not _semantic_unique(item, accepted, kind):
+            text = " ".join(str(item.get(field) or "") for field in ("question", "front", "back", "explanation"))
+            if not text_matches_language(text, language):
+                rejected["language_mismatch"] += 1
+                continue
+            if not _semantic_unique(item, provisional, kind):
                 rejected["semantic_duplicate"] += 1
                 continue
-            if kind == "quiz":
-                item = _balance_answer(item, len(accepted) % 4)
-            accepted.append(item)
-            if len(accepted) >= count:
+            provisional.append(item)
+            yielded += 1
+            if len(provisional) >= count:
                 break
         cursor += batch_count
+        candidate_rounds += 1
+        consecutive_zero = consecutive_zero + 1 if yielded == 0 else 0
+        if yielded < batch_count and batch_size > 1:
+            batch_size = 1
+            remaining_items = max(0, count - len(provisional))
+            max_candidate_rounds = max(max_candidate_rounds, candidate_rounds + remaining_items + 2)
+    stop_reason = "target_met" if len(provisional) >= count else "consecutive_zero_yield" if consecutive_zero >= 2 else stop_reason
+    if tier == "full" and provisional:
+        if reporter:
+            reporter.update("audit", "聚合审校全部候选", 0.76, current=len(provisional), total=count, unit="项")
+        try:
+            indexes, audit_issues = await _audit_candidates(kind, provisional, evidence_by_label, trace)
+            audit_rounds += 1
+            accepted = [provisional[index] for index in indexes]
+            rejected["aggregate_audit"] += len(provisional) - len(accepted)
+            if audit_issues:
+                rejected["audit_reported_issues"] += len(audit_issues)
+        except Exception:
+            accepted = provisional[:count]
+            audit_fallback = True
+            trace.mark_fallback()
+            rejected["audit_provider_or_json_error"] += 1
+    else:
+        accepted = provisional[:count]
+    if tier == "full" and len(accepted) < count:
+        deficit = min(batch_size, count - len(accepted))
+        concepts = [blueprint[(cursor + offset) % len(blueprint)] for offset in range(deficit)]
+        try:
+            generated = await budgeted_chat(
+                lambda budget: _evidence_build(budget, chunks, labels, _candidate_prompt(kind, concepts, deficit, language, custom_prompt) + "\n此前聚合审校淘汰了一些候选；只补充新的、证据更直接的项目。"),
+                json_mode=True,
+                max_tokens=structured_output_tokens(max(900, deficit * (900 if kind == "quiz" else 500))),
+                minimum_output_tokens=320,
+                trace=trace,
+            )
+            recovery: list[dict[str, Any]] = []
+            for candidate in _json_array_items(generated.content, "items"):
+                item, reason = validator(candidate, set(generated.build.metadata["labels"]), dict(zip(generated.build.metadata["labels"], generated.build.metadata["chunks"])))
+                if item and text_matches_language(" ".join(str(item.get(field) or "") for field in ("question", "front", "back", "explanation")), language) and _semantic_unique(item, accepted + recovery, kind):
+                    recovery.append(item)
+                elif not item:
+                    rejected[reason or "recovery_invalid"] += 1
+            if recovery:
+                indexes, _ = await _audit_candidates(kind, recovery, evidence_by_label, trace)
+                audit_rounds += 1
+                accepted.extend(recovery[index] for index in indexes)
+            stop_reason = "recovery_completed" if len(accepted) >= count else "recovery_exhausted"
+        except Exception:
+            rejected["recovery_provider_or_json_error"] += deficit
+            stop_reason = "recovery_exhausted"
+    accepted = accepted[:count]
+    if kind == "quiz":
+        accepted = [_balance_answer(item, index % 4) for index, item in enumerate(accepted)]
     minimum = min(3, count)
     if len(accepted) < minimum:
         raise ValueError(f"模型只生成了 {len(accepted)} 个通过证据校验的内容；请降低难度或切换更强的 MAIN Provider")
@@ -421,7 +510,7 @@ async def generate_study_artifact(
         item["id"] = f"q{index}" if kind == "quiz" else f"c{index}"
     used_labels = list(dict.fromkeys(label for item in accepted for label in item["citations"]))
     citations = [all_citations[label] for label in used_labels if label in all_citations]
-    partial = len(accepted) < count
+    partial = len(accepted) < count or audit_fallback
     if partial or blueprint_fallback:
         trace.mark_fallback()
     quality_report = {
@@ -436,8 +525,12 @@ async def generate_study_artifact(
         "selected_sources": len(ids),
         "difficulty_requested": difficulty,
         "difficulty_effective": "easy+medium" if tier == "lite" and difficulty == "mixed" else difficulty,
+        "candidate_rounds": candidate_rounds,
+        "audit_rounds": audit_rounds,
+        "audit_fallback": audit_fallback,
+        "stop_reason": stop_reason,
     }
-    payload = {"version": 2, "items": accepted, "quality_report": quality_report, "degraded": partial or blueprint_fallback, "context_usage": trace.as_dict()}
+    payload = {"version": 2, "items": accepted, "quality_report": quality_report, "degraded": partial or blueprint_fallback, "context_usage": trace.as_dict(), "language_selection": language_selection}
     artifact_id = f"artifact_{job_id.removeprefix('job_')}" if job_id else new_id("artifact")
     now = utc_now()
     status = "partial" if partial else "ready"
