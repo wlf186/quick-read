@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
-from .context_budget import validate_token_overrides
+from .context_budget import resolve_temperature, validate_token_overrides
 
 
 class NotebookCreate(BaseModel):
@@ -39,6 +39,7 @@ def _validate_provider_pair(role: str, kind: str) -> None:
 
 def _validate_provider_config(config: dict[str, Any]) -> None:
     validate_token_overrides(config)
+    resolve_temperature(config, 0.0)
     tier = config.get("study_generation_tier", "auto")
     if tier not in {"auto", "lite", "full"}:
         raise ValueError("学习生成档位必须是 auto、lite 或 full")
@@ -76,7 +77,7 @@ class ProviderUpdate(BaseModel):
     @model_validator(mode="after")
     def validate_context_overrides(self):
         if self.config is not None:
-            validate_token_overrides(self.config)
+            _validate_provider_config(self.config)
         return self
 
 

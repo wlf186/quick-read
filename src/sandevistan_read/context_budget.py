@@ -13,6 +13,8 @@ MIN_CONTEXT_WINDOW_TOKENS = 1024
 MIN_OUTPUT_WINDOW_TOKENS = 128
 SAFETY_RATIO = 0.80
 RETRY_SCALES = (1.0, 0.5, 0.25)
+MIN_TEMPERATURE = 0.0
+MAX_TEMPERATURE = 2.0
 
 
 def positive_int(value: Any) -> int | None:
@@ -40,6 +42,18 @@ def validate_token_overrides(config: dict[str, Any]) -> None:
             raise ValueError(f"最大输出必须是 {MIN_OUTPUT_WINDOW_TOKENS} 到 {MAX_CONTEXT_WINDOW_TOKENS} 之间的整数")
         if context is not None and output >= context:
             raise ValueError("最大输出必须小于上下文窗口")
+
+
+def resolve_temperature(config: dict[str, Any], default: float) -> float:
+    value = config.get("temperature")
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("Temperature 必须是 0 到 2 之间的数字")
+    temperature = float(value)
+    if not MIN_TEMPERATURE <= temperature <= MAX_TEMPERATURE:
+        raise ValueError("Temperature 必须是 0 到 2 之间的数字")
+    return temperature
 
 
 def estimate_text_tokens(text: str) -> int:

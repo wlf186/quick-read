@@ -12,10 +12,11 @@ export type StudyDifficulty='easy'|'medium'|'hard'|'mixed';
 export type StudyOptions={count:number;difficulty:StudyDifficulty;language:'auto'|'zh-CN'|'en';custom_prompt:string};
 export type StudySession={id:string;artifact_id:string;kind:'quiz'|'flashcard';mode:'all'|'missed'|'due'|'same';status:'active'|'complete';items:Array<Record<string,any>>;progress:{current:number;total:number};created_at:string;updated_at:string};
 export type TokenLimits={model_context_tokens?:number|null;effective_context_tokens:number;max_input_tokens?:number|null;max_output_tokens:number;context_source:'manual'|'ollama_runtime'|'ollama_modelfile'|'provider_metadata'|'fallback'|string;output_source:'manual'|'provider_metadata'|'derived'|string;image_tokens_per_image?:number;probed_at?:string};
-export type Provider={id:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>&{study_generation?:{tier:'lite'|'full';source:string;reason:string;parameter_count?:number|null;supports_difficulties:string[]}};config:Record<string,any>};
+export type ProviderConfig=Record<string,any>&{temperature?:number;context_window_tokens?:number;max_output_tokens?:number;study_generation_tier?:'auto'|'lite'|'full'};
+export type Provider={id:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;active:number;has_api_key:boolean;capabilities:Record<string,any>&{study_generation?:{tier:'lite'|'full';source:string;reason:string;parameter_count?:number|null;supports_difficulties:string[]}};config:ProviderConfig};
 export type ProviderModel={id:string;name:string;installed?:boolean;devices?:Array<{id:string;available:boolean;precision?:string;reason?:string}>;controls?:Record<string,any>;details?:Record<string,any>;token_limits?:Partial<TokenLimits>};
 export type ProviderInspection={status:'passed'|'warning'|'failed';connection_ok:boolean;activation_eligible:boolean;latency_ms:number;catalog_supported:boolean;models:ProviderModel[];capabilities:Record<string,any>;recommended?:{model?:string;compute_device?:string}|null;warning?:string|null;error?:{code:string;stage:string;message:string;hint:string;upstream_status?:number|null}|null};
-export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:Record<string,any>};
+export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:ProviderConfig};
 export type PodcastOptions={duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
 export type AuthStatus={required:boolean;authenticated:boolean};
 

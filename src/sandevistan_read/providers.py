@@ -26,6 +26,7 @@ from .context_budget import (
     is_context_error,
     positive_int,
     prompt_budget,
+    resolve_temperature,
     truncate_text_tokens,
     validate_token_overrides,
 )
@@ -416,10 +417,15 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
                 json={"model": model, "voice": voice, "input": "连接测试", "response_format": "wav"},
                 headers=headers,
             )
-            response.raise_for_status()
+            if not response.is_success:
+                raise _provider_response_error(response)
             if not response.content:
                 raise ProviderError("TTS Provider 未返回音频")
             return
+        try:
+            temperature = resolve_temperature(provider.get("config") or {}, 0.0)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
         if kind == "ollama":
             message: dict[str, Any] = {"role": "user", "content": "只回复 OK"}
             if role == "vlm":
@@ -427,7 +433,7 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
             limits = TokenLimits.from_provider(provider)
             response = await client.post(
                 f"{provider['base_url']}/api/chat",
-                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 4, "num_ctx": limits.effective_context_tokens}},
+                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": temperature, "num_predict": 64, "num_ctx": limits.effective_context_tokens}},
                 headers=headers,
             )
         else:
@@ -439,12 +445,25 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
                 ]
             response = await client.post(
                 f"{provider['base_url']}/v1/chat/completions",
-                json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0, "max_tokens": 4},
+                json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": temperature, "max_tokens": 64},
                 headers=headers,
             )
-        response.raise_for_status()
-        if not response.content:
-            raise ProviderError("Provider 未返回验证结果")
+        if not response.is_success:
+            raise _provider_response_error(response)
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ProviderError("Provider 返回了无法识别的验证结果") from exc
+        if not isinstance(result, dict):
+            raise ProviderError("Provider 返回了无法识别的验证结果")
+        if kind == "ollama":
+            message = result.get("message")
+        else:
+            choices = result.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            message = first.get("message") if isinstance(first, dict) else None
+        if not isinstance(message, dict) or not str(message.get("content") or "").strip():
+            raise ProviderError("Provider 未返回验证文本")
 
 
 async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> dict[str, Any]:
@@ -512,7 +531,9 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             return verification_error(code="verification_failed", message=f"模型调用失败（HTTP {status}）", hint="检查模型、能力和角色是否匹配", upstream_status=status)
-        except (httpx.HTTPError, ProviderError) as exc:
+        except ProviderError as exc:
+            return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、温度、音色、设备及 Provider 日志", upstream_status=exc.status)
+        except httpx.HTTPError as exc:
             return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、音色、设备及 Provider 日志")
         eligible, warning = True, context_warning
     return {
@@ -618,6 +639,10 @@ async def _chat_once(
     if provider["api_key"]:
         headers["Authorization"] = f"Bearer {provider['api_key']}"
     limits = TokenLimits.from_provider(provider)
+    try:
+        request_temperature = resolve_temperature(provider.get("config") or {}, temperature)
+    except ValueError as exc:
+        raise ProviderError(str(exc)) from exc
     async with httpx.AsyncClient(timeout=timeout) as client:
         if provider["kind"] == "ollama":
             payload: dict[str, Any] = {
@@ -625,7 +650,7 @@ async def _chat_once(
                 "messages": messages,
                 "stream": False,
                 "think": False,
-                "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": limits.effective_context_tokens},
+                "options": {"temperature": request_temperature, "num_predict": max_tokens, "num_ctx": limits.effective_context_tokens},
             }
             if json_mode:
                 payload["format"] = "json"
@@ -640,7 +665,7 @@ async def _chat_once(
                 str(result.get("done_reason") or "") or None,
             )
         if provider["kind"] == "openai":
-            payload = {"model": provider["model"], "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+            payload = {"model": provider["model"], "messages": messages, "temperature": request_temperature, "max_tokens": max_tokens}
             if json_mode:
                 payload["response_format"] = {"type": "json_object"}
             response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)

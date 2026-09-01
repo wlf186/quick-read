@@ -71,8 +71,11 @@ def main() -> None:
         assert settings.is_visible()
         assert settings.evaluate("element => element.contains(document.activeElement)")
 
+        inspection_requests: list[dict] = []
+
         def inspect_provider(route) -> None:
             request = json.loads(route.request.post_data or "{}")
+            inspection_requests.append(request)
             selected = request.get("model", "")
             models = [{"id": "alpha-chat", "name": "Alpha Chat"}, {"id": "beta-vision", "name": "Beta Vision"}]
             route.fulfill(
@@ -121,10 +124,13 @@ def main() -> None:
         assert settings.get_by_text(re.compile("2 个模型 · 42 ms")).is_visible()
         assert settings.get_by_text(re.compile("理论最大 32,768 · 运行 8,192 · 输出 2,048")).is_visible()
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
+        settings.get_by_label("Temperature 覆盖").fill("1")
         settings.get_by_label("上下文窗口覆盖（tokens）").fill("16384")
         settings.get_by_label("最大输出覆盖（tokens）").fill("2048")
         settings.get_by_role("button", name="连接并读取模型").click()
         settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
+        assert inspection_requests[-1]["config"]["temperature"] == 1
+        assert settings.get_by_label("Temperature 覆盖").input_value() == "1"
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
         assert_no_horizontal_overflow(page)
         page.screenshot(path="/tmp/sandevistan-read-provider-desktop.png")
@@ -339,10 +345,13 @@ def main() -> None:
         mobile_settings = mobile.get_by_role("dialog", name="Provider 配置")
         mobile_settings.get_by_role("button", name="添加 Provider").click()
         assert mobile_settings.get_by_role("heading", name="添加 Provider").is_visible()
+        mobile_temperature = mobile_settings.get_by_label("Temperature 覆盖")
+        assert mobile_temperature.is_visible()
+        mobile_temperature.scroll_into_view_if_needed()
         assert_no_horizontal_overflow(mobile)
         panel_metrics = mobile_settings.evaluate("element => ({scroll: element.scrollWidth, client: element.clientWidth})")
         assert panel_metrics["scroll"] <= panel_metrics["client"], panel_metrics
-        mobile.screenshot(path="/tmp/sandevistan-read-provider-mobile.png")
+        mobile.screenshot(path="/tmp/sandevistan-read-provider-temperature-mobile.png")
         mobile.keyboard.press("Escape")
         assert mobile_settings.count() == 0
 

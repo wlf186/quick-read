@@ -1,4 +1,5 @@
 import importlib
+import json
 from pathlib import Path
 
 import httpx
@@ -122,6 +123,118 @@ def test_context_overrides_are_validated() -> None:
             model="chat",
             config={"context_window_tokens": 4096, "max_output_tokens": 4096},
         )
+
+
+@pytest.mark.parametrize("value", [-0.01, 2.01, True, "1", float("nan")])
+def test_temperature_override_is_validated(value) -> None:
+    with pytest.raises(ValidationError, match="Temperature 必须是 0 到 2 之间的数字"):
+        ProviderCreate(
+            name="Broken",
+            role="main",
+            kind="openai",
+            base_url="https://example.com",
+            model="chat",
+            config={"temperature": value},
+        )
+    with pytest.raises(ValidationError, match="Temperature 必须是 0 到 2 之间的数字"):
+        ProviderUpdate(config={"temperature": value})
+
+
+def test_temperature_override_accepts_explicit_zero() -> None:
+    created = ProviderCreate(
+        name="Deterministic",
+        role="main",
+        kind="openai",
+        base_url="https://example.com",
+        model="chat",
+        config={"temperature": 0},
+    )
+    assert created.config["temperature"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("config", "expected"), [({}, 0.25), ({"temperature": 1}, 1.0)])
+async def test_chat_uses_provider_temperature_override(monkeypatch: pytest.MonkeyPatch, config: dict, expected: float) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["temperature"] == expected
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="chat", config=config)
+    result = await providers._chat_once(
+        profile,
+        [{"role": "user", "content": "test"}],
+        json_mode=False,
+        timeout=5,
+        max_tokens=128,
+        temperature=0.25,
+    )
+    assert result.content == "OK"
+
+
+@pytest.mark.asyncio
+async def test_ollama_chat_uses_provider_temperature_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["options"]["temperature"] == 1
+        return httpx.Response(200, json={"message": {"content": "OK"}, "done_reason": "stop"})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(config={"temperature": 1})
+    result = await providers._chat_once(
+        profile,
+        [{"role": "user", "content": "test"}],
+        json_mode=False,
+        timeout=5,
+        max_tokens=128,
+        temperature=0.25,
+    )
+    assert result.content == "OK"
+
+
+@pytest.mark.asyncio
+async def test_deep_verification_uses_temperature_override_and_requires_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    response_text = "OK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response_text
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        assert payload["temperature"] == 1
+        assert payload["max_tokens"] == 64
+        return httpx.Response(200, json={"choices": [{"message": {"content": response_text}}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(
+        kind="openai",
+        base_url="https://compatible.example.com",
+        model="reasoning-chat",
+        config={"temperature": 1},
+    )
+    verified = await providers.inspect_provider(profile, "deep")
+    assert verified["activation_eligible"] is True
+
+    response_text = ""
+    rejected = await providers.inspect_provider(profile, "deep")
+    assert rejected["activation_eligible"] is False
+    assert rejected["error"]["message"] == "Provider 未返回验证文本"
+
+
+@pytest.mark.asyncio
+async def test_deep_verification_surfaces_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        return httpx.Response(400, json={"error": {"message": "only temperature 1 is allowed", "type": "invalid_request_error"}})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="reasoning-chat")
+    result = await providers.inspect_provider(profile, "deep")
+    assert result["activation_eligible"] is False
+    assert result["error"]["message"] == "only temperature 1 is allowed"
+    assert result["error"]["upstream_status"] == 400
 
 
 @pytest.mark.asyncio
