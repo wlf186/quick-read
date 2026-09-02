@@ -12,7 +12,7 @@ from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .observability import Reporter
 from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
-from .retrieval import EMBEDDINGS, retrieve, tokenize
+from .retrieval import EMBEDDINGS, select_quality_evidence, tokenize
 from .languages import resolve_output_language, text_matches_language
 
 
@@ -43,21 +43,30 @@ def _evenly_spaced(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any
 
 
 def _collect_evidence(notebook_id: str, source_ids: list[str], count: int, custom_prompt: str) -> list[dict[str, Any]]:
-    target = min(80, max(16, count * 2))
-    selected: list[dict[str, Any]] = []
-    if custom_prompt.strip():
-        selected.extend(retrieve(notebook_id, custom_prompt, source_ids, limit=min(30, target), ensure_source_coverage=len(source_ids) > 1))
-    per_source = max(2, math.ceil(target / max(1, len(source_ids))))
-    for source_id in source_ids:
-        rows = DB.fetchall("SELECT * FROM chunks WHERE source_id=? ORDER BY ordinal", (source_id,))
-        for row in _evenly_spaced(rows, per_source):
-            row["locator"] = json_load(row.pop("locator_json", None), {})
-            row.pop("embedding_json", None)
-            selected.append(row)
-    unique: dict[str, dict[str, Any]] = {}
-    for row in selected:
-        unique.setdefault(row["id"], row)
-    return list(unique.values())[:target]
+    target = min(48, max(20, count * 3))
+    selected = select_quality_evidence(notebook_id, source_ids, limit=target, focus=custom_prompt)
+    if selected or not source_ids:
+        return selected
+
+    # Keep generation usable with isolated/test databases and legacy chunks that
+    # have not received embeddings yet. The normal path above remains the
+    # diversity-aware selector.
+    marks = ",".join("?" for _ in source_ids)
+    rows = DB.fetchall(
+        f"SELECT * FROM chunks WHERE source_id IN ({marks}) ORDER BY source_id, ordinal",
+        tuple(source_ids),
+    )
+    fallback: list[dict[str, Any]] = []
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        lowered = content.lower()
+        if len(content) < 12 or any(marker in lowered for marker in ("table of contents", "目录", "copyright", "all rights reserved")):
+            continue
+        item = dict(row)
+        item["locator"] = json_load(item.pop("locator_json", None), {})
+        item.pop("embedding", None)
+        fallback.append(item)
+    return _evenly_spaced(fallback, target)
 
 
 def _source_name(source_id: str) -> str:
@@ -190,6 +199,7 @@ async def _build_blueprint(
             max_tokens=structured_output_tokens(min(1800, max(700, count * 110))),
             minimum_output_tokens=384,
             trace=trace,
+            stage="blueprint",
         )
         valid_labels = set(generated.build.metadata["labels"])
         concepts = []
@@ -273,8 +283,15 @@ def validate_flashcard_item(item: Any, valid_labels: set[str], evidence_by_label
         return None, "invalid_shape"
     if front.startswith("资料要点") or any(term in front for term in ("引用位置", "该位置包含什么")):
         return None, "vague_prompt"
-    if estimate_text_tokens(front) > 80 or estimate_text_tokens(back) > 120 or estimate_text_tokens(explanation) > 180:
+    cjk = bool(re.search(r"[\u3400-\u9fff]", front + back))
+    front_size = len(front) if cjk else len(re.findall(r"\b\w+(?:[-']\w+)*\b", front))
+    back_size = len(back) if cjk else len(re.findall(r"\b\w+(?:[-']\w+)*\b", back))
+    explanation_size = len(explanation) if cjk else len(re.findall(r"\b\w+(?:[-']\w+)*\b", explanation))
+    limits = (50, 90, 140) if cjk else (18, 36, 55)
+    if front_size > limits[0] or back_size > limits[1] or explanation_size > limits[2]:
         return None, "too_long"
+    if front.count("?") + front.count("？") > 1 or re.search(r"(?:分别|并说明|以及为什么|\band\s+why\b)", front, re.I):
+        return None, "not_atomic"
     if _evidence_overlap(back + " " + explanation, citations, evidence_by_label) < 2:
         return None, "weak_evidence_overlap"
     difficulty = str(item.get("difficulty") or "medium")
@@ -299,7 +316,7 @@ def _candidate_prompt(kind: str, concepts: list[dict[str, Any]], count: int, lan
 资料：
 """
     return f"""你是严谨的闪卡设计师。{common}
-生成恰好 {count} 张原子化闪卡：一张只测一个知识点，正面必须能独立理解，背面简洁准确；不要写“资料要点”或“该位置包含什么”。中文 front/back/explanation 分别不超过 50/80/120 字；英文分别不超过 20/35/50 words。可覆盖事实、概念、关系、比较与资料内应用。explanation 给出简短理解说明。仅输出 JSON：{{"items":[{{"learning_objective":"...","difficulty":"easy|medium|hard","card_type":"fact|concept|relationship|comparison|application","front":"...","back":"...","explanation":"...","citations":["S1"]}}]}}
+生成恰好 {count} 张原子化闪卡：一张只测一个知识点，正面必须能独立理解，背面简洁准确；不要写“资料要点”或“该位置包含什么”。中文 front/back/explanation 分别不超过 50/90/140 字；英文分别不超过 18/36/55 words。不得用“分别说明 A 和 B”把两个问题塞进一张卡。可覆盖事实、概念、关系、比较与资料内应用。explanation 给出简短理解说明。仅输出 JSON：{{"items":[{{"learning_objective":"...","difficulty":"easy|medium|hard","card_type":"fact|concept|relationship|comparison|application","front":"...","back":"...","explanation":"...","citations":["S1"]}}]}}
 资料：
 """
 
@@ -325,6 +342,7 @@ async def _audit_candidates(
         max_tokens=structured_output_tokens(max(300, len(candidates) * 80)),
         minimum_output_tokens=384,
         trace=trace,
+        stage="aggregate_audit",
     )
     parsed = _json_object(generated.content)
     indexes = [int(value) for value in parsed.get("accepted_indexes", []) if str(value).isdigit() and 0 <= int(value) < len(candidates)]
@@ -387,14 +405,21 @@ async def generate_study_artifact(
     evidence_by_label = dict(zip(labels, chunks))
     all_citations = {_citation(chunk, label)["id"]: _citation(chunk, label) for label, chunk in zip(labels, chunks)}
     trace, reporter = ContextUsage(), Reporter(job_id) if job_id else None
+    if kind == "flashcard":
+        trace.request_limit = 4
+        trace.total_token_limit = min(45_000, 18_000 + count * 2_700)
     if reporter:
         reporter.update("plan", "构建知识蓝图", 0.08, current=0, total=count, unit="项")
-    blueprint, blueprint_fallback = await _build_blueprint(chunks, labels, count, difficulty, language, custom_prompt, tier, trace)
+    if kind == "flashcard":
+        blueprint, blueprint_fallback = _local_blueprint(chunks, labels, math.ceil(count * 1.25), difficulty, tier), False
+    else:
+        blueprint, blueprint_fallback = await _build_blueprint(chunks, labels, count, difficulty, language, custom_prompt, tier, trace)
     provisional: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
     rejected: Counter[str] = Counter()
-    batch_size = 1 if tier == "lite" else 3
-    max_candidate_rounds = math.ceil(count / batch_size) + 2
+    provisional_target = math.ceil(count * 1.25) if kind == "flashcard" and tier == "full" else count
+    batch_size = 1 if tier == "lite" else math.ceil(provisional_target / 2) if kind == "flashcard" else 3
+    max_candidate_rounds = 2 if kind == "flashcard" and tier == "full" else math.ceil(count / batch_size) + 2
     cursor = 0
     candidate_rounds = 0
     audit_rounds = 0
@@ -402,8 +427,8 @@ async def generate_study_artifact(
     consecutive_zero = 0
     stop_reason = "candidate_round_limit"
     validator: Callable[[Any, set[str], dict[str, dict[str, Any]]], tuple[dict[str, Any] | None, str | None]] = validate_quiz_item if kind == "quiz" else validate_flashcard_item
-    while len(provisional) < count and candidate_rounds < max_candidate_rounds and consecutive_zero < 2:
-        batch_count = min(batch_size, count - len(provisional))
+    while len(provisional) < provisional_target and candidate_rounds < max_candidate_rounds and consecutive_zero < 2:
+        batch_count = min(batch_size, provisional_target - len(provisional))
         concepts = [blueprint[(cursor + offset) % len(blueprint)] for offset in range(batch_count)]
         concept_labels = list(dict.fromkeys(label for concept in concepts for label in concept.get("citations", [])))
         selected_pairs = [(label, evidence_by_label[label]) for label in concept_labels if label in evidence_by_label]
@@ -423,6 +448,7 @@ async def generate_study_artifact(
                 max_tokens=structured_output_tokens(max(900, batch_count * (900 if kind == "quiz" else 500))),
                 minimum_output_tokens=320,
                 trace=trace,
+                stage="candidate_generation",
             )
             candidates = _json_array_items(generated.content, "items")
             used_labels = list(generated.build.metadata["labels"])
@@ -447,12 +473,12 @@ async def generate_study_artifact(
                 continue
             provisional.append(item)
             yielded += 1
-            if len(provisional) >= count:
+            if len(provisional) >= provisional_target:
                 break
         cursor += batch_count
         candidate_rounds += 1
         consecutive_zero = consecutive_zero + 1 if yielded == 0 else 0
-        if yielded < batch_count and batch_size > 1:
+        if kind != "flashcard" and yielded < batch_count and batch_size > 1:
             batch_size = 1
             remaining_items = max(0, count - len(provisional))
             max_candidate_rounds = max(max_candidate_rounds, candidate_rounds + remaining_items + 2)
@@ -484,6 +510,7 @@ async def generate_study_artifact(
                 max_tokens=structured_output_tokens(max(900, deficit * (900 if kind == "quiz" else 500))),
                 minimum_output_tokens=320,
                 trace=trace,
+                stage="deficit_recovery",
             )
             recovery: list[dict[str, Any]] = []
             for candidate in _json_array_items(generated.content, "items"):
@@ -493,9 +520,12 @@ async def generate_study_artifact(
                 elif not item:
                     rejected[reason or "recovery_invalid"] += 1
             if recovery:
-                indexes, _ = await _audit_candidates(kind, recovery, evidence_by_label, trace)
-                audit_rounds += 1
-                accepted.extend(recovery[index] for index in indexes)
+                if kind == "flashcard":
+                    accepted.extend(recovery)
+                else:
+                    indexes, _ = await _audit_candidates(kind, recovery, evidence_by_label, trace)
+                    audit_rounds += 1
+                    accepted.extend(recovery[index] for index in indexes)
             stop_reason = "recovery_completed" if len(accepted) >= count else "recovery_exhausted"
         except Exception:
             rejected["recovery_provider_or_json_error"] += deficit
@@ -503,7 +533,7 @@ async def generate_study_artifact(
     accepted = accepted[:count]
     if kind == "quiz":
         accepted = [_balance_answer(item, index % 4) for index, item in enumerate(accepted)]
-    minimum = min(3, count)
+    minimum = math.ceil(count * 0.7) if kind == "flashcard" else min(3, count)
     if len(accepted) < minimum:
         raise ValueError(f"模型只生成了 {len(accepted)} 个通过证据校验的内容；请降低难度或切换更强的 MAIN Provider")
     for index, item in enumerate(accepted, start=1):

@@ -15,6 +15,11 @@ from .paths import PATHS
 
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9_]+|[\u3400-\u9fff]+", re.UNICODE)
 CJK_PATTERN = re.compile(r"[\u3400-\u9fff]+")
+LOW_VALUE_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:table of contents|contents|copyright|all rights reserved|bibliography|references|index|acknowledg(?:e)?ments?|"
+    r"目录|版权|版权所有|参考文献|书目|索引|致谢)\b",
+    re.I,
+)
 
 
 def tokenize(text: str) -> list[str]:
@@ -92,6 +97,98 @@ def _cosine(left: list[float], right: list[float]) -> float:
     b = np.asarray(right, dtype=np.float32)
     denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
     return float(np.dot(a, b) / denominator) if denominator else 0.0
+
+
+def is_quality_chunk(row: dict[str, Any], *, minimum_chars: int = 120) -> bool:
+    """Reject front/back matter and fragments before they reach a paid model."""
+    content = re.sub(r"\s+", " ", str(row.get("content") or "")).strip()
+    if len(content) < minimum_chars or LOW_VALUE_PATTERN.search(content[:500]):
+        return False
+    lowered = content.lower()
+    if lowered.count("http://") + lowered.count("https://") >= 2:
+        return False
+    words = re.findall(r"[A-Za-z\u3400-\u9fff]+", content)
+    if len(words) < 18:
+        return False
+    locator = row.get("locator") if isinstance(row.get("locator"), dict) else json_load(row.get("locator_json"), {})
+    section = str(locator.get("section") or "")
+    return not bool(LOW_VALUE_PATTERN.search(section))
+
+
+def select_quality_evidence(
+    notebook_id: str,
+    source_ids: list[str],
+    *,
+    limit: int,
+    focus: str = "",
+    minimum_chars: int = 120,
+) -> list[dict[str, Any]]:
+    """Select central, diverse evidence locally with source and section coverage."""
+    if not source_ids or limit <= 0:
+        return []
+    marks = ",".join("?" for _ in source_ids)
+    rows = DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks}) ORDER BY source_id,ordinal", tuple(source_ids))
+    candidates = [row for row in rows if is_quality_chunk(row, minimum_chars=minimum_chars)]
+    if not candidates:
+        candidates = [
+            row for row in rows
+            if len(re.sub(r"\s+", " ", str(row.get("content") or "")).strip()) >= 24
+            and not LOW_VALUE_PATTERN.search(str(row.get("content") or "")[:500])
+        ]
+    if not candidates:
+        return []
+    vectors: list[list[float]] = []
+    missing_indexes: list[int] = []
+    for index, row in enumerate(candidates):
+        vector = json_load(row.get("embedding_json"), [])
+        vectors.append(vector)
+        if not vector:
+            missing_indexes.append(index)
+    if missing_indexes:
+        encoded = EMBEDDINGS.encode([str(candidates[index]["content"]) for index in missing_indexes])
+        for index, vector in zip(missing_indexes, encoded):
+            vectors[index] = vector
+    matrix = np.asarray(vectors, dtype=np.float32)
+    centroid = matrix.mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
+    centroid = centroid / norm if norm else centroid
+    focus_vector = np.asarray(EMBEDDINGS.encode([focus], query=True)[0], dtype=np.float32) if focus.strip() else centroid
+    focus_norm = float(np.linalg.norm(focus_vector))
+    focus_vector = focus_vector / focus_norm if focus_norm else focus_vector
+    base_scores = [0.55 * float(np.dot(vector, focus_vector)) + 0.45 * float(np.dot(vector, centroid)) for vector in matrix]
+    per_source_limit = max(1, math.ceil(limit / len(source_ids)) + 1)
+    selected_indexes: list[int] = []
+    source_counts: dict[str, int] = defaultdict(int)
+    section_counts: dict[tuple[str, str], int] = defaultdict(int)
+    while len(selected_indexes) < min(limit, len(candidates)):
+        best_index, best_score = None, -float("inf")
+        for index, row in enumerate(candidates):
+            if index in selected_indexes or source_counts[row["source_id"]] >= per_source_limit:
+                continue
+            locator = json_load(row.get("locator_json"), {})
+            section = str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
+            similarity = max((float(np.dot(matrix[index], matrix[value])) for value in selected_indexes), default=0.0)
+            section_penalty = min(0.18, section_counts[(row["source_id"], section)] * 0.06)
+            score = base_scores[index] - 0.35 * max(0.0, similarity) - section_penalty
+            if score > best_score:
+                best_index, best_score = index, score
+        if best_index is None:
+            break
+        selected_indexes.append(best_index)
+        row = candidates[best_index]
+        locator = json_load(row.get("locator_json"), {})
+        section = str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
+        source_counts[row["source_id"]] += 1
+        section_counts[(row["source_id"], section)] += 1
+    selected: list[dict[str, Any]] = []
+    for rank, index in enumerate(selected_indexes, start=1):
+        row = dict(candidates[index])
+        row["locator"] = json_load(row.pop("locator_json", None), {})
+        row.pop("embedding_json", None)
+        row["quality_rank"] = rank
+        row["quality_score"] = round(base_scores[index], 6)
+        selected.append(row)
+    return selected
 
 
 def reciprocal_rank_fusion(rankings: list[list[str]], constant: int = 60) -> dict[str, float]:

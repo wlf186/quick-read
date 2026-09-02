@@ -30,6 +30,39 @@ def test_structured_output_budget_includes_bounded_reasoning_headroom() -> None:
     assert structured_output_tokens(6000) == 10096
 
 
+def test_context_usage_enforces_aggregate_budget_and_tracks_stages() -> None:
+    trace = ContextUsage(request_limit=2, total_token_limit=500)
+    limits = TokenLimits.from_provider({"capabilities": {}, "config": {}})
+    trace.begin_request(estimated_tokens=200)
+    trace.record(
+        limits=limits,
+        requested_output=100,
+        output_tokens=100,
+        estimated_prompt=80,
+        actual_prompt=100,
+        actual_completion=50,
+        stage="outline",
+    )
+    assert trace.as_dict()["by_stage"]["outline"]["calls"] == 1
+    with pytest.raises(RuntimeError, match="token 达到任务上限"):
+        trace.begin_request(estimated_tokens=400)
+    assert trace.as_dict()["stop_reason"] == "token_limit"
+
+    no_usage = ContextUsage(total_token_limit=250)
+    no_usage.begin_request(estimated_tokens=200)
+    no_usage.record(
+        limits=limits,
+        requested_output=100,
+        output_tokens=100,
+        estimated_prompt=100,
+        actual_prompt=None,
+        actual_completion=None,
+    )
+    assert no_usage.as_dict()["accounted_total_tokens"] == 200
+    with pytest.raises(RuntimeError, match="token 达到任务上限"):
+        no_usage.begin_request(estimated_tokens=100)
+
+
 def test_packing_preserves_source_coverage_within_budget() -> None:
     items = [
         {"source": "a", "text": "甲" * 120},

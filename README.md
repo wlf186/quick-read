@@ -82,13 +82,15 @@ FFmpeg 使用 LGPL 静态构建，LibreOffice 使用 The Document Foundation 官
 
 Quiz 按题作答，提交前不会通过产物 API 暴露答案、解释或引用；作答后才返回该题的答案、解释和原文证据，并支持提示、错题重练和整组重练。Flashcards 支持四档反馈（再来、困难、良好、简单），使用 FSRS 持久化安排到期复习，同时支持到期/全部/本轮队列、洗牌、移除和 CSV 导出。旧版 Quiz 尝试与闪卡复习记录会在数据库 v4 升级后保留，并在需要时参与新调度状态的恢复。
 
-## Podcast V3
+## Podcast V4
 
-双人音频 V3 采用“证据主张表 → 递进式剧集规划 → 携带前文的场景续写 → 场景与跨章审校 → 逐轮 TTS”流水线。两位主持人分别承担综合解释与追问澄清，但每一轮都必须回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。脚本未达到连贯性、证据、重复控制或目标时长门槛时会在 TTS 前停止，不再用模板问答补足音频长度。
+双人音频 V4 采用“多样化证据 → 主张表 → editorial acts → 携带前文的长段续写 → 客观门禁 → 整集审校 → 逐轮 TTS → 本地 ASR 验收”流水线。两位主持人共享解释、质疑、追问与综合职责，每一轮都要回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。长节目使用约 2.8 轮/分钟的充实对话，并以紧凑模型输出减少结构 token；每个 Act 按剩余时长分配口播字数，欠账最多把下一幕提高到名义预算的 120%。只有输出上限截断时才允许全剧一次小型续写，且它与边界修复共享唯一恢复名额。客观门禁失败时跳过整集审校。脚本未达到连贯性、证据、角色平衡、重复控制或目标时长门槛时会在 TTS 前停止，不再用模板问答补足长度。音频完成后会先验证真实时长，再检查字/词错误率、双主持人分离和异常静音；只有少量坏轮次时最多重合成一次，GPU 因显存或设备问题失败时，TTS/ASR 各自只回退 CPU 一次，不修改 Provider 配置。
 
 默认自动生成 12–25 分钟，也可选择 5、10、20 或 30 分钟；首次默认输出简体中文，并在浏览器中记住上次选择。MAIN Provider 的上下文和输出窗口较小时，系统使用更短场景与压缩剧集记忆；大窗口模型会生成更长场景并执行同一质量门槛。已有 V2 产物保持兼容。
 
-可使用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5 --baseline-artifact <旧播客ID>` 只生成 V3 文字稿并与旧产物进行盲评，不会调用 TTS。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
+可使用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5 --baseline-artifact <旧播客ID>` 生成 V4 文字稿并与旧产物盲评，默认不会调用 TTS。追加 `--reference-audio <样本.m4a>` 时，会通过当前本地 Sandevistan ASR 转写样本并加入匿名盲评；也可用 `--candidate-json <已通过的candidate.json>` 跳过 MAIN，复用同一候选做参考 ASR、盲评或 `--render-candidate` 端到端验收。GPU 资源错误时自动单次转 CPU。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
+
+多样本冻结验收使用 `scripts/evaluate_podcast_suite.py prepare --manifest <runtime-manifest.json> --mode frozen`。它会为每个样本生成新候选、执行 TTS/ASR、按音频 ASR 生成匿名 A/B 包，并按音频 SHA 缓存参考 ASR；开发模式允许在 manifest 中提供已通过门禁的 `candidate_json`，避免因音频或评审问题重复调用 MAIN。独立评审完成 `scores-template.json` 后，以 `finalize --run-dir <目录> --scores <评分.json>` 解盲并执行六维分数、音频质量及 45k MAIN token 硬门槛。
 
 Sandevistan TTS Provider 可在设置中探测实时能力。自动模式选择已安装的最高质量模型：该模型支持 GPU 时优先 GPU，否则使用同一模型的 CPU；不会为了速度静默降低模型质量。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
 

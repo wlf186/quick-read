@@ -277,6 +277,45 @@ async def test_sandevistan_tts_catalog_recommends_installed_gpu_model(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_local_asr_retries_device_failure_once_on_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile = candidate(role="tts", kind="sandevistan_tts", base_url="http://localhost:20810", model="qwen3-tts-1.7b")
+    monkeypatch.setattr(providers, "active_provider", lambda role: profile)
+    devices: list[str] = []
+
+    async def fake_once(provider, path, *, language, compute_device, idempotency_key, cancel_check):
+        devices.append(compute_device)
+        if compute_device == "gpu":
+            raise providers.ProviderError("CUDA out of memory", code="insufficient_gpu_memory")
+        return {"text": "ok", "segments": [], "compute_device": "cpu"}
+
+    monkeypatch.setattr(providers, "_transcribe_sandevistan_once", fake_once)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    result = await providers.transcribe_audio(audio, language="Chinese", idempotency_key="12345678")
+    assert devices == ["gpu", "cpu"]
+    assert result["fallback_used"] is True
+    assert result["compute_device"] == "cpu"
+
+
+@pytest.mark.asyncio
+async def test_local_asr_does_not_retry_non_device_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile = candidate(role="tts", kind="sandevistan_tts", base_url="http://localhost:20810", model="qwen3-tts-1.7b")
+    monkeypatch.setattr(providers, "active_provider", lambda role: profile)
+    devices: list[str] = []
+
+    async def fake_once(provider, path, *, language, compute_device, idempotency_key, cancel_check):
+        devices.append(compute_device)
+        raise providers.ProviderError("invalid language", code="validation_error")
+
+    monkeypatch.setattr(providers, "_transcribe_sandevistan_once", fake_once)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    with pytest.raises(providers.ProviderError, match="invalid language"):
+        await providers.transcribe_audio(audio, language="Chinese", idempotency_key="12345678")
+    assert devices == ["gpu"]
+
+
+@pytest.mark.asyncio
 async def test_openai_tts_requires_both_host_voices(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"id": "tts-1", "owned_by": "vendor"}]})

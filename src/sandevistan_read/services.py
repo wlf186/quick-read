@@ -10,9 +10,9 @@ from typing import Any, Callable
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import chunk_blocks, parse_document
 from .paths import PATHS
-from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items, truncate_text_tokens
+from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items, structured_output_tokens, truncate_text_tokens
 from .providers import PromptBuild, ProviderError, budgeted_chat, describe_image
-from .retrieval import EMBEDDINGS, retrieve
+from .retrieval import EMBEDDINGS, retrieve, select_quality_evidence
 from .observability import Reporter
 from .languages import resolve_output_language
 
@@ -344,78 +344,98 @@ def _evenly_spaced(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any
 
 
 async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str, reporter: Reporter | None = None) -> dict[str, Any]:
-    representatives: list[dict[str, Any]] = []
-    for source_id in ids:
-        rows = DB.fetchall("SELECT * FROM chunks WHERE source_id=? ORDER BY ordinal", (source_id,))
-        for row in rows:
-            row["locator"] = json_load(row.get("locator_json"), {})
-        representatives.extend(_evenly_spaced(rows, 18))
+    representatives = select_quality_evidence(notebook_id, ids, limit=min(36, max(24, len(ids) * 12)))
     if not representatives:
         raise ValueError("当前范围没有可摘要的内容")
-    labels = [f"C{index}" for index in range(1, len(representatives) + 1)]
-    _, citations = _context(representatives, labels)
-    notes: list[str] = []
-    degraded = False
+    labels = [f"S{index}" for index in range(1, len(representatives) + 1)]
+    citations_by_id = {item["id"]: item for item in _context(representatives, labels)[1]}
     trace = ContextUsage()
-    cursor = 0
-    batch_number = 0
-    while cursor < len(representatives):
-        batch_number += 1
-        if reporter:
-            if reporter.cancelled():
-                raise RuntimeError("任务已取消")
-            reporter.update("summarize", f"分段提炼 {cursor}/{len(representatives)}", 0.12 + 0.72 * cursor / max(1, len(representatives)), current=cursor, total=len(representatives), unit="段")
-        remaining = representatives[cursor:]
-        remaining_labels = labels[cursor:]
-        prefix = f"只根据以下资料提炼 2 条有实质信息、可独立阅读的完整要点。不要使用外部知识，不要输出标题或引用标记。语言：{language}。\n"
+    trace.request_limit = 2
+    trace.total_token_limit = 24_000
+
+    def parse_points(raw: str, valid_labels: set[str]) -> list[dict[str, Any]]:
         try:
-            generated = await budgeted_chat(
-                lambda budget: _evidence_prompt_build(
-                    budget,
-                    chunks=remaining,
-                    labels=remaining_labels,
-                    prefix=prefix,
-                ),
-                max_tokens=650,
-                minimum_output_tokens=128,
-                trace=trace,
+            parsed = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+        except (ValueError, json.JSONDecodeError):
+            return []
+        points: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for value in parsed.get("points") or []:
+            if not isinstance(value, dict):
+                continue
+            claim = re.sub(r"\s+", " ", str(value.get("claim") or "")).strip()
+            why = re.sub(r"\s+", " ", str(value.get("why_it_matters") or "")).strip()
+            refs = list(dict.fromkeys(str(item) for item in value.get("citations") or [] if str(item) in valid_labels))[:3]
+            key = re.sub(r"\W+", "", claim).lower()
+            if len(claim) < 24 or len(why) < 16 or not refs or key in seen:
+                continue
+            seen.add(key)
+            points.append(
+                {
+                    "claim": claim[:600],
+                    "why_it_matters": why[:600],
+                    "qualification": re.sub(r"\s+", " ", str(value.get("qualification") or "")).strip()[:360],
+                    "citations": refs,
+                }
             )
-            raw = generated.content
-            batch = list(generated.build.metadata["chunks"])
-            batch_labels = list(generated.build.metadata["labels"])
-            if not batch:
-                raise ProviderError("上下文窗口无法容纳摘要资料")
-            candidates: list[str] = []
-            for line in raw.splitlines():
-                clean = re.sub(r"\[C\d+\]", "", line)
-                clean = re.sub(r"^[#>*\-\d.\s]+", "", clean).strip()
-                if len(clean) >= 24 and not clean.endswith(("：", ":")):
-                    candidates.append(clean[:700])
-            if not candidates:
-                clean = re.sub(r"\[C\d+\]", "", raw).strip()
-                candidates = [clean[:900]] if clean else []
-            if not candidates:
-                raise ProviderError("摘要模型未返回可用内容")
-            suffix = " ".join(f"[{label}]" for label in batch_labels)
-            notes.extend(f"- {line} {suffix}" for line in candidates[:2])
-            cursor += len(batch)
-        except Exception:
-            degraded = True
-            trace.mark_fallback()
-            chunk, label = representatives[cursor], labels[cursor]
-            notes.append(f"- {chunk['content'][:300]} [{label}]")
-            cursor += 1
+        return points[:10]
+
+    language_rule = "自然简体中文" if language != "en" else "natural English"
+    prefix = f"""你是严谨的研究编辑。只依据资料，用{language_rule}提炼 6–10 个相互独立、覆盖全文主线的高信息密度要点。不要复述封面、版权、目录、书目或索引。每点只能引用真正支持该点的 1–3 个编号；不得给每点附整批编号。仅输出 JSON：{{"points":[{{"claim":"完整核心判断","why_it_matters":"为何重要或如何作用","qualification":"资料中的限制或空字符串","citations":["S1"]}}]}}。\n资料：\n"""
+    points: list[dict[str, Any]] = []
+    valid_labels: set[str] = set()
+    if reporter:
+        reporter.update("summarize", "一次性综合全文要点", 0.30, current=0, total=1, unit="次")
+    try:
+        generated = await budgeted_chat(
+            lambda budget: _evidence_prompt_build(
+                budget, chunks=representatives, labels=labels, prefix=prefix, ensure_source_coverage=len(ids) > 1
+            ),
+            json_mode=True,
+            max_tokens=structured_output_tokens(2200),
+            minimum_output_tokens=700,
+            trace=trace,
+            stage="summary",
+        )
+        valid_labels = set(generated.build.metadata["labels"])
+        points = parse_points(generated.content, valid_labels)
+        if len(points) < 6:
+            repair_prefix = f"""上次摘要只有 {len(points)} 个有效要点。只依据资料补足到 6–10 个，避免与现有要点重复，并保持每点 1–3 个精确引用。现有有效要点：{json.dumps(points, ensure_ascii=False)}。仅输出同一 JSON points 结构。\n资料：\n"""
+            repaired = await budgeted_chat(
+                lambda budget: _evidence_prompt_build(
+                    budget, chunks=representatives, labels=labels, prefix=repair_prefix, ensure_source_coverage=len(ids) > 1
+                ),
+                json_mode=True,
+                max_tokens=structured_output_tokens(1600),
+                minimum_output_tokens=500,
+                trace=trace,
+                stage="summary_repair",
+            )
+            extra = parse_points(repaired.content, set(repaired.build.metadata["labels"]))
+            known = {re.sub(r"\W+", "", item["claim"]).lower() for item in points}
+            points.extend(item for item in extra if re.sub(r"\W+", "", item["claim"]).lower() not in known)
+            points = points[:10]
+    except Exception:
+        trace.mark_fallback()
+    degraded = len(points) < 6
+    if degraded and not points:
+        points = [
+            {"claim": str(chunk["content"])[:300], "why_it_matters": "可直接核验的资料摘录" if language != "en" else "A directly verifiable source excerpt", "qualification": "", "citations": [label]}
+            for chunk, label in zip(representatives[:6], labels[:6])
+        ]
+        valid_labels = set(labels[:6])
+    if degraded:
+        trace.mark_fallback()
     heading = "## Evidence-bound summary" if language == "en" else "## 可追溯摘要"
-    answer = heading + "\n\n" + "\n".join(notes)
-    used_c = [citation for citation in citations if citation["id"] in set(re.findall(r"\[(C\d+)\]", answer))]
-    if not used_c:
-        used_c = citations[: min(8, len(citations))]
-        answer += "\n\n" + " ".join(f"[{item['id']}]" for item in used_c)
-    remap = {citation["id"]: f"S{index}" for index, citation in enumerate(used_c, start=1)}
-    for old, new in remap.items():
-        answer = answer.replace(f"[{old}]", f"[{new}]")
-    output_citations = [{**citation, "id": remap[citation["id"]]} for citation in used_c]
-    return {"content": answer, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "context_usage": trace.as_dict()}
+    lines = []
+    for point in points:
+        qualification = f" {point['qualification']}" if point["qualification"] else ""
+        markers = " ".join(f"[{label}]" for label in point["citations"])
+        lines.append(f"- {point['claim']} — {point['why_it_matters']}{qualification} {markers}")
+    answer = heading + "\n\n" + "\n".join(lines)
+    used_labels = list(dict.fromkeys(label for point in points for label in point["citations"]))
+    output_citations = [citations_by_id[label] for label in used_labels if label in citations_by_id]
+    return {"version": 2, "content": answer, "points": points, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "context_usage": trace.as_dict()}
 
 
 async def make_summary(notebook_id: str, source_ids: list[str] | None, language: str, job_id: str | None = None) -> dict[str, Any]:
@@ -433,7 +453,7 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     summary_id = f"summary_{suffix}" if suffix else new_id("summary")
     artifact_id, now = (f"artifact_{suffix}" if suffix else new_id("artifact")), utc_now()
     DB.execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?)", (summary_id, notebook_id, result["scope_hash"], result["content"], json_dump(result["citations"]), now))
-    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"content": result["content"], "degraded": result["degraded"], "context_usage": result["context_usage"], "language_selection": language_selection}), json_dump(result["citations"]), None, now, now))
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "ready", json_dump({"version": result["version"], "content": result["content"], "points": result["points"], "degraded": result["degraded"], "context_usage": result["context_usage"], "language_selection": language_selection}), json_dump(result["citations"]), None, now, now))
     result["language"] = language
     result["language_selection"] = language_selection
     result["id"] = summary_id

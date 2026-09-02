@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, TypeVar
 
 
@@ -241,17 +241,29 @@ class ContextUsage:
     reasoning_tokens: int = 0
     visible_completion_tokens: int = 0
     cached_tokens: int = 0
+    accounted_tokens: int = 0
     temperature_sources: dict[str, int] | None = None
     effective_temperatures: dict[str, int] | None = None
     request_limit: int | None = None
+    total_token_limit: int | None = None
+    stop_reason: str | None = None
+    by_stage: dict[str, dict[str, int]] = field(default_factory=dict)
     fallback_used: bool = False
 
     def mark_fallback(self) -> None:
         self.fallback_used = True
 
-    def begin_request(self) -> None:
+    @property
+    def actual_total_tokens(self) -> int:
+        return self.actual_prompt_tokens + self.actual_completion_tokens
+
+    def begin_request(self, *, estimated_tokens: int = 0) -> None:
         if self.request_limit is not None and self.requests >= self.request_limit:
+            self.stop_reason = "request_limit"
             raise RuntimeError(f"MAIN 调用达到任务上限（{self.request_limit}）")
+        if self.total_token_limit is not None and self.accounted_tokens + max(0, estimated_tokens) > self.total_token_limit:
+            self.stop_reason = "token_limit"
+            raise RuntimeError(f"MAIN token 达到任务上限（{self.total_token_limit}）")
         self.requests += 1
 
     def record_failure(self) -> None:
@@ -270,6 +282,7 @@ class ContextUsage:
         cached_tokens: int | None = None,
         temperature: float | None = None,
         temperature_source: str | None = None,
+        stage: str = "generation",
         total_segments: int = 0,
         included_segments: int = 0,
         truncated_segments: int = 0,
@@ -287,6 +300,17 @@ class ContextUsage:
         self.reasoning_tokens += reasoning_tokens or 0
         self.visible_completion_tokens += max(0, (actual_completion or 0) - (reasoning_tokens or 0))
         self.cached_tokens += cached_tokens or 0
+        self.accounted_tokens += (actual_prompt if actual_prompt is not None else estimated_prompt)
+        self.accounted_tokens += (actual_completion if actual_completion is not None else output_tokens)
+        stage_usage = self.by_stage.setdefault(
+            stage,
+            {"calls": 0, "estimated_prompt_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
+        )
+        stage_usage["calls"] += 1
+        stage_usage["estimated_prompt_tokens"] += estimated_prompt
+        stage_usage["prompt_tokens"] += actual_prompt or 0
+        stage_usage["completion_tokens"] += actual_completion or 0
+        stage_usage["reasoning_tokens"] += reasoning_tokens or 0
         if temperature_source:
             self.temperature_sources = self.temperature_sources or {}
             self.temperature_sources[temperature_source] = self.temperature_sources.get(temperature_source, 0) + 1
@@ -298,7 +322,7 @@ class ContextUsage:
     def as_dict(self) -> dict[str, Any]:
         adjusted = bool(
             self.overflow_retries or self.dropped_segments or self.truncated_segments or self.output_limited_calls
-            or self.budget_clamped_calls or self.fallback_used
+            or self.budget_clamped_calls or self.failed_requests or self.fallback_used
         )
         return {
             "effective_context_tokens": self.effective_context_tokens,
@@ -321,6 +345,11 @@ class ContextUsage:
             "temperature_sources": self.temperature_sources or {},
             "effective_temperatures": self.effective_temperatures or {},
             "request_limit": self.request_limit,
+            "total_token_limit": self.total_token_limit,
+            "actual_total_tokens": self.actual_total_tokens or None,
+            "accounted_total_tokens": self.accounted_tokens or None,
+            "by_stage": self.by_stage,
+            "stop_reason": self.stop_reason,
             "adjusted": adjusted,
             "fallback_used": self.fallback_used,
         }

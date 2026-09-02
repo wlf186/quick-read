@@ -5,13 +5,18 @@ import argparse
 import asyncio
 import hashlib
 import json
+import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from sandevistan_read.database import DB, json_load
+from sandevistan_read.audio_quality import assess_transcription
+from sandevistan_read.config import CONFIG
+from sandevistan_read.jobs import _actual_duration_check, _run_ffmpeg
 from sandevistan_read.paths import PATHS
 from sandevistan_read.podcast import PodcastQualityError, _content_minutes, _repeated_stem_ratio, build_podcast_script
+from sandevistan_read.providers import active_provider, synthesize, transcribe_audio
 
 
 def transcript(payload: dict[str, Any]) -> str:
@@ -19,6 +24,27 @@ def transcript(payload: dict[str, Any]) -> str:
     if turns:
         return "\n".join(f"{turn.get('speaker', '?')}: {turn.get('text', '')}" for turn in turns)
     return str(payload.get("script") or "")
+
+
+def anonymous_transcript(payload: dict[str, Any], *, asr: bool = False) -> str:
+    values = payload.get("segments") if asr else payload.get("turns")
+    values = [item for item in values or [] if isinstance(item, dict) and str(item.get("text") or "").strip()]
+    if not values:
+        text = str(payload.get("text") or payload.get("script") or "").strip()
+        return f"Speaker 1: {text}" if text else ""
+    speaker_order: dict[str, str] = {}
+    normalized: list[tuple[str, str]] = []
+    for item in values:
+        raw_speaker = str(
+            item.get("speaker_label") if asr and item.get("speaker_label") else item.get("speaker") or "speaker"
+        )
+        speaker = speaker_order.setdefault(raw_speaker, f"Speaker {len(speaker_order) + 1}")
+        text = " ".join(str(item.get("text") or "").split())
+        if asr and normalized and normalized[-1][0] == speaker:
+            normalized[-1] = (speaker, normalized[-1][1] + " " + text)
+        else:
+            normalized.append((speaker, text))
+    return "\n".join(f"{speaker}: {text}" for speaker, text in normalized)
 
 
 def metrics(payload: dict[str, Any]) -> dict[str, Any]:
@@ -45,60 +71,229 @@ def load_baseline(artifact_id: str | None) -> dict[str, Any] | None:
 def review_sheet(items: list[tuple[str, str]]) -> str:
     rubric = """# Podcast blind review
 
-请不要查看 `mapping.json`，先分别为 A/B 打分。每项 1–5 分：
+请不要查看 `mapping.json`，先分别为每份文字稿打分。每项 1–5 分：
 
 - 连贯性：每轮是否回应上一轮，跨章是否自然。
 - 自然度：是否像真实双人交流，而不是模板采访或事实清单。
+- 论证深度：是否展开前提、机制、限制和含义，而非停留在概念复述。
 - 资料忠实度：是否存在无依据的数字、实体、案例或因果。
 - 角色稳定：两位主持人的职责是否清晰且不僵硬。
 - 重复控制：是否反复重启话题、复述相同事实或使用相同句式。
 
-记录格式：`A: 连贯/自然/忠实/角色/重复 = _/_/_/_/_`。
+记录格式：`A: 连贯/自然/深度/忠实/角色/重复 = _/_/_/_/_/_`。
 """
     sections = "\n\n".join(f"## Transcript {label}\n\n{text}" for label, text in items)
     return rubric + "\n\n" + sections + "\n"
 
 
+async def render_candidate(candidate: dict[str, Any], output: Path, stamp: str) -> dict[str, Any]:
+    provider = active_provider("tts")
+    if not provider:
+        raise RuntimeError("请先启用 TTS Provider")
+    ffmpeg = CONFIG.tools.ffmpeg_path
+    if not ffmpeg:
+        raise RuntimeError("完整候选评测需要项目内 FFmpeg")
+    config = provider.get("config") or {}
+    language = str(candidate.get("language") or "zh-CN")
+    defaults = ("Ryan", "Aiden") if language == "en" else ("Vivian", "Dylan")
+    voices = {
+        "HOST_A": config.get("host_a_en" if language == "en" else "host_a", defaults[0]),
+        "HOST_B": config.get("host_b_en" if language == "en" else "host_b", defaults[1]),
+    }
+    model = str(provider.get("model") or "")
+    device = str(config.get("compute_device") or "gpu")
+    model_caps = next((item for item in (provider.get("capabilities") or {}).get("models", []) if item.get("id") == model), {})
+    supports_instruction = "preset" in ((model_caps.get("controls") or {}).get("instruction_voice_modes") or [])
+    parts_dir = output / "candidate-parts"
+    normalized_dir = output / "candidate-normalized"
+    parts_dir.mkdir(exist_ok=True)
+    normalized_dir.mkdir(exist_ok=True)
+    turns = candidate.get("turns") or []
+    execution: dict[str, Any] = {"requested_device": device, "compute_device": device, "fallback_used": False}
+
+    def instruction(turn: dict[str, Any]) -> str | None:
+        if not supports_instruction:
+            return None
+        base = str(config.get("host_a_instruct" if turn["speaker"] == "HOST_A" else "host_b_instruct") or "").strip()
+        act = str(turn.get("dialogue_act") or "")
+        if language == "en":
+            cue = {"question": "Ask with genuine curiosity, without sounding theatrical.", "challenge": "Sound thoughtful and mildly skeptical.", "synthesis": "Slow slightly and land the conclusion clearly.", "bridge": "Keep this brief and conversational.", "acknowledgement": "Use a light, natural acknowledgement."}.get(act, "Use an engaged, natural knowledge-podcast cadence.")
+        else:
+            cue = {"question": "带着真实好奇追问，不要表演化。", "challenge": "语气克制、认真，带一点审慎质疑。", "synthesis": "略微放慢，把结论自然落稳。", "bridge": "简短自然地承接，不要播报腔。", "acknowledgement": "用轻微、自然的回应语气。"}.get(act, "使用投入、自然的知识播客节奏。")
+        return f"{base} {cue}".strip()
+
+    async def synthesize_turn(index: int, retry: bool = False) -> None:
+        turn = turns[index]
+        part = parts_dir / f"{index:04d}.wav"
+        digest = hashlib.sha256(f"{model}|{device}|{voices[turn['speaker']]}|{turn['text']}".encode()).hexdigest()[:20]
+        turn_execution: dict[str, Any] = {}
+        await synthesize(
+            turn["text"], voices[turn["speaker"]], part,
+            language="English" if language == "en" else "Chinese",
+            model=model, compute_device=device, instruct=instruction(turn),
+            idempotency_key=f"sread-eval-{stamp[:20]}-{index:04d}-{digest}{'-r1' if retry else ''}",
+            execution=turn_execution,
+        )
+        if turn_execution.get("fallback_used"):
+            execution.update(turn_execution)
+
+    async def render(force_indexes: set[int] | None = None) -> tuple[Path, float]:
+        force_indexes = force_indexes or set()
+        chapter_ends = {int(chapter["turn_end"]) for chapter in (candidate.get("chapters") or [])[:-1]}
+        normalized: list[Path] = []
+        for index in range(len(turns)):
+            source, target = parts_dir / f"{index:04d}.wav", normalized_dir / f"{index:03d}.wav"
+            if index in force_indexes or not target.exists():
+                pause = 0.60 if index in chapter_ends else 0.22
+                code, stderr = await _run_ffmpeg(
+                    [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-af", f"apad=pad_dur={pause}", "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(target)],
+                    180,
+                    lambda: False,
+                )
+                if code:
+                    raise RuntimeError(f"FFmpeg 音频标准化失败: {stderr[-500:]}")
+            normalized.append(target)
+        cursor = 0.0
+        for turn, part in zip(turns, normalized):
+            with wave.open(str(part), "rb") as audio:
+                duration = audio.getnframes() / max(1, audio.getframerate())
+            turn["start_seconds"] = round(cursor, 3)
+            cursor += duration
+            turn["end_seconds"] = round(cursor, 3)
+        concat_file = output / "candidate-concat.txt"
+        concat_file.write_text("".join(f"file '{part.as_posix()}'\n" for part in normalized), encoding="utf-8")
+        destination = output / "candidate.m4a"
+        code, stderr = await _run_ffmpeg(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "24000", "-ac", "1", "-c:a", "aac", "-b:a", "128k", str(destination)],
+            600,
+            lambda: False,
+        )
+        if code:
+            raise RuntimeError(f"FFmpeg 音频合并失败: {stderr[-500:]}")
+        return destination, cursor
+
+    for index in range(len(turns)):
+        if not (parts_dir / f"{index:04d}.wav").is_file():
+            await synthesize_turn(index)
+    destination, seconds = await render()
+    duration = _actual_duration_check(float(candidate["duration"]["target_minutes"]), seconds)
+    if not duration["passed"]:
+        return {"passed": False, "stage": "duration", "duration": duration, "execution": execution}
+    asr = await transcribe_audio(
+        destination,
+        language="English" if language == "en" else "Chinese",
+        idempotency_key=f"sread-eval-candidate-{stamp}",
+    )
+    quality = assess_transcription(turns, asr, language)
+    retry_indexes = list(quality.get("turn_errors") or [])
+    if retry_indexes and len(retry_indexes) <= 6:
+        for index in retry_indexes:
+            await synthesize_turn(index, retry=True)
+        destination, seconds = await render(set(retry_indexes))
+        duration = _actual_duration_check(float(candidate["duration"]["target_minutes"]), seconds)
+        if not duration["passed"]:
+            return {"passed": False, "stage": "duration_after_audio_repair", "duration": duration, "execution": execution}
+        asr = await transcribe_audio(
+            destination,
+            language="English" if language == "en" else "Chinese",
+            idempotency_key=f"sread-eval-candidate-{stamp}-verify",
+        )
+        quality = assess_transcription(turns, asr, language)
+        quality["repaired_turns"] = retry_indexes
+    (output / "candidate-asr.json").write_text(json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = {**quality, "duration": duration, "execution": execution}
+    result["passed"] = bool(quality.get("passed") and duration["passed"])
+    return result
+
+
 async def run(args: argparse.Namespace) -> tuple[Path, bool]:
     baseline = load_baseline(args.baseline_artifact)
-    payload = {
-        "source_ids": args.source_id or None,
-        "duration_mode": "fixed",
-        "minutes": args.minutes,
-        "language": args.language,
-        "focus": args.focus,
-    }
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    output = PATHS.runtime / "evals" / f"podcast-v3-{stamp}"
+    output = PATHS.runtime / "evals" / f"podcast-v4-{stamp}"
     output.mkdir(parents=True, exist_ok=False)
-    try:
-        candidate = await build_podcast_script(args.notebook_id, payload)
-    except PodcastQualityError as exc:
-        failure = {"status": "failed", "message": str(exc), "quality_report": exc.report}
-        (output / "failure.json").write_text(json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8")
-        return output, False
+    if args.candidate_json:
+        candidate_path = Path(args.candidate_json).expanduser().resolve()
+        if not candidate_path.is_file():
+            raise SystemExit(f"找不到候选 JSON：{candidate_path}")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        if not isinstance(candidate, dict):
+            raise SystemExit("--candidate-json 必须是 Podcast 候选对象")
+        candidate_quality = candidate.get("quality") or candidate.get("quality_report") or {}
+        if not candidate.get("turns") or candidate_quality.get("passed") is not True:
+            raise SystemExit("--candidate-json 必须是已通过质量门禁且包含 turns 的 Podcast 候选")
+    else:
+        if not args.notebook_id:
+            raise SystemExit("生成新候选时必须提供 --notebook-id")
+        payload = {
+            "source_ids": args.source_id or None,
+            "duration_mode": "fixed",
+            "minutes": args.minutes,
+            "language": args.language,
+            "focus": args.focus,
+        }
+        try:
+            candidate = await build_podcast_script(args.notebook_id, payload)
+        except PodcastQualityError as exc:
+            failure = {"status": "failed", "message": str(exc), "quality_report": exc.report}
+            (output / "failure.json").write_text(json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8")
+            return output, False
     (output / "candidate.json").write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
     comparison = {"candidate": metrics(candidate), "baseline": metrics(baseline) if baseline else None}
     (output / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.render_candidate:
+        try:
+            audio_quality = await render_candidate(candidate, output, stamp)
+        except Exception as exc:
+            audio_quality = {"passed": False, "stage": "render", "error": f"{type(exc).__name__}: {exc}"}
+        (output / "candidate-audio-quality.json").write_text(
+            json.dumps(audio_quality, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if not audio_quality.get("passed"):
+            return output, False
+    review_items = [("candidate", anonymous_transcript(candidate))]
     if baseline:
-        candidate_text, baseline_text = transcript(candidate), transcript(baseline)
-        candidate_first = int(hashlib.sha256(candidate_text.encode()).hexdigest(), 16) % 2 == 0
-        ordered = [("A", candidate_text), ("B", baseline_text)] if candidate_first else [("A", baseline_text), ("B", candidate_text)]
-        mapping = {"A": "candidate" if candidate_first else "baseline", "B": "baseline" if candidate_first else "candidate"}
+        review_items.append(("baseline", transcript(baseline)))
+    for index, value in enumerate(args.reference_audio or [], start=1):
+        reference = Path(value).expanduser().resolve()
+        if not reference.is_file():
+            raise SystemExit(f"找不到参考音频：{reference}")
+        reference_key = hashlib.sha256(
+            f"{reference}:{reference.stat().st_size}:{reference.stat().st_mtime_ns}".encode()
+        ).hexdigest()[:32]
+        result = await transcribe_audio(
+            reference,
+            language=args.reference_language,
+            idempotency_key=f"sread-eval-{reference_key}",
+        )
+        (output / f"reference-{index}-asr.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        review_items.append((f"reference-{index}", anonymous_transcript(result, asr=True)))
+    if len(review_items) > 1:
+        review_items.sort(key=lambda item: hashlib.sha256((stamp + item[0] + item[1]).encode()).hexdigest())
+        labels = [chr(ord("A") + index) for index in range(len(review_items))]
+        ordered = [(label, item[1]) for label, item in zip(labels, review_items)]
+        mapping = {label: item[0] for label, item in zip(labels, review_items)}
         (output / "blind-review.md").write_text(review_sheet(ordered), encoding="utf-8")
         (output / "mapping.json").write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     return output, True
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="生成脚本级 Podcast V3 评测，不调用 TTS。")
-    parser.add_argument("--notebook-id", required=True)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="生成 Podcast V4 脚本评测；可选用当前本地 TTS/ASR 渲染并验收同一候选。")
+    parser.add_argument("--notebook-id")
     parser.add_argument("--source-id", action="append", default=[])
-    parser.add_argument("--minutes", type=int, choices=(5, 10, 20, 30), default=5)
+    parser.add_argument("--minutes", type=int, choices=(5, 10, 14, 20, 22, 25, 30), default=5)
     parser.add_argument("--language", choices=("auto", "zh-CN", "en"), default="zh-CN")
     parser.add_argument("--focus", default="")
     parser.add_argument("--baseline-artifact")
-    args = parser.parse_args()
+    parser.add_argument("--reference-audio", action="append", default=[], help="加入盲评的参考音频，可重复指定")
+    parser.add_argument("--reference-language", choices=("Chinese", "English"), default="Chinese")
+    parser.add_argument("--render-candidate", action="store_true", help="渲染已生成候选并执行实际时长与 ASR 门禁；不会再次调用 MAIN")
+    parser.add_argument("--candidate-json", help="复用已通过门禁的候选 JSON，跳过 MAIN 生成")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     destination, passed = asyncio.run(run(args))
     print(json.dumps({"status": "passed" if passed else "failed", "output": str(destination)}, ensure_ascii=False))
     if not passed:

@@ -122,6 +122,7 @@ def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         recommended = {"model": best["id"], "compute_device": device}
     native = tts.get("preset_speaker_native_languages") or {}
     voices = [{"id": name, "native_language": native.get(name)} for name in tts.get("preset_speakers") or []]
+    asr = payload.get("asr") or {}
     return {
         "models": models,
         "voices": voices,
@@ -129,6 +130,13 @@ def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         "recommended": recommended,
         "async": True,
         "discovery": True,
+        "asr": {
+            "default_model": asr.get("default_model"),
+            "models": asr.get("models") or [],
+            "diarization": asr.get("diarization"),
+            "languages": asr.get("languages") or [],
+            "timestamp_precisions": asr.get("timestamp_precisions") or [],
+        } if asr else {},
     }
 
 
@@ -725,6 +733,7 @@ async def budgeted_chat(
     minimum_output_tokens: int = 128,
     temperature: float = 0.15,
     trace: ContextUsage | None = None,
+    stage: str = "generation",
 ) -> BudgetedCompletion:
     provider = _chat_provider(role)
     limits = TokenLimits.from_provider(provider)
@@ -739,7 +748,7 @@ async def budgeted_chat(
             )
         try:
             if trace:
-                trace.begin_request()
+                trace.begin_request(estimated_tokens=estimated + budget.output_tokens)
             completion = await _chat_once(
                 provider,
                 build.messages,
@@ -770,6 +779,7 @@ async def budgeted_chat(
                 cached_tokens=completion.cached_tokens,
                 temperature=completion.temperature,
                 temperature_source=completion.temperature_source,
+                stage=stage,
                 total_segments=build.total_segments,
                 included_segments=build.included_segments,
                 truncated_segments=build.truncated_segments,
@@ -924,7 +934,8 @@ async def _synthesize_sandevistan(
         data["instruct"] = instruct
     async with httpx.AsyncClient(timeout=300) as client:
         response = await client.post(f"{provider['base_url'].rstrip('/')}/api/v1/tts/jobs", data=data, headers=headers)
-        response.raise_for_status()
+        if not response.is_success:
+            raise _provider_response_error(response)
         result = response.json()
         job_id = result.get("id") or result.get("job_id")
         status_url = result.get("status_url") or f"/api/v1/jobs/{job_id}"
@@ -936,7 +947,8 @@ async def _synthesize_sandevistan(
                     raise ProviderError("任务已取消")
             poll_url = status_url if status_url.startswith("http") else provider["base_url"].rstrip("/") + status_url
             poll = await client.get(poll_url, headers=headers)
-            poll.raise_for_status()
+            if not poll.is_success:
+                raise _provider_response_error(poll)
             state = poll.json()
             job_state = state.get("state") or state.get("status")
             if job_state in {"completed", "succeeded", "done"}:
@@ -959,7 +971,20 @@ async def _synthesize_sandevistan(
                         pass
                 return output
             if job_state in {"failed", "error", "cancelled"}:
-                raise ProviderError(state.get("error_message") or state.get("error") or "TTS job failed")
+                failure = ProviderError(
+                    str(state.get("error_message") or state.get("error") or "TTS job failed"),
+                    code=str(state.get("error_code") or "tts_failed"),
+                )
+                if config.get("cleanup_remote_jobs", True):
+                    try:
+                        await client.delete(
+                            f"{provider['base_url'].rstrip('/')}/api/v1/jobs/{job_id}",
+                            params={"purge": "true"},
+                            headers=headers,
+                        )
+                    except Exception:
+                        pass
+                raise failure
             await asyncio.sleep(max(0.5, min(float(state.get("poll_after_seconds") or 1), 5)))
     raise ProviderError("TTS job timed out")
 
@@ -975,6 +1000,7 @@ async def synthesize(
     compute_device: str | None = None,
     instruct: str | None = None,
     idempotency_key: str | None = None,
+    execution: dict[str, Any] | None = None,
 ) -> Path:
     provider = active_provider("tts")
     if not provider:
@@ -990,6 +1016,8 @@ async def synthesize(
             )
             response.raise_for_status()
             output.write_bytes(response.content)
+            if execution is not None:
+                execution.update({"compute_device": "remote", "fallback_used": False})
             return output
     if provider["kind"] == "sandevistan_tts":
         config = provider.get("config", {})
@@ -997,7 +1025,7 @@ async def synthesize(
         selected_device = compute_device or config.get("compute_device", "gpu")
         key = idempotency_key or str(uuid.uuid4())
         try:
-            return await _synthesize_sandevistan(
+            result = await _synthesize_sandevistan(
                 provider,
                 text,
                 voice,
@@ -1009,10 +1037,13 @@ async def synthesize(
                 idempotency_key=key,
                 cancel_check=cancel_check,
             )
-        except (ProviderError, httpx.HTTPError):
-            if selected_device != "gpu" or not config.get("allow_device_fallback", True):
+            if execution is not None:
+                execution.update({"compute_device": selected_device, "fallback_used": False})
+            return result
+        except (ProviderError, httpx.HTTPError) as exc:
+            if selected_device != "gpu" or not config.get("allow_device_fallback", True) or not _device_failure(exc):
                 raise
-            return await _synthesize_sandevistan(
+            result = await _synthesize_sandevistan(
                 provider,
                 text,
                 voice,
@@ -1024,4 +1055,125 @@ async def synthesize(
                 idempotency_key=(key + "-cpu")[:128],
                 cancel_check=cancel_check,
             )
+            if execution is not None:
+                execution.update({"compute_device": "cpu", "fallback_used": True, "fallback_reason": str(exc)[:300]})
+            return result
     raise ProviderError(f"Provider {provider['kind']} cannot serve TTS")
+
+
+def _device_failure(error: BaseException) -> bool:
+    code = str(getattr(error, "code", "") or "").lower()
+    message = str(error).lower()
+    return code in {"gpu_unavailable", "insufficient_gpu_memory", "cuda_error", "gpu_out_of_memory", "worker_oom"} or any(
+        marker in message for marker in ("cuda", "out of memory", "gpu unavailable", "gpu is unavailable", "显存不足")
+    )
+
+
+async def _transcribe_sandevistan_once(
+    provider: dict[str, Any],
+    path: Path,
+    *,
+    language: str,
+    compute_device: str,
+    idempotency_key: str,
+    cancel_check: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
+    headers["Idempotency-Key"] = idempotency_key
+    data = {
+        "model": "qwen3-asr-0.6b",
+        "language": language,
+        "speaker_count": "2",
+        "diarize": "true",
+        "align": "true",
+        "export_formats": "json",
+        "compute_device": compute_device,
+        "use_voiceprint_library": "false",
+        "accelerate_single_task": "true",
+    }
+    job_id: str | None = None
+    async with httpx.AsyncClient(timeout=300) as client:
+        try:
+            with path.open("rb") as audio:
+                response = await client.post(
+                    f"{provider['base_url'].rstrip('/')}/api/v1/asr/jobs",
+                    data=data,
+                    files={"file": (path.name, audio, "audio/mp4" if path.suffix.lower() == ".m4a" else "audio/wav")},
+                    headers=headers,
+                )
+            if not response.is_success:
+                raise _provider_response_error(response)
+            submitted = response.json()
+            job_id = str(submitted.get("id") or submitted.get("job_id") or "")
+            if not job_id:
+                raise ProviderError("ASR provider did not return a job id")
+            status_url = submitted.get("status_url") or f"/api/v1/jobs/{job_id}"
+            for _ in range(7200):
+                if cancel_check and cancel_check():
+                    await client.post(f"{provider['base_url'].rstrip('/')}/api/v1/jobs/{job_id}/cancel", headers=headers)
+                    raise ProviderError("任务已取消", code="cancelled")
+                poll_url = status_url if str(status_url).startswith("http") else provider["base_url"].rstrip("/") + str(status_url)
+                poll = await client.get(poll_url, headers=headers)
+                if not poll.is_success:
+                    raise _provider_response_error(poll)
+                state = poll.json()
+                job_state = str(state.get("state") or state.get("status") or "")
+                if job_state in {"completed", "succeeded", "done"}:
+                    result_url = state.get("result_url") or f"/api/v1/jobs/{job_id}/result"
+                    result_response = await client.get(
+                        result_url if str(result_url).startswith("http") else provider["base_url"].rstrip("/") + str(result_url),
+                        headers=headers,
+                    )
+                    if not result_response.is_success:
+                        raise _provider_response_error(result_response)
+                    result = result_response.json()
+                    return result.get("result") if isinstance(result.get("result"), dict) else result
+                if job_state in {"failed", "error", "cancelled"}:
+                    raise ProviderError(
+                        str(state.get("error_message") or state.get("error") or "ASR job failed"),
+                        code=str(state.get("error_code") or "asr_failed"),
+                    )
+                await asyncio.sleep(max(0.5, min(float(state.get("poll_after_seconds") or 1), 5)))
+            raise ProviderError("ASR job timed out", code="timeout")
+        finally:
+            if job_id:
+                try:
+                    await client.delete(
+                        f"{provider['base_url'].rstrip('/')}/api/v1/jobs/{job_id}", params={"purge": "true"}, headers=headers
+                    )
+                except Exception:
+                    pass
+
+
+async def transcribe_audio(
+    path: Path,
+    *,
+    language: str,
+    cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Transcribe with the co-located ASR service and a single GPU-to-CPU fallback."""
+    provider = active_provider("tts")
+    if not provider or provider.get("kind") != "sandevistan_tts":
+        raise ProviderError("当前 TTS provider 不提供本地 ASR", code="asr_unsupported")
+    key = idempotency_key or str(uuid.uuid4())
+    try:
+        result = await _transcribe_sandevistan_once(
+            provider, path, language=language, compute_device="gpu", idempotency_key=key,
+            cancel_check=cancel_check,
+        )
+        return {**result, "model": result.get("model") or "qwen3-asr-0.6b", "compute_device": "gpu", "fallback_used": False}
+    except Exception as exc:
+        if not _device_failure(exc):
+            raise
+        result = await _transcribe_sandevistan_once(
+            provider, path, language=language, compute_device="cpu", idempotency_key=(key + "-cpu")[:128],
+            cancel_check=cancel_check,
+        )
+        return {
+            **result,
+            "model": result.get("model") or "qwen3-asr-0.6b",
+            "compute_device": "cpu",
+            "fallback_used": True,
+            "fallback_reason": str(exc)[:300],
+        }

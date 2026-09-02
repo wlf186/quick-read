@@ -155,10 +155,10 @@ def main() -> None:
         page.locator(".studio-cards button").filter(has_text="双人音频").click()
         podcast_create = page.get_by_role("dialog", name="生成双人深度播客")
         assert podcast_create.is_visible()
-        assert podcast_create.get_by_text("PODCAST V3 // LINKED SCENES", exact=True).is_visible()
-        assert podcast_create.get_by_text(re.compile("脚本不合格时不会进入语音合成")).is_visible()
+        assert podcast_create.get_by_text("PODCAST V4 // EDITORIAL ACTS", exact=True).is_visible()
+        assert podcast_create.get_by_text(re.compile("成品再由本地 ASR 验收")).is_visible()
         assert page.get_by_label("目标时长").is_visible()
-        page.screenshot(path="/tmp/sandevistan-read-podcast-v3-desktop.png")
+        page.screenshot(path="/tmp/sandevistan-read-podcast-v4-desktop.png")
         page.keyboard.press("Escape")
         assert podcast_create.count() == 0
 

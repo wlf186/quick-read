@@ -3,6 +3,7 @@
 .cache/
 .temp/
 runtime/
+/.experiment/
 frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo
