@@ -13,7 +13,7 @@ from .database import DB, json_dump, json_load, new_id, utc_now
 from .config import CONFIG
 from .paths import PATHS
 from .providers import ProviderError, active_provider, study_generation_profile, synthesize, transcribe_audio
-from .audio_quality import assess_transcription
+from .audio_quality import assess_transcription, repair_turn_indexes
 from .podcast import PODCAST_DURATION_CALIBRATION_VERSION, PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script
 from .services import ingest_source, make_summary
 from .study import generate_study_artifact
@@ -163,7 +163,10 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     tts_execution: dict[str, Any] = {"requested_device": selected_device, "compute_device": selected_device, "fallback_used": False}
 
     def turn_instruction(turn: dict[str, Any]) -> str | None:
-        base = str(instructions.get(turn["speaker"]) or "").strip()
+        configured = instructions.get(turn["speaker"])
+        if configured is None:
+            return None  # 模型不支持 preset instruction，与评测路径一致不发送
+        base = configured.strip()
         act = str(turn.get("dialogue_act") or "")
         if language == "en":
             cue = {
@@ -219,25 +222,29 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         destination = out_dir / "podcast.m4a"
         if not ffmpeg:
             destination = out_dir / "podcast.wav"
+            chapter_ends = {int(chapter["turn_end"]) for chapter in generated["chapters"][:-1]}
             cursor = 0.0
-            with wave.open(str(parts[0]), "rb") as first:
-                params, frames = first.getparams(), [first.readframes(first.getnframes())]
-                duration = first.getnframes() / max(1, first.getframerate())
-            turns[0]["start_seconds"], turns[0]["end_seconds"] = 0.0, round(duration, 3)
-            cursor = duration
-            for index, part in enumerate(parts[1:], start=1):
+            params = None
+            rendered: list[bytes] = []
+            for index, part in enumerate(parts):
                 with wave.open(str(part), "rb") as audio:
-                    if audio.getparams()[:3] != params[:3]:
+                    if params is None:
+                        params = audio.getparams()
+                    elif audio.getparams()[:3] != params[:3]:
                         raise RuntimeError("TTS 输出音频参数不一致，请安装项目内 FFmpeg")
-                    frames.append(audio.readframes(audio.getnframes()))
+                    frames = audio.readframes(audio.getnframes())
                     duration = audio.getnframes() / max(1, audio.getframerate())
+                pause = 0.60 if index in chapter_ends else 0.22
+                silence = b"\x00" * int(params.framerate * params.sampwidth * params.nchannels * pause)
                 turns[index]["start_seconds"] = round(cursor, 3)
-                cursor += duration
+                cursor += duration + pause
                 turns[index]["end_seconds"] = round(cursor, 3)
+                rendered.append(frames)
+                rendered.append(silence)
             with wave.open(str(destination), "wb") as output:
                 output.setparams(params)
-                for frame in frames:
-                    output.writeframes(frame)
+                for chunk in rendered:
+                    output.writeframes(chunk)
             for chapter in generated["chapters"]:
                 chapter_turns = turns[chapter["turn_start"] : chapter["turn_end"] + 1]
                 if chapter_turns:
@@ -295,7 +302,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         save_manifest(manifest)
         raise RuntimeError(f"成品音频 ASR 验收失败：{exc}") from exc
     audio_quality = assess_transcription(turns, asr_result, language)
-    retry_indexes = list(audio_quality.get("turn_errors") or [])
+    retry_indexes = repair_turn_indexes(audio_quality)
     if retry_indexes and len(retry_indexes) <= 6:
         for index in retry_indexes:
             await synthesize_turn(index, retry=True)

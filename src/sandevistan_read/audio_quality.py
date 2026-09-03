@@ -176,3 +176,8 @@ def assess_transcription(turns: list[dict[str, Any]], result: dict[str, Any], la
         "device_fallback": bool(result.get("fallback_used")),
         "fallback_reason": result.get("fallback_reason"),
     }
+
+
+def repair_turn_indexes(report: dict[str, Any]) -> list[int]:
+    """需要重合成的轮次：转写错轮与超长静音归属轮的并集，生产与评测路径共用。"""
+    return sorted(set(report.get("turn_errors") or []) | set(report.get("silence_outlier_turns") or []))

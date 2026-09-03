@@ -1,4 +1,4 @@
-from sandevistan_read.audio_quality import assess_transcription
+from sandevistan_read.audio_quality import assess_transcription, repair_turn_indexes
 
 
 def _turns() -> list[dict]:
@@ -117,3 +117,16 @@ def test_audio_quality_tight_turn_gaps_are_not_outliers() -> None:
     assert result["silence_outliers"] == 0
     assert result["silence_outlier_turns"] == []
     assert result["passed"] is True
+
+
+def test_repair_turn_indexes_merges_silence_outliers() -> None:
+    report = {"turn_errors": [5, 2], "silence_outlier_turns": [2, 9]}
+    assert repair_turn_indexes(report) == [2, 5, 9]
+
+
+def test_repair_turn_indexes_silence_only() -> None:
+    assert repair_turn_indexes({"silence_outlier_turns": [3]}) == [3]
+
+
+def test_repair_turn_indexes_empty() -> None:
+    assert repair_turn_indexes({}) == []

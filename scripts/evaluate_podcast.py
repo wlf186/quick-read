@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from sandevistan_read.database import DB, json_load
-from sandevistan_read.audio_quality import assess_transcription
+from sandevistan_read.audio_quality import assess_transcription, repair_turn_indexes
 from sandevistan_read.config import CONFIG
 from sandevistan_read.jobs import _actual_duration_check, _run_ffmpeg
 from sandevistan_read.paths import PATHS
@@ -193,7 +193,7 @@ async def render_candidate(
         idempotency_key=f"sread-eval-candidate-{stamp}",
     )
     quality = assess_transcription(turns, asr, language)
-    retry_indexes = sorted(set(quality.get("turn_errors") or []) | set(quality.get("silence_outlier_turns") or []))
+    retry_indexes = repair_turn_indexes(quality)
     if retry_indexes and len(retry_indexes) <= 6:
         for index in retry_indexes:
             await synthesize_turn(index, retry=True)
