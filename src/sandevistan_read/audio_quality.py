@@ -137,13 +137,21 @@ def assess_transcription(turns: list[dict[str, Any]], result: dict[str, Any], la
             turn_errors.append(index)
     error_rate = total_edits / max(1, total_reference)
     speaker_alignment, speaker_mapping = _segment_host_alignment(turns, segments)
-    gaps = []
+    gaps: list[tuple[float, float]] = []
     ordered = sorted(segments, key=lambda item: float(item.get("start") or 0))
     for left, right in zip(ordered, ordered[1:]):
         gap = float(right.get("start") or 0) - float(left.get("end") or 0)
         if gap > 0:
-            gaps.append(gap)
-    silence_outliers = sum(gap > 1.5 for gap in gaps)
+            gaps.append(((float(left.get("end") or 0) + float(right.get("start") or 0)) / 2, gap))
+    silence_outliers = sum(gap > 1.5 for _, gap in gaps)
+    # 把超长静音按中点归属到所在轮次（轮首静音属于后一轮），让渲染层只重合成这些轮
+    silence_outlier_turns = sorted({
+        index
+        for midpoint, gap in gaps
+        if gap > 1.5
+        for index, turn in enumerate(turns)
+        if float(turn.get("start_seconds") or 0) <= midpoint <= float(turn.get("end_seconds") or 0)
+    })
     passed = bool(
         segments
         and error_rate <= threshold
@@ -161,7 +169,8 @@ def assess_transcription(turns: list[dict[str, Any]], result: dict[str, Any], la
         "turn_errors": turn_errors,
         "segment_count": len(segments),
         "silence_outliers": silence_outliers,
-        "max_internal_silence": round(max(gaps, default=0.0), 3),
+        "silence_outlier_turns": silence_outlier_turns,
+        "max_internal_silence": round(max((gap for _, gap in gaps), default=0.0), 3),
         "asr_model": result.get("model"),
         "compute_device": result.get("compute_device"),
         "device_fallback": bool(result.get("fallback_used")),

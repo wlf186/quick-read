@@ -797,7 +797,7 @@ async def test_episode_audit_samples_each_act_instead_of_resending_full_transcri
         podcast.ContextUsage(),
     )
     assert audit["passed"] is True
-    assert captured["max_tokens"] == 2400
+    assert captured["max_tokens"] == podcast.structured_output_tokens(2400)
     for index in (0, 2, 4, 5, 7, 9):
         assert f"unique-{index}" in captured["prompt"]
     for index in (1, 3, 6, 8):
@@ -847,3 +847,206 @@ async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, mo
     assert manifest["version"] == 4
     assert manifest["quality_failure"]["stage"] == "episode"
     assert not synthesized
+
+
+@pytest.mark.asyncio
+async def test_episode_audit_reserves_reasoning_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    async def fake_budgeted_chat(builder, **kwargs):
+        captured.update(kwargs)
+        build = builder(PromptBudget(8192, 6000, 1200, 2048, 1.0))
+        content = json.dumps({
+            "verdict": "pass",
+            "scores": {"grounding": 5, "coherence": 5, "depth": 5, "roles": 5, "repetition": 5, "completeness": 5},
+            "invalid_boundaries": [],
+            "blocking_issues": [],
+        }, ensure_ascii=False)
+        return SimpleNamespace(content=content, build=build)
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_budgeted_chat)
+    turns = _gate_ready_turns(12)
+    chapters = [{"id": "chapter_1", "turn_start": 0, "turn_end": 11}]
+    result = await podcast._audit_episode(turns, chapters, "命题", "zh-CN", podcast.ContextUsage())
+    assert result["passed"] is True
+    # 推理模型的隐藏 reasoning 会占用 max_tokens：审计必须像其他结构化调用一样预留余量
+    assert captured["max_tokens"] >= 2400 + 1024
+
+
+def _gate_ready_turns(count: int = 30) -> list[dict]:
+    # 三个槽位取互质周期（6/5/7），保证 30 轮内没有两轮同时命中两个槽位，
+    # 使 _similar 的 SequenceMatcher 比率稳定在 0.84 重复阈值以下
+    topics = ["信任机制", "层次结构", "网络协议", "证明过程", "历史背景", "符号系统"]
+    angles = ["从成本角度剖析", "用具体案例说明", "对照替代方案比较", "拆开前提逐层验证", "换成反方立场审视"]
+    endings = ["并给出对应的实例", "再补充一个反例", "同时交代适用条件", "由此引出后续讨论", "并指出常见误读", "最后落到实际影响", "顺手厘清相邻概念"]
+    turns: list[dict] = []
+    for index in range(count):
+        is_question = index % 5 == 2
+        text = (
+            f"主持人就{topics[index % 6]}的第{index}点{angles[index % 5]}，{endings[index % 7]}，"
+            f"并进一步交代这一点的适用条件与常见误解（材料第{index}段）"
+            + ("？" if is_question else "。")
+        )
+        turns.append({
+            "speaker": "HOST_A" if index % 2 == 0 else "HOST_B",
+            "text": text,
+            "dialogue_act": "question" if is_question else "explain",
+            "claim_ids": [] if is_question else ["C1"],
+            "citation_ids": [] if is_question else ["S1"],
+        })
+    return turns
+
+
+def _gate_chapters(count: int = 30, acts: int = 3) -> list[dict]:
+    size = count // acts
+    return [
+        {"id": f"chapter_{index + 1}", "turn_start": index * size, "turn_end": (index + 1) * size - 1}
+        for index in range(acts)
+    ]
+
+
+def _run_quality_gate(turns: list[dict], chapters: list[dict] | None = None) -> dict:
+    return podcast._quality_metrics_v3(
+        turns,
+        [{"source_id": "s1", "id": "S1"}],
+        5,
+        30,
+        {"passed": True, "scores": {"grounding": 5, "coherence": 5, "depth": 5, "roles": 5, "repetition": 5, "completeness": 5}},
+        [],
+        ["s1"],
+        None,
+        chapters,
+    )
+
+
+def test_cliche_gate_passes_clean_episode() -> None:
+    report = _run_quality_gate(_gate_ready_turns(), _gate_chapters())
+    assert report["deterministic_passed"] is True
+    assert report["cliche_family_density"] == 0
+    assert report["cliche_family_counts"] == {"audit_negation": 0, "recap_meta": 0, "next_layer": 0, "boundary_meta": 0}
+    assert len(report["cliche_act_density"]) == 3
+
+
+def test_cliche_gate_rejects_dense_episode() -> None:
+    turns = _gate_ready_turns()
+    for index in (0, 5, 10, 15, 20, 25):
+        turns[index]["text"] += "这里先把第一主张压实，再回扣开篇问题。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["cliche_family_counts"]["recap_meta"] == 12
+    assert report["deterministic_passed"] is False
+    reasons = podcast._deterministic_failure_reasons(report)
+    assert any("套话" in reason and "recap_meta" in reason for reason in reasons)
+
+
+def test_cliche_gate_family_count_boundary() -> None:
+    turns = _gate_ready_turns()
+    for index in (0, 5, 10):
+        turns[index]["text"] += "这一点只支持到这里。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    # 3 次命中：密度 0.10、单族 3，恰好都在阈值上，应通过
+    assert report["cliche_family_density"] == 0.1
+    assert report["cliche_max_family_count"] == 3
+    assert report["deterministic_passed"] is True
+    turns[15]["text"] += "这里不能推出更多结论。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["cliche_max_family_count"] == 4
+    assert report["deterministic_passed"] is False
+
+
+def test_cliche_gate_rejects_single_act_cluster() -> None:
+    turns = _gate_ready_turns()
+    # 全部命中集中在第一个 Act：整集密度与单族计数都在阈值内，但单 Act 密度 0.3 超限
+    for index in (0, 1, 2):
+        turns[index]["text"] += "下一层问题自然冒出来。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["cliche_family_density"] == 0.1
+    assert report["cliche_act_density"][0]["density"] == 0.3
+    assert report["deterministic_passed"] is False
+    assert any("单个 Act" in reason for reason in podcast._deterministic_failure_reasons(report))
+
+
+def test_cliche_gate_ignores_soft_boundary_content_words() -> None:
+    turns = _gate_ready_turns()
+    soft_additions = [
+        "这个门槛随攻击条件移动。",
+        "机制边界在材料里交代得很清楚。",
+        "理解的门槛并不等于失效。",
+        "演示流畅不代表跨过了那道门槛。",
+        "它给出的边界是双值性留下的入口。",
+    ]
+    for addition, index in zip(soft_additions, (0, 3, 6, 9, 12)):
+        turns[index]["text"] += addition
+    report = _run_quality_gate(turns, _gate_chapters())
+    # 软族只统计、不参与判定：正当内容词不应导致失败
+    assert report["cliche_family_counts"]["boundary_meta"] == 5
+    assert report["cliche_family_density"] == 0
+    assert report["deterministic_passed"] is True
+
+
+def test_guard_gate_passes_clean_episode() -> None:
+    report = _run_quality_gate(_gate_ready_turns(), _gate_chapters())
+    assert report["deterministic_passed"] is True
+    assert report["guard_family_counts"] == {"guard_disclaimer": 0, "neq_disclaimer": 0}
+    assert report["guard_density"] == 0
+    assert len(report["guard_act_density"]) == 3
+
+
+def test_guard_gate_rejects_dense_disclaimers() -> None:
+    turns = _gate_ready_turns()
+    for index in (0, 5, 10, 15, 20, 25):
+        turns[index]["text"] += "这里别把它读成绝对结论。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    # 6 次命中：整集密度 0.2 超过 0.18 上限
+    assert report["guard_family_counts"]["guard_disclaimer"] == 6
+    assert report["guard_density"] == 0.2
+    assert report["deterministic_passed"] is False
+    assert any("防误读" in reason for reason in podcast._deterministic_failure_reasons(report))
+
+
+def test_guard_gate_density_boundary() -> None:
+    turns = _gate_ready_turns()
+    for index in (0, 5, 10, 15, 20):
+        turns[index]["text"] += "风险不等于消失。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    # 5/30 = 0.167，低于 0.18 且单族 5 ≤ 10，应通过
+    assert report["guard_density"] == 0.167
+    assert report["deterministic_passed"] is True
+    turns[25]["text"] += "速度快不意味着安全。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["guard_density"] == 0.2
+    assert report["deterministic_passed"] is False
+
+
+def test_guard_regex_ignores_legitimate_reading_verbs() -> None:
+    turns = _gate_ready_turns()
+    # 正当用法：没有“别”字告诫语境的“读成/当成”不计入
+    turns[0]["text"] += "先把这个读成工程上的顺手设计。"
+    turns[1]["text"] += "可以把它当成一次架构演示来听。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["guard_family_counts"]["guard_disclaimer"] == 0
+    assert report["deterministic_passed"] is True
+    turns[2]["text"] += "先别急着把它当成定论。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["guard_family_counts"]["guard_disclaimer"] == 1
+
+
+def test_guard_act_density_is_report_only() -> None:
+    turns = _gate_ready_turns()
+    # 命中集中在首个 Act：整集密度 0.1 与单族 3 都在限内，Act 密度 0.3 只记录不判定
+    for index in (0, 1, 2):
+        turns[index]["text"] += "这不意味着机制失效。"
+    report = _run_quality_gate(turns, _gate_chapters())
+    assert report["guard_act_density"][0]["density"] == 0.3
+    assert report["guard_density"] == 0.1
+    assert report["deterministic_passed"] is True
+
+
+
+def test_cliche_metrics_english_turns_no_false_positive() -> None:
+    turns = [
+        {"speaker": "HOST_A", "text": "The threshold here is a real boundary condition for the mechanism.", "dialogue_act": "explain"},
+        {"speaker": "HOST_B", "text": "Right, and we cannot push the claim beyond what the text supports.", "dialogue_act": "challenge"},
+    ]
+    metrics = podcast._cliche_family_metrics(turns)
+    assert metrics["cliche_family_density"] == 0
+    assert metrics["cliche_worst_family"] is None

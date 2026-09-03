@@ -361,3 +361,54 @@ async def test_activation_switch_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_
     await app_module.update_provider("provider_new", ProviderUpdate(active=True))
     assert database.fetchone("SELECT active FROM provider_profiles WHERE id='provider_old'")["active"] == 0
     assert database.fetchone("SELECT active FROM provider_profiles WHERE id='provider_new'")["active"] == 1
+
+
+def _stub_budgeted_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(providers, "_chat_provider", lambda role: {"model": "m"})
+    monkeypatch.setattr(providers.TokenLimits, "from_provider", staticmethod(lambda provider: None))
+    monkeypatch.setattr(
+        providers,
+        "prompt_budget",
+        lambda limits, max_tokens, minimum, scale: SimpleNamespace(input_tokens=100_000, output_tokens=1000, image_tokens_per_image=0),
+    )
+    monkeypatch.setattr(providers, "estimate_messages_tokens", lambda messages, images: 10)
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_retries_transport_error_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    _stub_budgeted_chat(monkeypatch)
+    calls = {"count": 0}
+
+    async def flaky(provider, messages, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ConnectError("connection reset")
+        return SimpleNamespace(content="OK", finish_reason="stop")
+
+    monkeypatch.setattr(providers, "_chat_once", flaky)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == "OK"
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_gives_up_after_single_transport_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    _stub_budgeted_chat(monkeypatch)
+    calls = {"count": 0}
+
+    async def always_down(provider, messages, **kwargs):
+        calls["count"] += 1
+        raise httpx.TimeoutException("timeout")
+
+    monkeypatch.setattr(providers, "_chat_once", always_down)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    with pytest.raises(httpx.TimeoutException):
+        await providers.budgeted_chat(lambda budget: build)
+    assert calls["count"] == 2

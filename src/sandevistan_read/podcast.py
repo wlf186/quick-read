@@ -42,6 +42,35 @@ GENERIC_STEMS = (
     "what does this passage establish",
     "without going beyond the text",
 )
+# 审计式套话语义族。硬族只含不可能是自然口语内容的元话语，进入整集确定性门禁；
+# 软族（边界/门槛/范围）在技术、哲学题材中有正当内容用法（离线校准：历史胜者 0.14/轮 ≈
+# 失败样本 0.148/轮，无区分度），只统计进报告、不参与判定。
+CLICHE_FAMILIES = {
+    "audit_negation": ("不能推出", "无法推出", "推不出", "只支持到这里", "只能支持到", "不能直接得出", "不能得出"),
+    "recap_meta": ("回扣", "压实", "收数"),
+    "next_layer": ("下一层",),
+}
+CLICHE_SOFT_FAMILIES = {
+    "boundary_meta": ("边界", "门槛", "范围之内", "范围之外"),
+}
+# 阈值取自离线校准中点（历史胜者 vs 匿名评审失败样本）：整集胜者 0.02/轮、失败 0.188/轮；
+# 单族胜者最大 1、失败最大 6；单 Act 胜者最差 0.062、失败最差 0.333。
+CLICHE_EPISODE_DENSITY_LIMIT = 0.10
+CLICHE_FAMILY_COUNT_LIMIT = 3
+CLICHE_ACT_DENSITY_LIMIT = 0.20
+# 防护句式（“别把它读成/夸成 X”“A 不等于 B”式防误读提醒）用正则统计：纯子串会把
+# “把这个读成工程上的顺手”等正当用法误算。V6 离线校准（生产正则口径）：历史胜者 4 次
+# （0.080/轮）、参考 0 次、V5 盲评通过样本 12 次（0.194/轮，重复控制 4 压线）、
+# V5 失败样本 14 次（0.200/轮，重复控制 3）。
+GUARD_FAMILIES = {
+    "guard_disclaimer": re.compile(r"别[^，。；]{0,16}?(?:读成|夸成|说成|想成|当成|看成|理解成|误认为|误以为|推向|拧成|急着)"),
+    "neq_disclaimer": re.compile(r"不等于|并不等同|不意味着|未必是|谈不上"),
+}
+# 阈值宁松勿紧：整集密度 0.18 卡在胜者 0.080 与 V5 两轮 0.194/0.200 之间（盲评对两轮
+# 都点名了防护鼓点，故两者都应被拦）；单族计数 10 取通过 8 与失败 12 之间的宽口径。
+# Act 级区分度弱（通过样本最差 Act 达 0.38），只在报告中统计、不参与判定。
+GUARD_FAMILY_COUNT_LIMIT = 10
+GUARD_EPISODE_DENSITY_LIMIT = 0.18
 
 
 class PodcastQualityError(RuntimeError):
@@ -229,14 +258,18 @@ def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
     if language == "en":
         return (
             f"Follow this ordered slot plan: {encoded}. S slots use 1–2 natural sentences for concise questions, "
-            "acknowledgements, or bridges; D slots use 3–5 complete sentences to explain, test, evidence, challenge, or synthesize the @ claim. "
+            "acknowledgements, or bridges; D slots use 3–5 complete sentences to explain, probe, qualify, or synthesize the @ claim. "
+            "Within the 3–5 sentence range, alternate compact and expansive D turns instead of writing them all at one length, "
+            "but do not lower the act's overall density below the slot plan. "
             "The @ claim is also the only default support when an S slot states a fact. "
             "Do not strengthen association into causation, or a supporting argument into the only, final, or definitive one unless the claim says so. "
             "Write directly without counting words or reporting statistics; use useful spoken content, not filler or repeated summaries."
         )
     return (
         f"严格执行按轮次排列的槽位计划：{encoded}。S 槽用 1–2 个自然句完成简洁追问、回应或承接；"
-        "D 槽用 3–5 个完整但紧凑的句子解释、检验、限制或综合 @ 后的主张；S 槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
+        "D 槽用 3–5 个完整但紧凑的句子解释、追问、辨析或综合 @ 后的主张；在 3–5 句范围内让紧凑轮与展开轮长短交替，"
+        "不要所有 D 槽写成同一长度，但整 Act 的总篇幅不得低于槽位计划的密度；"
+        "S 槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
         "除非主张本身明说，不得把相关性强化为因果，也不得把支持性论据说成‘唯一、最终、根本、证明’。"
         "直接写正文，不要在思考中逐字计数或输出统计；禁止填充语和重复总结。"
     )
@@ -488,6 +521,8 @@ def _sentences(content: str) -> list[str]:
     return values
 
 
+# V3 遗留：_grounded_question / _safe_chapter_turns 只被 create_chapter_turns（V3 路径）使用，
+# V4 editorial-acts 生产路径不经过；其循环模板正是匿名评审所指“修正模板”的句式来源，保留仅为 V3 兼容。
 def _grounded_question(chapter_title: str, index: int, language: str) -> str:
     topic = chapter_title[:24]
     cycle = index // 7
@@ -811,7 +846,7 @@ async def create_episode_plan(
     language_rule = "只使用自然的简体中文" if language != "en" else "Use natural spoken English only"
     target = act_count or max(3, min(6, round(math.sqrt(max(1, len(claims))))))
     prompt_prefix = f"""你是资料型深度播客的总编。{language_rule}。只规划一条能从核心问题逐步走向结论的叙事主线，不写对话，不补充资料外事实。
-规划恰好 {target} 个逻辑递进 Act。HOST_A 与 HOST_B 必须按 Act 轮换主导解释、质疑和综合，不能固定成主讲者与采访者。每个 claim 只在真正相关的 Act 使用。第一 Act 提出问题但不预告所有答案，最后一 Act 回扣问题且不引入新事实。
+规划恰好 {target} 个逻辑递进 Act。HOST_A 与 HOST_B 必须按 Act 轮换主导解释、质疑和综合，不能固定成主讲者与采访者。每个 claim 只在真正相关的 Act 使用。第一 Act 必须先用一两轮立起题目与背景（这份材料是什么、核心问题是什么、为什么值得听），再进入细节论证；提出问题但不预告所有答案，最后一 Act 回扣问题且不引入新事实。
 输出 JSON：{{"episode_thesis":"","chapters":[{{"title":"","purpose":"","tension":"需要检验的误解或反例","lead_host":"HOST_A|HOST_B","claim_ids":["C1"],"bridge_in":"如何承接上一 Act","bridge_out":"留给下一 Act 的问题"}}]}}。
 用户关注：{focus or '整体深度解读'}
 可用主张：
@@ -1069,14 +1104,14 @@ def _scene_instruction(scene_kind: str, language: str) -> str:
             "chapter": "Advance one coherent line of reasoning. Each turn must directly answer, qualify, or build on the immediately previous turn.",
             "outro": "Resolve the central question using only claims already discussed, then close naturally without introducing new facts.",
             "boundary_repair": "Rewrite this chapter opening so it responds directly to the preceding exchange and then enters the planned topic.",
-            "act": "Develop the planned act as one continuous exchange: frame the issue, test it, explain the evidence, draw an implication, and hand off naturally. The first act opens the central question; the last resolves it without new facts.",
+            "act": "Develop the planned act as one continuous exchange: frame the issue, probe common misunderstandings, explain the evidence, draw an implication, and hand off naturally. The first act opens the central question; the last resolves it without new facts.",
         }[scene_kind]
     return {
         "intro": "用核心问题开场，让两位主持人的互补视角自然出现；不要提前罗列所有答案。",
         "chapter": "沿一条推理主线推进；每一轮必须直接回应、修正或承接紧邻的上一轮。",
         "outro": "只用已经讨论过的主张回应开场问题，自然收束，不引入任何新事实。",
         "boundary_repair": "重写本章开头，使其先回应上一段真实对话，再自然进入规划主题。",
-        "act": "把当前 Act 写成连续推进的交流：提出局部问题、检验误解、解释证据、形成含义并自然承接。第一 Act 打开核心问题，最后一 Act 只用已讨论事实完成回扣。",
+        "act": "把当前 Act 写成连续推进的交流：提出局部问题、澄清常见误解、解释证据、形成含义并自然承接。第一 Act 打开核心问题，最后一 Act 只用已讨论事实自然收束核心问题。",
     }[scene_kind]
 
 
@@ -1125,10 +1160,10 @@ async def _draft_scene(
         duration_rule = ""
     prompt_prefix = f"""你是严格资料内的双人深度播客编剧。{language_rule}。两位主持人都能解释、质疑和综合；本 Act 由 {chapter.get('lead_host') or 'HOST_A'} 主导，但另一位必须贡献实质判断，禁止机械采访和孤立事实罗列。
 {_scene_instruction(scene_kind, language)}
-生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。问句占本 Act 的 20%–35%，不得连续出现超过两个问句；长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”把前提、机制、限制和含义逐步讲清，不能把上一轮尚未确认的猜测写成已建立结论。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
+生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。问句占本 Act 的 20%–35%，不得连续出现超过两个问句；长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
 只输出一个 JSON 对象，键名为 turns；turns 的每一项必须是四元素数组，依次为 speaker、act_code、text、claim_ids。speaker 只能为 A/B；act_code 只能为 I/F/B/Q/A/X/E/M/C/S/O；claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。不要输出示例、统计、解释或额外字段。
 剧集记忆：{memory_json}
-当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；需要检验的张力：{chapter.get('tension')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。
+当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；本 Act 的内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。
 {'这不是首个 Act：第一轮必须先明确回应剧集记忆中上个钩子的未决关系，再进入新角度；不得直接跳到新类比。' if memory.last_turns else ''}
 {f'上次草稿问题，必须修复：{feedback}' if feedback else ''}
 允许使用的主张：
@@ -1251,7 +1286,7 @@ async def _continue_scene(
     prompt_prefix = f"""你正在补全一段提前结束、结构不完整的资料型双人播客。{language_rule}。不要重写或复述已有轮次，只续写缺失的 {missing} 轮，从 HOST_{start_speaker} 开始严格交替。
 续写需要补足约 {remaining_minutes:.1f} 分钟自然口播，其中最多 {remaining_question_cap} 轮可以是问句（包括以问号结尾的非 Q 标签轮）。{_slot_plan_instruction(slot_plan, language)} 继续当前推理并完成本 Act 的目的与后续钩子；事实轮必须带受支持的 claim_ids。
 只输出一个 JSON 对象，键名为 turns；每一项是 speaker、act_code、text、claim_ids 组成的四元素数组。不要输出短示例、统计或解释。act code 只能使用 I/F/B/Q/A/X/E/M/C/S/O。
-当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；张力：{chapter.get('tension')}；后续钩子：{chapter.get('bridge_out')}。
+当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；后续钩子：{chapter.get('bridge_out')}。
 紧邻的已有对话：{json.dumps(compact_recent, ensure_ascii=False)}
 允许使用的主张：
 """
@@ -1619,7 +1654,7 @@ async def _expand_episode_duration(
         )
     language_rule = "Use natural spoken English only." if language == "en" else "只使用自然的简体中文口语。"
     unit = "words" if language == "en" else "中文等价字符"
-    prompt_prefix = f"""你是资料型双人播客的精简扩写编辑。{language_rule} 只扩写列出的实质轮次，不改变说话人、dialogue act、claim_ids、结论方向或相邻轮次关系。用对应 claims 补足前提、机制、限制或含义，不得加入资料外事实、数字、类比、开场白或重复总结。
+    prompt_prefix = f"""你是资料型双人播客的精简扩写编辑。{language_rule} 只扩写列出的实质轮次，不改变说话人、dialogue act、claim_ids、结论方向或相邻轮次关系。用对应 claims 补足前提、机制或含义；需要限定时用一句自然口语带过（如“这里原文没明说”），不使用“不能推出、只支持、边界、门槛、回扣、压实”一类审稿术语，也不要新增“别把它读成/夸成”“不等于”一类防误读提醒。不得加入资料外事实、数字、类比、开场白或重复总结。
 每项必须达到自己的 minimum_units 且不超过 maximum_units，单位为{unit}。只输出 JSON 对象，键名 replacements；每项是 [原始整数 index, replacement_text]。必须恰好返回全部 index，不输出统计或解释。
 待扩写轮次：
 """
@@ -1718,7 +1753,7 @@ async def _audit_episode(
     )
     used_claims = list(dict.fromkeys(claim_id for _, turn in sampled_turns for claim_id in turn.get("claim_ids") or []))
     claims = [claims_by_id[value] for value in used_claims if claims_by_id and value in claims_by_id]
-    prompt_prefix = f"""你是深度播客主编。全稿已通过时长、引用、说话人平衡、问题密度和重复的逐轮客观检查；下面是每个 Act 的开头、中点和结尾抽样。判断对应事实是否受 claim 支持、论证是否逐步深入、Act 之间是否自然、双方是否都贡献实质内容、是否有套话或过度绝对的结论。只输出 JSON：{{"verdict":"pass|fail","scores":{{"grounding":5,"coherence":5,"depth":5,"roles":5,"repetition":5,"completeness":5}},"invalid_boundaries":[1],"blocking_issues":["会阻断发布的具体问题"],"notes":["可选润色建议"]}}。5=优秀、4=可发布、1=严重失败。blocking_issues 只能放会使某项低于 4 分或与 pass 矛盾的发布阻断项；4 分范围内的改善建议必须放 notes，不得放 blocking_issues。只有局限在 Act 边界附近、最多可改 6 轮的问题才放入 invalid_boundaries；需要重写整集时给 fail 但保持该数组为空。语言={language}。核心命题：{thesis}
+    prompt_prefix = f"""你是深度播客主编。全稿已通过时长、引用、说话人平衡、问题密度和重复的逐轮客观检查；下面是每个 Act 的开头、中点和结尾抽样。判断对应事实是否受 claim 支持、论证是否逐步深入、Act 之间是否自然、双方是否都贡献实质内容、是否有套话或过度绝对的结论。额外检查两点：(a) 是否把尚未确认的猜测说成已建立结论、是否把支持性论据过度放大——资料忠实度防线不变；(b) 口播是否把审稿术语（如“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”）直接说出口——区分确定与不确定应该是一句自然口语限定，而不是方法论旁白；(c) 防误读提醒是否密集重复——“别把它读成/夸成/说成”“不等于/不意味着”一类句式在同一 Act 出现多处，会让节目听起来像持续自我审查；发现任一点即记入 blocking_issues。只输出 JSON：{{"verdict":"pass|fail","scores":{{"grounding":5,"coherence":5,"depth":5,"roles":5,"repetition":5,"completeness":5}},"invalid_boundaries":[1],"blocking_issues":["会阻断发布的具体问题"],"notes":["可选润色建议"]}}。5=优秀、4=可发布、1=严重失败。blocking_issues 只能放会使某项低于 4 分或与 pass 矛盾的发布阻断项；4 分范围内的改善建议必须放 notes，不得放 blocking_issues。只有局限在 Act 边界附近、最多可改 6 轮的问题才放入 invalid_boundaries；需要重写整集时给 fail 但保持该数组为空。语言={language}。核心命题：{thesis}
 Act 抽样（保留原始轮次索引）：
 {transcript}
 抽样所用主张：
@@ -1734,7 +1769,7 @@ Act 抽样（保留原始轮次索引）：
             ),
             json_mode=True,
             timeout=300,
-            max_tokens=2400,
+            max_tokens=structured_output_tokens(2400),
             minimum_output_tokens=450,
             temperature=0.0,
             trace=trace,
@@ -1846,10 +1881,64 @@ def _repeated_stem_ratio(turns: list[dict[str, Any]]) -> float:
     return repeated / len(stems)
 
 
+def _count_cliche_hits(text: str, families: dict[str, tuple[str, ...]]) -> dict[str, int]:
+    return {family: sum(text.count(phrase) for phrase in phrases) for family, phrases in families.items()}
+
+
+def _cliche_family_metrics(turns: list[dict[str, Any]], chapter_payloads: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    hard_counts = {family: 0 for family in CLICHE_FAMILIES}
+    soft_counts = {family: 0 for family in CLICHE_SOFT_FAMILIES}
+    guard_counts = {family: 0 for family in GUARD_FAMILIES}
+    for turn in turns:
+        text = str(turn.get("text") or "")
+        for family, count in _count_cliche_hits(text, CLICHE_FAMILIES).items():
+            hard_counts[family] += count
+        for family, count in _count_cliche_hits(text, CLICHE_SOFT_FAMILIES).items():
+            soft_counts[family] += count
+        for family, pattern in GUARD_FAMILIES.items():
+            guard_counts[family] += len(pattern.findall(text))
+    total = sum(hard_counts.values())
+    guard_total = sum(guard_counts.values())
+    act_densities: list[dict[str, Any]] = []
+    guard_act_densities: list[dict[str, Any]] = []
+    for chapter in chapter_payloads or []:
+        start = max(0, int(chapter.get("turn_start") or 0))
+        end = chapter.get("turn_end")
+        segment = turns[start : int(end) + 1 if end is not None else len(turns)]
+        if not segment:
+            continue
+        hits = sum(
+            sum(str(turn.get("text") or "").count(phrase) for phrase in phrases)
+            for turn in segment
+            for phrases in CLICHE_FAMILIES.values()
+        )
+        act_densities.append({"chapter_id": chapter.get("id"), "density": round(hits / len(segment), 3)})
+        guard_hits = sum(
+            len(pattern.findall(str(turn.get("text") or "")))
+            for turn in segment
+            for pattern in GUARD_FAMILIES.values()
+        )
+        guard_act_densities.append({"chapter_id": chapter.get("id"), "density": round(guard_hits / len(segment), 3)})
+    worst_act = max((item["density"] for item in act_densities), default=0.0)
+    return {
+        "cliche_family_counts": {**hard_counts, **soft_counts},
+        "cliche_family_density": round(total / max(1, len(turns)), 3),
+        "cliche_max_family_count": max(hard_counts.values(), default=0),
+        "cliche_worst_family": max(hard_counts, key=lambda family: hard_counts[family]) if total else None,
+        "cliche_act_density": act_densities,
+        "cliche_worst_act_density": worst_act,
+        "guard_family_counts": guard_counts,
+        "guard_density": round(guard_total / max(1, len(turns)), 3),
+        "guard_max_family_count": max(guard_counts.values(), default=0),
+        "guard_act_density": guard_act_densities,
+    }
+
+
 def _quality_metrics_v3(
     turns: list[dict[str, Any]], citations: list[dict[str, Any]], target_minutes: int, requested_turns: int,
     episode_audit: dict[str, Any], scene_audits: list[dict[str, Any]], selected_source_ids: list[str],
     duration_calibration: dict[str, Any] | None = None,
+    chapter_payloads: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     a_chars = sum(len(turn["text"]) for turn in turns if turn["speaker"] == "HOST_A")
     b_chars = sum(len(turn["text"]) for turn in turns if turn["speaker"] == "HOST_B")
@@ -1892,6 +1981,7 @@ def _quality_metrics_v3(
         "safe_fallback_turns": 0,
         "duration_calibration": duration_calibration or {},
     }
+    report.update(_cliche_family_metrics(turns, chapter_payloads))
     report["deterministic_passed"] = bool(
         0.85 <= report["duration_ratio"] <= 1.20
         and 0.40 <= report["host_a_ratio"] <= 0.60
@@ -1900,6 +1990,11 @@ def _quality_metrics_v3(
         and report["uncited_factual_turns"] == 0
         and report["duplicate_pairs"] == 0
         and report["repeated_stem_ratio"] <= 0.10
+        and report["cliche_family_density"] <= CLICHE_EPISODE_DENSITY_LIMIT
+        and report["cliche_max_family_count"] <= CLICHE_FAMILY_COUNT_LIMIT
+        and report["cliche_worst_act_density"] <= CLICHE_ACT_DENSITY_LIMIT
+        and report["guard_density"] <= GUARD_EPISODE_DENSITY_LIMIT
+        and report["guard_max_family_count"] <= GUARD_FAMILY_COUNT_LIMIT
     )
     report["passed"] = bool(report["deterministic_passed"] and episode_audit.get("passed"))
     return report
@@ -1914,6 +2009,20 @@ def _deterministic_failure_reasons(report: dict[str, Any]) -> list[str]:
         (int(report.get("uncited_factual_turns") or 0) > 0, "存在未引用的事实轮"),
         (int(report.get("duplicate_pairs") or 0) > 0, "存在重复轮次"),
         (float(report.get("repeated_stem_ratio") or 0) > 0.10, "问句模板重复"),
+        (
+            float(report.get("cliche_family_density") or 0) > CLICHE_EPISODE_DENSITY_LIMIT
+            or int(report.get("cliche_max_family_count") or 0) > CLICHE_FAMILY_COUNT_LIMIT,
+            f"审计式套话密度过高（{report.get('cliche_worst_family') or '-'} 出现 {report.get('cliche_max_family_count') or 0} 次，整集 {report.get('cliche_family_density') or 0}/轮）",
+        ),
+        (
+            float(report.get("cliche_worst_act_density") or 0) > CLICHE_ACT_DENSITY_LIMIT,
+            f"审计式套话在单个 Act 内过密（最高 {report.get('cliche_worst_act_density') or 0}/轮）",
+        ),
+        (
+            float(report.get("guard_density") or 0) > GUARD_EPISODE_DENSITY_LIMIT
+            or int(report.get("guard_max_family_count") or 0) > GUARD_FAMILY_COUNT_LIMIT,
+            f"防误读提醒句式过密（整集 {report.get('guard_density') or 0}/轮，{report.get('guard_family_counts') or {}}）",
+        ),
     )
     return [message for failed, message in checks if failed]
 
@@ -2058,7 +2167,8 @@ async def build_podcast_script(
         "issues": ["客观脚本门禁失败，未调用整集审校"],
     }
     preflight = _quality_metrics_v3(
-        turns, provisional_citations, target_minutes, total_target, skipped_audit, scene_audits, ids, duration_calibration
+        turns, provisional_citations, target_minutes, total_target, skipped_audit, scene_audits, ids,
+        duration_calibration, chapter_payloads
     )
     if not preflight.get("deterministic_passed", preflight.get("passed", False)):
         preflight["deterministic_failure_reasons"] = _deterministic_failure_reasons(preflight)
@@ -2078,7 +2188,8 @@ async def build_podcast_script(
         turn["id"] = f"turn_{index}"
         turn["chapter_id"] = next((chapter["id"] for chapter in chapter_payloads if chapter["turn_start"] <= index - 1 <= chapter["turn_end"]), "unknown")
     quality = _quality_metrics_v3(
-        turns, citations, target_minutes, total_target, episode_audit, scene_audits, ids, duration_calibration
+        turns, citations, target_minutes, total_target, episode_audit, scene_audits, ids,
+        duration_calibration, chapter_payloads
     )
     quality["recovery"] = {
         "continuation_used": generation_state.continuation_used,

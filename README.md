@@ -41,7 +41,7 @@ Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署�
 
 MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提供时）和最大输出。Ollama 优先采用当前运行实例的 `context_length`，其次采用 Modelfile 的 `num_ctx`，不会把模型理论最大窗口直接当作运行窗口；OpenAI-compatible 服务则读取模型清单或详情中公开的限制。无法探测时使用 4096 tokens 安全回退并显示警告，最大输出默认按有效窗口的 25% 推导且不超过 4096。设置页可人工覆盖上下文窗口和最大输出；人工值优先，但不能超过模型明确报告的理论最大值。
 
-问答、摘要、闪卡和播客脚本会预留 20% 安全余量，并按输入与输出预算裁剪证据。若 Provider 仍报告上下文溢出，系统会以 100%、50%、25% 三档自动缩小后重试。发生裁剪、输出受限或回退时，聊天或 Studio 产物会显示“已按模型窗口调整证据量”。
+问答、摘要、闪卡和播客脚本会预留 20% 安全余量，并按输入与输出预算裁剪证据。若 Provider 仍报告上下文溢出，系统会以 100%、50%、25% 三档自动缩小后重试；网络连接或超时错误则在同一预算下重试一次，不消耗溢出降档。发生裁剪、输出受限或回退时，聊天或 Studio 产物会显示“已按模型窗口调整证据量”。
 
 连接检查不保存配置。深度验证只发送内置的极短测试文本或测试图片，不会发送 Notebook 资料；使用云端模型时仍可能产生少量 API 费用。未通过验证的配置可以保存为未启用状态，启用失败不会替换当前同角色的活跃 Provider。
 
@@ -84,13 +84,13 @@ Quiz 按题作答，提交前不会通过产物 API 暴露答案、解释或引�
 
 ## Podcast V4
 
-双人音频 V4 采用“多样化证据 → 主张表 → editorial acts → 携带前文的长段续写 → 客观门禁 → 整集审校 → 逐轮 TTS → 本地 ASR 验收”流水线。两位主持人共享解释、质疑、追问与综合职责，每一轮都要回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。长节目使用约 2.8 轮/分钟的充实对话，并以紧凑模型输出减少结构 token；每个 Act 按剩余时长分配口播字数，欠账最多把下一幕提高到名义预算的 120%。只有输出上限截断时才允许全剧一次小型续写，且它与边界修复共享唯一恢复名额。客观门禁失败时跳过整集审校。脚本未达到连贯性、证据、角色平衡、重复控制或目标时长门槛时会在 TTS 前停止，不再用模板问答补足长度。音频完成后会先验证真实时长，再检查字/词错误率、双主持人分离和异常静音；只有少量坏轮次时最多重合成一次，GPU 因显存或设备问题失败时，TTS/ASR 各自只回退 CPU 一次，不修改 Provider 配置。
+双人音频 V4 采用“多样化证据 → 主张表 → editorial acts → 携带前文的长段续写 → 客观门禁 → 整集审校 → 逐轮 TTS → 本地 ASR 验收”流水线。两位主持人共享解释、质疑、追问与综合职责，每一轮都要回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。口播限定用自然口语表达，审稿术语与密集的防误读提醒不得进入口播；每个 Act 先立题目再展开。长节目使用约 2.8 轮/分钟的充实对话，并以紧凑模型输出减少结构 token；每个 Act 按剩余时长分配口播字数，欠账最多把下一幕提高到名义预算的 120%。只有输出上限截断时才允许全剧一次小型续写，且它与边界修复共享唯一恢复名额。客观门禁覆盖时长、引用、角色平衡、问句密度、重复轮次，以及审计套话与防误读句式的密度上限（整集、单族、单 Act 三档），失败时在整集审校前直接停止，不消耗额外模型调用；整集审校为推理模型预留输出余量，避免隐藏推理挤占答复导致截断。脚本未达到门槛时会在 TTS 前停止，不再用模板问答补足长度。音频完成后会先验证真实时长，再检查字/词错误率、双主持人分离和异常静音；异常静音会归属到具体轮次并并入重合成集合，只有少量坏轮次时最多重合成一次，GPU 因显存或设备问题失败时，TTS/ASR 各自只回退 CPU 一次，不修改 Provider 配置。
 
 默认自动生成 12–25 分钟，也可选择 5、10、20 或 30 分钟；首次默认输出简体中文，并在浏览器中记住上次选择。MAIN Provider 的上下文和输出窗口较小时，系统使用更短场景与压缩剧集记忆；大窗口模型会生成更长场景并执行同一质量门槛。已有 V2 产物保持兼容。
 
-可使用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5 --baseline-artifact <旧播客ID>` 生成 V4 文字稿并与旧产物盲评，默认不会调用 TTS。追加 `--reference-audio <样本.m4a>` 时，会通过当前本地 Sandevistan ASR 转写样本并加入匿名盲评；也可用 `--candidate-json <已通过的candidate.json>` 跳过 MAIN，复用同一候选做参考 ASR、盲评或 `--render-candidate` 端到端验收。GPU 资源错误时自动单次转 CPU。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
+可使用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5 --baseline-artifact <旧播客ID>` 生成 V4 文字稿并与旧产物盲评，默认不会调用 TTS。追加 `--reference-audio <样本.m4a>` 时，会通过当前本地 Sandevistan ASR 转写样本并加入匿名盲评；也可用 `--candidate-json <已通过的candidate.json>` 跳过 MAIN，复用同一候选做参考 ASR、盲评或 `--render-candidate` 端到端验收。`--tts-model`/`--tts-device` 可对单次渲染覆盖模型与设备（如 0.6B 快速预览），不写数据库、不修改已保存的 Provider。GPU 资源错误时自动单次转 CPU。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
 
-多样本冻结验收使用 `scripts/evaluate_podcast_suite.py prepare --manifest <runtime-manifest.json> --mode frozen`。它会为每个样本生成新候选、执行 TTS/ASR、按音频 ASR 生成匿名 A/B 包，并按音频 SHA 缓存参考 ASR；开发模式允许在 manifest 中提供已通过门禁的 `candidate_json`，避免因音频或评审问题重复调用 MAIN。独立评审完成 `scores-template.json` 后，以 `finalize --run-dir <目录> --scores <评分.json>` 解盲并执行六维分数、音频质量及 45k MAIN token 硬门槛。
+多样本冻结验收使用 `scripts/evaluate_podcast_suite.py prepare --manifest <runtime-manifest.json> --mode frozen`。它会为每个样本生成新候选、执行 TTS/ASR、按音频 ASR 生成匿名 A/B 包，并按音频 SHA 缓存参考 ASR；开发模式允许在 manifest 中提供已通过门禁的 `candidate_json`，避免因音频或评审问题重复调用 MAIN。`--sample <id>` 可重复指定以只跑 manifest 子集（选样集合参与套件身份哈希），`--tts-model/--tts-device` 同样支持单次覆盖；中断后 resume 会保留已生成的匿名映射，缺失时用不变的 seed 确定性重建。独立评审完成 `scores-template.json` 后，以 `finalize --run-dir <目录> --scores <评分.json>` 解盲并执行六维分数、音频质量及 45k MAIN token 硬门槛。
 
 Sandevistan TTS Provider 可在设置中探测实时能力。自动模式选择已安装的最高质量模型：该模型支持 GPU 时优先 GPU，否则使用同一模型的 CPU；不会为了速度静默降低模型质量。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
 

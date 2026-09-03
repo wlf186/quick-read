@@ -80,3 +80,40 @@ def test_audio_quality_treats_chinese_spoken_numbers_as_equivalent() -> None:
     )
     assert result["error_rate"] == 0
     assert result["turn_errors"] == []
+
+
+def test_audio_quality_attributes_silence_outliers_to_turns() -> None:
+    turns = [
+        {"speaker": "HOST_A", "text": "第一轮内容完整无缺。", "start_seconds": 0.0, "end_seconds": 4.0},
+        {"speaker": "HOST_B", "text": "第二轮内容同样完整。", "start_seconds": 4.0, "end_seconds": 8.5},
+    ]
+    result = assess_transcription(
+        turns,
+        {"segments": [
+            {"start": 0.0, "end": 3.8, "speaker": "SPEAKER_00", "text": "第一轮内容完整无缺。"},
+            # 轮首静音 2.2 秒：落在第二轮窗口内，应归属 turn 1
+            {"start": 6.0, "end": 8.4, "speaker": "SPEAKER_01", "text": "第二轮内容同样完整。"},
+        ]},
+        "zh-CN",
+    )
+    assert result["silence_outliers"] == 1
+    assert result["silence_outlier_turns"] == [1]
+    assert result["passed"] is False
+
+
+def test_audio_quality_tight_turn_gaps_are_not_outliers() -> None:
+    turns = [
+        {"speaker": "HOST_A", "text": "第一轮内容完整无缺。", "start_seconds": 0.0, "end_seconds": 4.0},
+        {"speaker": "HOST_B", "text": "第二轮内容同样完整。", "start_seconds": 4.0, "end_seconds": 8.5},
+    ]
+    result = assess_transcription(
+        turns,
+        {"segments": [
+            {"start": 0.0, "end": 3.8, "speaker": "SPEAKER_00", "text": "第一轮内容完整无缺。"},
+            {"start": 4.4, "end": 8.2, "speaker": "SPEAKER_01", "text": "第二轮内容同样完整。"},
+        ]},
+        "zh-CN",
+    )
+    assert result["silence_outliers"] == 0
+    assert result["silence_outlier_turns"] == []
+    assert result["passed"] is True

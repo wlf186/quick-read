@@ -749,14 +749,27 @@ async def budgeted_chat(
         try:
             if trace:
                 trace.begin_request(estimated_tokens=estimated + budget.output_tokens)
-            completion = await _chat_once(
-                provider,
-                build.messages,
-                json_mode=json_mode,
-                timeout=timeout,
-                max_tokens=budget.output_tokens,
-                temperature=temperature,
-            )
+            try:
+                completion = await _chat_once(
+                    provider,
+                    build.messages,
+                    json_mode=json_mode,
+                    timeout=timeout,
+                    max_tokens=budget.output_tokens,
+                    temperature=temperature,
+                )
+            except (httpx.ConnectError, httpx.TimeoutException):
+                # 传输层错误与提示预算无关，同一预算下只重试一次；不消耗溢出降档
+                if trace:
+                    trace.record_failure()
+                completion = await _chat_once(
+                    provider,
+                    build.messages,
+                    json_mode=json_mode,
+                    timeout=timeout,
+                    max_tokens=budget.output_tokens,
+                    temperature=temperature,
+                )
         except ContextOverflowError as exc:
             if trace:
                 trace.record_failure()
