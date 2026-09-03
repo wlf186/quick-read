@@ -86,7 +86,14 @@ def review_sheet(items: list[tuple[str, str]]) -> str:
     return rubric + "\n\n" + sections + "\n"
 
 
-async def render_candidate(candidate: dict[str, Any], output: Path, stamp: str) -> dict[str, Any]:
+async def render_candidate(
+    candidate: dict[str, Any],
+    output: Path,
+    stamp: str,
+    *,
+    tts_model: str | None = None,
+    tts_device: str | None = None,
+) -> dict[str, Any]:
     provider = active_provider("tts")
     if not provider:
         raise RuntimeError("请先启用 TTS Provider")
@@ -100,8 +107,9 @@ async def render_candidate(candidate: dict[str, Any], output: Path, stamp: str) 
         "HOST_A": config.get("host_a_en" if language == "en" else "host_a", defaults[0]),
         "HOST_B": config.get("host_b_en" if language == "en" else "host_b", defaults[1]),
     }
-    model = str(provider.get("model") or "")
-    device = str(config.get("compute_device") or "gpu")
+    # tts_model/tts_device 只覆盖本次渲染；显式参数经 synthesize() 透传，不修改已保存的 provider
+    model = str(tts_model or provider.get("model") or "")
+    device = str(tts_device or config.get("compute_device") or "gpu")
     model_caps = next((item for item in (provider.get("capabilities") or {}).get("models", []) if item.get("id") == model), {})
     supports_instruction = "preset" in ((model_caps.get("controls") or {}).get("instruction_voice_modes") or [])
     parts_dir = output / "candidate-parts"
@@ -109,7 +117,7 @@ async def render_candidate(candidate: dict[str, Any], output: Path, stamp: str) 
     parts_dir.mkdir(exist_ok=True)
     normalized_dir.mkdir(exist_ok=True)
     turns = candidate.get("turns") or []
-    execution: dict[str, Any] = {"requested_device": device, "compute_device": device, "fallback_used": False}
+    execution: dict[str, Any] = {"requested_device": device, "compute_device": device, "fallback_used": False, "model": model}
 
     def instruction(turn: dict[str, Any]) -> str | None:
         if not supports_instruction:
@@ -185,7 +193,7 @@ async def render_candidate(candidate: dict[str, Any], output: Path, stamp: str) 
         idempotency_key=f"sread-eval-candidate-{stamp}",
     )
     quality = assess_transcription(turns, asr, language)
-    retry_indexes = list(quality.get("turn_errors") or [])
+    retry_indexes = sorted(set(quality.get("turn_errors") or []) | set(quality.get("silence_outlier_turns") or []))
     if retry_indexes and len(retry_indexes) <= 6:
         for index in retry_indexes:
             await synthesize_turn(index, retry=True)
@@ -242,7 +250,9 @@ async def run(args: argparse.Namespace) -> tuple[Path, bool]:
     (output / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2), encoding="utf-8")
     if args.render_candidate:
         try:
-            audio_quality = await render_candidate(candidate, output, stamp)
+            audio_quality = await render_candidate(
+                candidate, output, stamp, tts_model=args.tts_model, tts_device=args.tts_device
+            )
         except Exception as exc:
             audio_quality = {"passed": False, "stage": "render", "error": f"{type(exc).__name__}: {exc}"}
         (output / "candidate-audio-quality.json").write_text(
@@ -289,6 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-language", choices=("Chinese", "English"), default="Chinese")
     parser.add_argument("--render-candidate", action="store_true", help="渲染已生成候选并执行实际时长与 ASR 门禁；不会再次调用 MAIN")
     parser.add_argument("--candidate-json", help="复用已通过门禁的候选 JSON，跳过 MAIN 生成")
+    parser.add_argument("--tts-model", help="仅本次渲染覆盖 TTS 模型（如 qwen3-tts-0.6b），不修改已保存的 Provider")
+    parser.add_argument("--tts-device", help="仅本次渲染覆盖 TTS 设备（gpu/cpu），不修改已保存的 Provider")
     return parser
 
 

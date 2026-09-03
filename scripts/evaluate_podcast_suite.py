@@ -156,8 +156,20 @@ async def prepare_suite(
     mode: str,
     output: Path | None = None,
     resume: bool = False,
+    samples: list[str] | None = None,
+    tts_model: str | None = None,
+    tts_device: str | None = None,
 ) -> tuple[Path, bool]:
     manifest = load_manifest(manifest_path)
+    wanted = sorted({str(value).strip() for value in (samples or []) if str(value).strip()})
+    if wanted:
+        known = {sample["id"] for sample in manifest["samples"]}
+        unknown = sorted(set(wanted) - known)
+        if unknown:
+            raise ValueError(f"--sample 包含 manifest 中不存在的 id：{', '.join(unknown)}")
+        # 过滤发生在 manifest_hash 计算之前：不同选样即不同 suite 身份，
+        # resume 时 manifest_hash 校验会自动拒绝选样不一致的误恢复
+        manifest["samples"] = [sample for sample in manifest["samples"] if sample["id"] in set(wanted)]
     if mode == "frozen" and any(sample.get("candidate_json") for sample in manifest["samples"]):
         raise ValueError("frozen 模式禁止 candidate_json 或 resume")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -176,6 +188,7 @@ async def prepare_suite(
             "status": "running",
             "implementation": implementation,
             "provider": _provider_fingerprint(),
+            "tts_override": {"model": tts_model, "device": tts_device},
             "resumed_at": datetime.now(UTC).isoformat(),
         })
     else:
@@ -185,20 +198,56 @@ async def prepare_suite(
             "mode": mode,
             "created_at": datetime.now(UTC).isoformat(),
             "manifest_hash": manifest_hash,
+            "requested_samples": wanted or None,
             "implementation": implementation,
             "provider": _provider_fingerprint(),
+            "tts_override": {"model": tts_model, "device": tts_device},
             "samples": {},
         }
     seed = hashlib.sha256(f"{snapshot['created_at']}:{manifest_hash}".encode()).hexdigest()
     (output / "suite.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     mappings: dict[str, dict[str, str]] = {}
     scores_template: dict[str, Any] = {"samples": {}}
+    if resume:
+        # 优先从磁盘恢复既有 mapping/template：blind-review.md 可能已送评审，
+        # 已落盘的 private-mapping.json 是 A/B 解盲映射的唯一权威来源
+        mapping_path = output / "private-mapping.json"
+        if mapping_path.is_file():
+            saved_mappings = json.loads(mapping_path.read_text(encoding="utf-8"))
+            if isinstance(saved_mappings, dict):
+                mappings.update(saved_mappings)
+        template_path = output / "scores-template.json"
+        if template_path.is_file():
+            saved_template = json.loads(template_path.read_text(encoding="utf-8"))
+            if isinstance(saved_template, dict):
+                scores_template["samples"].update(saved_template.get("samples") or {})
+        valid_ids = {sample["id"] for sample in manifest["samples"]}
+        for stale in sorted(set(mappings) - valid_ids):
+            mappings.pop(stale, None)
+            scores_template["samples"].pop(stale, None)
+    rebuilt_mappings: list[str] = []
     cache_dir = PATHS.runtime / "evals" / "reference-cache"
     for sample in manifest["samples"]:
         sample_id = sample["id"]
         sample_dir = output / sample_id
         previous = (snapshot.get("samples") or {}).get(sample_id) or {}
         if resume and previous.get("status") == "awaiting_scores":
+            if sample_id not in mappings:
+                # 兜底：mapping 文件缺失时，用不变的 seed 与已落盘 ASR 确定性重建
+                candidate_asr_path = sample_dir / "candidate-asr.json"
+                reference_asr_path = sample_dir / "reference-asr.json"
+                if candidate_asr_path.is_file() and reference_asr_path.is_file():
+                    _, mapping = _blind_packet(
+                        sample_id,
+                        json.loads(candidate_asr_path.read_text(encoding="utf-8")),
+                        json.loads(reference_asr_path.read_text(encoding="utf-8")),
+                        seed,
+                    )
+                    mappings[sample_id] = mapping
+                    scores_template["samples"].setdefault(
+                        sample_id, {label: {dimension: None for dimension in DIMENSIONS} for label in ("A", "B")}
+                    )
+                    rebuilt_mappings.append(sample_id)
             continue
         sample_dir.mkdir(exist_ok=resume)
         try:
@@ -223,7 +272,9 @@ async def prepare_suite(
                 )
                 candidate_source = "fresh"
             (sample_dir / "candidate.json").write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
-            audio_quality = await render_candidate(candidate, sample_dir, f"{stamp}-{sample_id}")
+            audio_quality = await render_candidate(
+                candidate, sample_dir, f"{stamp}-{sample_id}", tts_model=tts_model, tts_device=tts_device
+            )
             (sample_dir / "candidate-rendered.json").write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
             (sample_dir / "candidate-audio-quality.json").write_text(
                 json.dumps(audio_quality, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -275,6 +326,8 @@ async def prepare_suite(
             return output, False
         (output / "suite.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     snapshot["status"] = "awaiting_scores"
+    if rebuilt_mappings:
+        snapshot["rebuilt_mappings"] = rebuilt_mappings
     (output / "private-mapping.json").write_text(json.dumps(mappings, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "scores-template.json").write_text(json.dumps(scores_template, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "suite.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -364,6 +417,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--mode", choices=("development", "frozen"), default="development")
     prepare.add_argument("--output")
     prepare.add_argument("--resume", action="store_true")
+    prepare.add_argument("--sample", action="append", default=[], help="只评测指定 sample id，可重复指定；选样集合是 suite 身份的一部分")
+    prepare.add_argument("--tts-model", help="仅本次评测覆盖 TTS 模型（如 qwen3-tts-0.6b），不修改已保存的 Provider")
+    prepare.add_argument("--tts-device", help="仅本次评测覆盖 TTS 设备（gpu/cpu），不修改已保存的 Provider")
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--run-dir", required=True)
     finalize.add_argument("--scores", required=True)
@@ -379,6 +435,9 @@ def main() -> None:
                 mode=args.mode,
                 output=Path(args.output).expanduser().resolve() if args.output else None,
                 resume=args.resume,
+                samples=args.sample or None,
+                tts_model=args.tts_model,
+                tts_device=args.tts_device,
             )
         )
         print(json.dumps({"status": "awaiting_scores" if prepared else "failed", "output": str(destination)}, ensure_ascii=False))
