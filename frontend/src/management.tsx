@@ -16,8 +16,9 @@ function Pager({page,onPage}:{page:Page<unknown>;onPage:(page:number)=>void}){re
 type JobConfirmation={kind:'cancel'|'purge';jobs:Job[]};
 export function JobsPage({onError}:{onError:(error:unknown)=>void}){
   const[data,setData]=useState<Page<Job>>(EMPTY_PAGE);const[query,setQuery]=useState('');const deferred=useDeferredValue(query);const[kind,setKind]=useState('all');const[state,setState]=useState('all');const[page,setPage]=useState(1);const[selected,setSelected]=useState<Set<string>>(new Set());const[opened,setOpened]=useState<Job>();const[events,setEvents]=useState<any[]>([]);const[loading,setLoading]=useState(true);const[confirmation,setConfirmation]=useState<JobConfirmation>();
-  const load=useCallback(async()=>{try{setData(await getJobsPage({q:deferred,kind,state,page,page_size:20}))}catch(error){onError(error)}finally{setLoading(false)}},[deferred,kind,state,page,onError]);
-  useEffect(()=>{void load();const timer=window.setInterval(load,2000);return()=>window.clearInterval(timer)},[load]);
+  const load=useCallback(async()=>{try{setData(await getJobsPage({q:deferred,kind,state,page,page_size:20,view:'summary'}))}catch(error){onError(error)}finally{setLoading(false)}},[deferred,kind,state,page,onError]);
+  useEffect(()=>{void load()},[load]);
+  useEffect(()=>{if(!data.items.some(item=>ACTIVE_STATES.has(item.state)))return;const timer=window.setTimeout(()=>void load(),2000);return()=>window.clearTimeout(timer)},[data.items,load]);
   useEffect(()=>{
     if(!opened)return;
     let active=true;
@@ -48,7 +49,8 @@ type NotebookConfirmation={kind:'single'|'batch';notebooks:Notebook[]};
 export function NotebooksPage({onOpen,onError,onNotify,onChanged}:{onOpen:(id:string)=>void;onError:(error:unknown)=>void;onNotify:(message:string,tone:'success'|'error')=>void;onChanged:()=>Promise<void>}){
   const[data,setData]=useState<Page<Notebook>>(EMPTY_PAGE);const[query,setQuery]=useState('');const deferred=useDeferredValue(query);const[state,setState]=useState('all');const[page,setPage]=useState(1);const[selected,setSelected]=useState<Set<string>>(new Set());const[createOpen,setCreateOpen]=useState(false);const[title,setTitle]=useState('');const[creating,setCreating]=useState(false);const[confirmation,setConfirmation]=useState<NotebookConfirmation>();const[loading,setLoading]=useState(true);const[retrying,setRetrying]=useState('');
   const load=useCallback(async()=>{try{setData(await getNotebookManagement({q:deferred,state,page,page_size:20}))}catch(error){onError(error)}finally{setLoading(false)}},[deferred,state,page,onError]);
-  useEffect(()=>{void load();const timer=window.setInterval(load,3000);return()=>window.clearInterval(timer)},[load]);
+  useEffect(()=>{void load()},[load]);
+  useEffect(()=>{if(!data.items.some(item=>item.state==='deleting'||Boolean(item.active_jobs)))return;const timer=window.setTimeout(()=>void load(),3000);return()=>window.clearTimeout(timer)},[data.items,load]);
   useEffect(()=>{const selectable=new Set(data.items.filter(item=>item.state==='active').map(item=>item.id));setSelected(current=>{const next=new Set([...current].filter(id=>selectable.has(id)));return next.size===current.size?current:next})},[data.items]);
   function closeCreate(){setCreateOpen(false);setTitle('')}
   async function create(){if(!title.trim()||creating)return;setCreating(true);try{const item=await createNotebook(title.trim());closeCreate();await load();onOpen(item.id)}catch(error){onError(error);throw error}finally{setCreating(false)}}

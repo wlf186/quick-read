@@ -31,6 +31,7 @@ export function Overlay({children,className='',label,layer='base',onClose,closeO
     });
     const onKeyDown=(event:KeyboardEvent)=>{
       if(overlayStack.at(-1)!==overlayId)return;
+      if(event.key==='Escape'&&event.target instanceof Element&&event.target.closest('[data-escape-boundary]'))return;
       if(event.key==='Escape'&&closeOnEscape){event.preventDefault();event.stopImmediatePropagation();onCloseRef.current();return}
       if(event.key!=='Tab'||!panelRef.current)return;
       const focusable=[...panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(element=>element.offsetParent!==null);

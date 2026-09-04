@@ -230,6 +230,8 @@ async def test_render_candidate_defaults_to_saved_provider(tmp_path: Path, monke
     assert captured[0]["model"] == "saved-tts-1.7b"
     assert captured[0]["compute_device"] == "gpu"
     assert captured[0]["instruct"]
+    assert "突然兴奋" in captured[0]["instruct"]
+    assert "voice_mode" in captured[0] and captured[0]["voice_mode"] == "preset"
 
 
 @pytest.mark.asyncio

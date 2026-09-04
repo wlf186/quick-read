@@ -73,7 +73,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 def _provider_fingerprint() -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for role in ("main", "tts"):
+    for role in ("main", "audio"):
         provider = active_provider(role) or {}
         config = provider.get("config") or {}
         result[role] = {
@@ -87,6 +87,11 @@ def _provider_fingerprint() -> dict[str, Any]:
                 for key in (
                     "temperature", "context_window_tokens", "max_output_tokens", "compute_device",
                     "host_a", "host_b", "host_a_en", "host_b_en", "allow_device_fallback",
+                    "host_a_voice_mode", "host_b_voice_mode",
+                    "host_a_voiceprint_person_id", "host_b_voiceprint_person_id",
+                    "host_a_voiceprint_sample_id", "host_b_voiceprint_sample_id",
+                    "host_a_instruct", "host_b_instruct",
+                    "asr_auto_select", "asr_model", "asr_compute_device", "asr_allow_device_fallback",
                 )
                 if key in config
             },
@@ -115,12 +120,13 @@ def _load_candidate(path: Path) -> dict[str, Any]:
 
 async def _reference_asr(sample: dict[str, Any], cache_dir: Path) -> tuple[dict[str, Any], Path, bool]:
     reference = Path(sample["reference_audio"])
-    tts = active_provider("tts") or {}
-    asr = (tts.get("capabilities") or {}).get("asr") or {}
+    audio = active_provider("audio") or {}
+    asr = (audio.get("capabilities") or {}).get("asr") or {}
+    asr_config = audio.get("config") or {}
     cache_identity = {
         "audio_sha256": _file_hash(reference),
         "language": sample["reference_language"],
-        "asr_model": asr.get("default_model"),
+        "asr_model": asr_config.get("asr_model") or asr.get("default_model"),
     }
     cache_path = cache_dir / f"{_json_hash(cache_identity)}.json"
     if cache_path.is_file():

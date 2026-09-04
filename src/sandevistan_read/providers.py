@@ -56,7 +56,7 @@ def normalize_provider_base_url(kind: str, value: str) -> str:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ProviderError("服务地址不能包含账号、密码、查询参数或片段")
     path = parsed.path.rstrip("/")
-    suffix = "/v1" if kind in {"openai", "openai_tts"} else "/api/v1" if kind == "sandevistan_tts" else "/api"
+    suffix = "/v1" if kind in {"openai", "openai_tts"} else "/api/v1" if kind in {"sandevistan_audio", "sandevistan_tts"} else "/api"
     if path.endswith(suffix):
         path = path[: -len(suffix)]
     return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
@@ -90,25 +90,33 @@ def _inspection_error(
     }
 
 
-def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalized_devices(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": device.get("id"),
+            "available": bool(device.get("available")),
+            "default": bool(device.get("default")),
+            "precision": device.get("precision"),
+            "reason": device.get("unavailable_reason"),
+            "reason_code": device.get("unavailable_reason_code"),
+        }
+        for device in item.get("compute_devices") or []
+        if isinstance(device, dict) and device.get("id")
+    ]
+
+
+def _normalized_audio_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
     tts = payload.get("tts") or {}
     models: list[dict[str, Any]] = []
     for item in tts.get("model_capabilities") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
         models.append(
             {
                 "id": item.get("id"),
                 "name": item.get("name") or item.get("id"),
                 "installed": bool(item.get("installed", True)),
-                "devices": [
-                    {
-                        "id": device.get("id"),
-                        "available": bool(device.get("available")),
-                        "precision": device.get("precision"),
-                        "reason": device.get("unavailable_reason"),
-                        "reason_code": device.get("unavailable_reason_code"),
-                    }
-                    for device in item.get("compute_devices") or []
-                ],
+                "devices": _normalized_devices(item),
                 "voice_modes": item.get("voice_modes") or [],
                 "controls": item.get("controls") or {},
             }
@@ -123,6 +131,31 @@ def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
     native = tts.get("preset_speaker_native_languages") or {}
     voices = [{"id": name, "native_language": native.get(name)} for name in tts.get("preset_speakers") or []]
     asr = payload.get("asr") or {}
+    asr_models = []
+    for item in asr.get("models") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        asr_models.append(
+            {
+                "id": item.get("id"),
+                "name": item.get("name") or item.get("id"),
+                "installed": bool(item.get("installed", item.get("installation_state") == "installed")),
+                "default": bool(item.get("default")),
+                "devices": _normalized_devices(item),
+            }
+        )
+    default_model = str(asr.get("default_model") or "")
+    preferred = next((item for item in asr_models if item["id"] == default_model and item["installed"]), None)
+    preferred = preferred or next((item for item in asr_models if item["default"] and item["installed"]), None)
+    preferred = preferred or next((item for item in asr_models if item["installed"]), None)
+    asr_recommended = None
+    if preferred:
+        available_devices = [device for device in preferred["devices"] if device["available"]]
+        selected_device = next((device for device in available_devices if device["default"]), None)
+        selected_device = selected_device or next((device for device in available_devices if device["id"] == "gpu"), None)
+        selected_device = selected_device or next((device for device in available_devices if device["id"] == "cpu"), None)
+        selected_device = selected_device or (available_devices[0] if available_devices else None)
+        asr_recommended = {"model": preferred["id"], "compute_device": selected_device["id"] if selected_device else None}
     return {
         "models": models,
         "voices": voices,
@@ -131,13 +164,224 @@ def _normalized_tts_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         "async": True,
         "discovery": True,
         "asr": {
-            "default_model": asr.get("default_model"),
-            "models": asr.get("models") or [],
+            "default_model": default_model or None,
+            "models": asr_models,
+            "recommended": asr_recommended,
             "diarization": asr.get("diarization"),
+            "speaker_count": asr.get("speaker_count") or {},
             "languages": asr.get("languages") or [],
+            "default_language": asr.get("default_language"),
             "timestamp_precisions": asr.get("timestamp_precisions") or [],
+            "aligner_languages": asr.get("aligner_languages") or [],
+            "single_task_acceleration": asr.get("single_task_acceleration") or {},
         } if asr else {},
     }
+
+
+async def _voiceprint_library(provider: dict[str, Any], models: list[dict[str, Any]]) -> dict[str, Any]:
+    if not any("voiceprint" in set(item.get("voice_modes") or []) for item in models):
+        return {"status": "unsupported", "people": [], "message": "当前 TTS 模型不支持声纹克隆"}
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            response = await client.get(
+                f"{provider['base_url'].rstrip('/')}/api/v1/voiceprints/people",
+                headers=_headers(provider),
+            )
+        if response.status_code in {404, 405, 501}:
+            return {"status": "unsupported", "people": [], "message": "AUDIO Provider 未提供声纹库接口"}
+        if not response.is_success:
+            return {
+                "status": "unavailable",
+                "people": [],
+                "message": f"声纹库读取失败（HTTP {response.status_code}）",
+            }
+        if len(response.content) > MAX_CATALOG_BYTES:
+            return {"status": "unavailable", "people": [], "message": "声纹库清单过大"}
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return {"status": "unavailable", "people": [], "message": "声纹库暂时无法读取"}
+    source = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(source, list):
+        return {"status": "unavailable", "people": [], "message": "声纹库返回格式无法识别"}
+    people: list[dict[str, Any]] = []
+    for person in source:
+        if not isinstance(person, dict) or not person.get("id") or not person.get("name"):
+            continue
+        eligible = [
+            sample for sample in person.get("samples") or []
+            if isinstance(sample, dict) and sample.get("id") and sample.get("tts_eligible")
+        ]
+        latest = max(
+            eligible,
+            key=lambda sample: (str(sample.get("created_at") or ""), str(sample.get("id") or "")),
+            default=None,
+        )
+        item: dict[str, Any] = {
+            "id": str(person["id"]),
+            "name": str(person["name"]),
+            "note": str(person.get("note") or "") or None,
+            "eligible_sample_count": len(eligible),
+        }
+        if latest:
+            item["latest_sample"] = {
+                "id": str(latest["id"]),
+                "language": str(latest.get("language") or "Auto"),
+                "duration": latest.get("duration"),
+                "created_at": latest.get("created_at"),
+            }
+        people.append(item)
+    return {"status": "ready", "people": people, "message": None}
+
+
+def host_voice_selection(
+    config: dict[str, Any], host: str, language: str, *, preset_override: str | None = None,
+) -> dict[str, Any]:
+    mode = str(config.get(f"{host}_voice_mode") or "preset")
+    if mode == "voiceprint":
+        person_id = str(config.get(f"{host}_voiceprint_person_id") or "").strip()
+        sample_id = str(config.get(f"{host}_voiceprint_sample_id") or "").strip()
+        if not person_id or not sample_id:
+            raise ProviderError(f"{host.upper()} 尚未选择可用的声纹人员")
+        return {"mode": "voiceprint", "person_id": person_id, "sample_id": sample_id, "label": person_id}
+    defaults = {"host_a": ("Vivian", "Ryan"), "host_b": ("Dylan", "Aiden")}
+    chinese, english = defaults[host]
+    field = f"{host}_en" if language == "en" else host
+    speaker = str(preset_override or config.get(field) or (english if language == "en" else chinese)).strip()
+    if not speaker:
+        raise ProviderError(f"{host.upper()} 尚未选择预置音色")
+    return {"mode": "preset", "speaker": speaker, "label": speaker}
+
+
+def host_voice_instruction(
+    config: dict[str, Any], host: str, language: str, *, supported: bool,
+) -> str | None:
+    if not supported or config.get(f"{host}_voice_mode", "preset") != "preset":
+        return None
+    base = str(config.get(f"{host}_instruct") or "").strip()
+    if language == "en":
+        guardrail = (
+            "Keep the same restrained knowledge-podcast voice throughout the episode: use an even medium pace, "
+            "stable volume and pitch, and only a slight natural rise for questions. Do not become excited, angry, "
+            "shout, rush, or make abrupt changes in intensity."
+        )
+    else:
+        guardrail = (
+            "整集保持同一位知识播客主持人的克制表达基线：使用均匀的中等语速、稳定的音量和音高，"
+            "疑问句只做轻微自然上扬；不要突然兴奋、愤怒、喊叫、加速或大幅改变强弱。"
+        )
+    return f"{base} {guardrail}".strip()
+
+
+def _resolve_audio_voice_config(
+    provider: dict[str, Any], capabilities: dict[str, Any], voiceprint_library: dict[str, Any],
+) -> str | None:
+    config = provider.setdefault("config", {})
+    config.setdefault("host_a_voice_mode", "preset")
+    config.setdefault("host_b_voice_mode", "preset")
+    config.setdefault("host_a", "Vivian")
+    config.setdefault("host_b", "Dylan")
+    config.setdefault("host_a_en", "Ryan")
+    config.setdefault("host_b_en", "Aiden")
+    selected = next(
+        (item for item in capabilities.get("models") or [] if item.get("id") == provider.get("model")),
+        None,
+    )
+    if selected:
+        supported_modes = set(selected.get("voice_modes") or ["preset"])
+        for host in ("host_a", "host_b"):
+            mode = str(config.get(f"{host}_voice_mode") or "preset")
+            if mode not in supported_modes:
+                return f"所选 TTS 模型不支持 {mode} 音色模式"
+    people = {item.get("id"): item for item in voiceprint_library.get("people") or []}
+    for host in ("host_a", "host_b"):
+        if config.get(f"{host}_voice_mode") != "voiceprint":
+            continue
+        if voiceprint_library.get("status") != "ready":
+            return voiceprint_library.get("message") or "声纹库不可用"
+        person_id = str(config.get(f"{host}_voiceprint_person_id") or "").strip()
+        person = people.get(person_id)
+        if not person:
+            return f"{host.upper()} 选择的声纹人员不存在"
+        latest = person.get("latest_sample") or {}
+        if not latest.get("id"):
+            return f"{host.upper()} 选择的声纹人员没有可用于 TTS 的样本"
+        config[f"{host}_voiceprint_sample_id"] = latest["id"]
+    try:
+        a = host_voice_selection(config, "host_a", "zh-CN")
+        b = host_voice_selection(config, "host_b", "zh-CN")
+    except ProviderError as exc:
+        return str(exc)
+    if a["mode"] == b["mode"] == "preset" and a["speaker"] == b["speaker"]:
+        return "Host A 与 Host B 不能使用同一个预置音色"
+    if a["mode"] == b["mode"] == "voiceprint" and a["person_id"] == b["person_id"]:
+        return "Host A 与 Host B 不能使用同一个声纹人员"
+    return None
+
+
+def _asr_execution(provider: dict[str, Any]) -> tuple[str, str, bool]:
+    config = provider.get("config") or {}
+    asr = (provider.get("capabilities") or {}).get("asr") or {}
+    recommended = asr.get("recommended") or {}
+    auto_select = bool(config.get("asr_auto_select", True))
+    model = str((recommended.get("model") if auto_select else config.get("asr_model")) or config.get("asr_model") or asr.get("default_model") or "qwen3-asr-0.6b")
+    device = str((recommended.get("compute_device") if auto_select else config.get("asr_compute_device")) or config.get("asr_compute_device") or "gpu")
+    return model, device, bool(config.get("asr_allow_device_fallback", True))
+
+
+def audio_provider_readiness(provider: dict[str, Any] | None) -> tuple[bool, str]:
+    if not provider:
+        return False, "请先配置并启用 AUDIO Provider"
+    if provider.get("role") != "audio" or provider.get("kind") not in {"sandevistan_audio", "sandevistan_tts"}:
+        return False, "当前 Provider 不同时提供 Podcast 所需的 TTS 与 ASR"
+    capabilities = provider.get("capabilities") or {}
+    tts_model = str(provider.get("model") or "")
+    tts_selected = next((item for item in capabilities.get("models") or [] if item.get("id") == tts_model), None)
+    if not tts_selected or tts_selected.get("installed") is False:
+        return False, "AUDIO Provider 没有可用的 TTS 模型"
+    config = provider.get("config") or {}
+    supported_modes = set(tts_selected.get("voice_modes") or ["preset"])
+    for host in ("host_a", "host_b"):
+        mode = str(config.get(f"{host}_voice_mode") or "preset")
+        if mode not in supported_modes:
+            return False, f"所选 TTS 模型不支持 {mode} 音色模式"
+        if mode == "voiceprint" and (
+            not str(config.get(f"{host}_voiceprint_person_id") or "").strip()
+            or not str(config.get(f"{host}_voiceprint_sample_id") or "").strip()
+        ):
+            return False, f"{host.upper()} 尚未锁定可用的声纹样本"
+    if (
+        config.get("host_a_voice_mode", "preset") == config.get("host_b_voice_mode", "preset") == "preset"
+        and str(config.get("host_a") or "Vivian") == str(config.get("host_b") or "Dylan")
+    ):
+        return False, "Host A 与 Host B 不能使用同一个预置音色"
+    if (
+        config.get("host_a_voice_mode") == config.get("host_b_voice_mode") == "voiceprint"
+        and str(config.get("host_a_voiceprint_person_id") or "")
+        == str(config.get("host_b_voiceprint_person_id") or "")
+    ):
+        return False, "Host A 与 Host B 不能使用同一个声纹人员"
+    tts_device = str((provider.get("config") or {}).get("compute_device") or "")
+    if tts_selected.get("devices") and not any(
+        item.get("id") == tts_device and item.get("available") for item in tts_selected.get("devices") or []
+    ):
+        return False, "所选 TTS 设备不可用"
+    asr = capabilities.get("asr") or {}
+    models = asr.get("models") or []
+    model, device, _ = _asr_execution(provider)
+    selected = next((item for item in models if item.get("id") == model), None)
+    if not selected or not selected.get("installed"):
+        return False, "AUDIO Provider 没有可用的 ASR 模型"
+    if not any(item.get("id") == device and item.get("available") for item in selected.get("devices") or []):
+        return False, "所选 ASR 设备不可用"
+    if not asr.get("diarization"):
+        return False, "ASR Provider 未声明说话人分离能力"
+    if "segment" not in set(asr.get("timestamp_precisions") or []):
+        return False, "ASR Provider 未声明分段时间戳能力"
+    languages = set(asr.get("languages") or [])
+    aligners = set(asr.get("aligner_languages") or [])
+    if not {"Chinese", "English"}.issubset(languages) or not {"Chinese", "English"}.issubset(aligners):
+        return False, "ASR Provider 必须支持中英文识别与时间对齐"
+    return True, "AUDIO Provider 已就绪"
 
 
 CONTEXT_LIMIT_FIELDS = ("context_window_tokens", "context_window", "context_length", "max_context_length", "max_model_len")
@@ -350,7 +594,7 @@ async def _provider_catalog(provider: dict[str, Any]) -> tuple[bool, list[dict[s
     async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
         if provider["kind"] == "ollama":
             response = await client.get(f"{base_url}/api/tags", headers=headers)
-        elif provider["kind"] == "sandevistan_tts":
+        elif provider["kind"] in {"sandevistan_audio", "sandevistan_tts"}:
             response = await client.get(f"{base_url}/api/v1/capabilities", headers=headers)
         else:
             response = await client.get(f"{base_url}/v1/models", headers=headers)
@@ -362,8 +606,8 @@ async def _provider_catalog(provider: dict[str, Any]) -> tuple[bool, list[dict[s
         payload = response.json()
     if not isinstance(payload, dict):
         raise ProviderError("Provider 返回了无法识别的能力清单")
-    if provider["kind"] == "sandevistan_tts":
-        normalized = _normalized_tts_capabilities(payload)
+    if provider["kind"] in {"sandevistan_audio", "sandevistan_tts"}:
+        normalized = _normalized_audio_capabilities(payload)
         models = normalized.pop("models")
         recommended = normalized.pop("recommended")
         return True, models, normalized, recommended
@@ -392,31 +636,53 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
         raise ProviderError("请先选择或填写模型")
     headers = _headers(provider)
     role, kind = provider["role"], provider["kind"]
-    if role == "tts" and kind == "sandevistan_tts":
+    if role == "audio" and kind in {"sandevistan_audio", "sandevistan_tts"}:
         config = provider.get("config") or {}
         device = str(config.get("compute_device") or "cpu")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-            output = Path(handle.name)
+        outputs: list[Path] = []
         try:
-            await _synthesize_sandevistan(
+            for host, text in (("host_a", "主持人甲连接测试"), ("host_b", "主持人乙连接测试")):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                    output = Path(handle.name)
+                outputs.append(output)
+                selection = host_voice_selection(config, host, "zh-CN")
+                await _synthesize_sandevistan(
+                    provider,
+                    text,
+                    selection.get("speaker"),
+                    output,
+                    language="Chinese",
+                    model=model,
+                    compute_device=device,
+                    voice_mode=selection["mode"],
+                    voiceprint_sample_id=selection.get("sample_id"),
+                    instruct=None,
+                    idempotency_key=f"provider-test-{uuid.uuid4()}",
+                    cancel_check=None,
+                )
+                if not output.exists() or output.stat().st_size == 0:
+                    raise ProviderError(f"{host.upper()} TTS Provider 未返回音频")
+            result = await _transcribe_with_provider(
                 provider,
-                "连接测试",
-                str(config.get("host_a") or "Vivian"),
-                output,
+                outputs[0],
                 language="Chinese",
-                model=model,
-                compute_device=device,
-                instruct=None,
-                idempotency_key=f"provider-test-{uuid.uuid4()}",
+                idempotency_key=f"provider-asr-test-{uuid.uuid4()}",
                 cancel_check=None,
             )
-            if not output.exists() or output.stat().st_size == 0:
-                raise ProviderError("TTS Provider 未返回音频")
+            segments = [item for item in result.get("segments") or [] if isinstance(item, dict)]
+            if not segments or not all(
+                item.get("start") is not None
+                and item.get("end") is not None
+                and (item.get("speaker") or item.get("speaker_label"))
+                for item in segments
+            ):
+                raise ProviderError("ASR Provider 未返回带时间戳和说话人标签的转写")
         finally:
-            output.unlink(missing_ok=True)
+            for output in outputs:
+                output.unlink(missing_ok=True)
         return
     async with httpx.AsyncClient(timeout=180, follow_redirects=False) as client:
-        if role == "tts":
+        if role == "tts_only":
             voice = str((provider.get("config") or {}).get("host_a") or "").strip()
             if not voice:
                 raise ProviderError("OpenAI TTS 需要配置 Host A 音色")
@@ -497,9 +763,12 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
     except httpx.HTTPError:
         return _inspection_error(started=started, code="network_error", stage="connection", message="Provider 连接失败", hint="检查 TLS、代理与服务日志")
 
+    voiceprint_library: dict[str, Any] | None = None
+    if provider["role"] == "audio" and provider["kind"] in {"sandevistan_audio", "sandevistan_tts"}:
+        voiceprint_library = await _voiceprint_library(provider, models)
     model = str(provider.get("model") or "").strip()
     model_ids = {str(item.get("id") or "") for item in models}
-    if provider["kind"] == "sandevistan_tts" and provider["config"].get("auto_select") and recommended:
+    if provider["kind"] in {"sandevistan_audio", "sandevistan_tts"} and provider["config"].get("auto_select") and recommended:
         model = str(recommended.get("model") or model)
         provider["model"] = model
         provider["config"]["compute_device"] = recommended.get("compute_device")
@@ -515,6 +784,8 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
     def verification_error(**kwargs: Any) -> dict[str, Any]:
         failure = _inspection_error(started=started, connection_ok=True, stage="verification", **kwargs)
         failure.update({"catalog_supported": supported, "models": models, "capabilities": capabilities, "recommended": recommended})
+        if voiceprint_library is not None:
+            failure["voiceprint_library"] = voiceprint_library
         return failure
     if provider["role"] in {"main", "vlm"} and model:
         try:
@@ -526,11 +797,31 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         if token_limits.get("context_source") == "fallback":
             context_warning = "Provider 未报告上下文窗口，当前按 4K 安全预算运行；可在模型设置中人工覆盖"
             warning = f"{warning}；{context_warning}" if warning else context_warning
+    if provider["role"] == "audio":
+        provider["capabilities"] = {**capabilities, "models": models}
+        asr_recommended = (capabilities.get("asr") or {}).get("recommended") or {}
+        if provider["config"].get("asr_auto_select", True) and asr_recommended.get("model"):
+            provider["config"]["asr_model"] = asr_recommended["model"]
+            provider["config"]["asr_compute_device"] = asr_recommended.get("compute_device")
+        voice_error = _resolve_audio_voice_config(
+            provider,
+            provider["capabilities"],
+            voiceprint_library or {"status": "unsupported", "people": []},
+        )
+        if voice_error:
+            eligible = False
+            warning = voice_error
+        else:
+            audio_ready, audio_message = audio_provider_readiness(provider)
+            if not audio_ready:
+                eligible = False
+                warning = audio_message
     if provider["kind"] == "openai_tts":
         config = provider["config"]
         if not str(config.get("host_a") or "").strip() or not str(config.get("host_b") or "").strip():
-            eligible = False
-            warning = "OpenAI TTS 启用前需要配置两位主持人的音色"
+            warning = "OpenAI TTS 旧配置缺少两位主持人的音色"
+        eligible = False
+        warning = f"{warning}；仅提供 TTS，不能用于 Podcast" if warning else "仅提供 TTS，不能用于 Podcast"
     if mode == "deep":
         try:
             await _deep_verify(provider)
@@ -543,8 +834,12 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
             return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、温度、音色、设备及 Provider 日志", upstream_status=exc.status)
         except httpx.HTTPError as exc:
             return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、音色、设备及 Provider 日志")
-        eligible, warning = True, context_warning
-    return {
+        if provider["role"] in {"main", "vlm"}:
+            eligible = True
+            warning = context_warning
+        elif eligible:
+            warning = context_warning
+    result = {
         "status": "warning" if warning else "passed" if eligible else "warning",
         "connection_ok": True,
         "activation_eligible": eligible,
@@ -556,10 +851,23 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         "warning": warning,
         "error": None,
     }
+    if voiceprint_library is not None:
+        result["voiceprint_library"] = voiceprint_library
+        result["resolved_audio_config"] = {
+            key: value for key, value in provider["config"].items()
+            if key.startswith("host_")
+        }
+    return result
 
 
 def active_provider(role: str) -> dict[str, Any] | None:
-    row = DB.fetchone("SELECT * FROM provider_profiles WHERE role=? AND active=1 ORDER BY updated_at DESC LIMIT 1", (role,))
+    setting = DB.fetchone("SELECT enabled FROM provider_role_settings WHERE role=?", (role,))
+    if setting and not setting["enabled"]:
+        return None
+    row = DB.fetchone(
+        "SELECT * FROM provider_profiles WHERE role=? AND COALESCE(selected,active)=1 ORDER BY updated_at DESC LIMIT 1",
+        (role,),
+    )
     if not row:
         return None
     row["capabilities"] = json_load(row.pop("capabilities_json"), {})
@@ -734,8 +1042,9 @@ async def budgeted_chat(
     temperature: float = 0.15,
     trace: ContextUsage | None = None,
     stage: str = "generation",
+    provider_override: dict[str, Any] | None = None,
 ) -> BudgetedCompletion:
-    provider = _chat_provider(role)
+    provider = provider_override or _chat_provider(role)
     limits = TokenLimits.from_provider(provider)
     last_error: ContextOverflowError | None = None
     for attempt, scale in enumerate(RETRY_SCALES, start=1):
@@ -803,8 +1112,8 @@ async def budgeted_chat(
     raise last_error or ContextOverflowError("Provider 上下文窗口不足", code="context_window_exceeded", status=422)
 
 
-async def describe_image(path: Path, nearby_text: str) -> str:
-    provider = active_provider("vlm") or active_provider("main")
+async def describe_image(path: Path, nearby_text: str, provider: dict[str, Any] | None = None) -> str:
+    provider = provider or active_provider("vlm") or active_provider("main")
     if not provider or not provider.get("capabilities", {}).get("vision"):
         return ""
     encoded = base64.b64encode(path.read_bytes()).decode()
@@ -820,10 +1129,14 @@ async def describe_image(path: Path, nearby_text: str) -> str:
             messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}]}]
         return PromptBuild(messages, 1, 1, int(clipped))
 
-    return (await budgeted_chat(build, role="vlm", max_tokens=700, minimum_output_tokens=128)).content
+    return (await budgeted_chat(build, role=provider["role"], max_tokens=700, minimum_output_tokens=128, provider_override=provider)).content
 
 
 async def health(role: str, provider_id: str | None = None) -> dict[str, Any]:
+    if provider_id is None:
+        setting = DB.fetchone("SELECT enabled FROM provider_role_settings WHERE role=?", (role,))
+        if setting and not setting["enabled"]:
+            return {"ok": False, "status": "disabled", "message": "已暂停"}
     provider = provider_by_id(provider_id) if provider_id else active_provider(role)
     if not provider:
         return {"ok": False, "message": "未配置"}
@@ -875,19 +1188,20 @@ def _quality_score(model: dict[str, Any]) -> tuple[float, int, str]:
     return parameters, int(bool(controls.get("instruction_voice_modes"))), str(model.get("id", ""))
 
 
-async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) -> dict[str, Any]:
-    """Read live TTS capabilities and optionally apply the highest-quality safe default."""
+async def probe_audio_provider(provider_id: str, *, apply_defaults: bool = False) -> dict[str, Any]:
+    """Read live TTS/ASR capabilities and optionally apply safe execution defaults."""
     provider = provider_by_id(provider_id)
     if not provider:
-        raise ProviderError("TTS provider does not exist")
-    if provider["kind"] != "sandevistan_tts":
+        raise ProviderError("AUDIO provider does not exist")
+    if provider["kind"] not in {"sandevistan_audio", "sandevistan_tts"}:
         return {"ok": True, "kind": provider["kind"], "discovery": False, "models": [], "voices": [], "recommended": None}
     headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(f"{provider['base_url'].rstrip('/')}/api/v1/capabilities", headers=headers)
         response.raise_for_status()
-    normalized = _normalized_tts_capabilities(response.json())
+    normalized = _normalized_audio_capabilities(response.json())
     recommended = normalized.get("recommended")
+    asr_recommended = (normalized.get("asr") or {}).get("recommended") or {}
     config = dict(provider.get("config") or {})
     legacy_default = (
         provider.get("model") == "qwen3-tts-0.6b"
@@ -898,6 +1212,8 @@ async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) 
     )
     auto_select = bool(config.get("auto_select", legacy_default or not provider.get("model")))
     if apply_defaults:
+        config.setdefault("host_a_voice_mode", "preset")
+        config.setdefault("host_b_voice_mode", "preset")
         config.setdefault("host_a", "Vivian")
         config.setdefault("host_b", "Dylan")
         config.setdefault("host_a_en", "Ryan")
@@ -905,12 +1221,17 @@ async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) 
         config.setdefault("host_a_instruct", "自然、沉稳、有叙事感的知识播客主持人口吻，语速适中。")
         config.setdefault("host_b_instruct", "敏锐、亲切、善于追问和澄清的知识播客主持人口吻，语速适中。")
         config.setdefault("allow_device_fallback", True)
+        config.setdefault("asr_auto_select", True)
+        config.setdefault("asr_allow_device_fallback", True)
         config.setdefault("cleanup_remote_jobs", True)
         config["auto_select"] = auto_select
         model = provider.get("model") or ""
         if auto_select and recommended:
             model = recommended["model"]
             config["compute_device"] = recommended["compute_device"]
+        if config["asr_auto_select"] and asr_recommended.get("model"):
+            config["asr_model"] = asr_recommended["model"]
+            config["asr_compute_device"] = asr_recommended.get("compute_device")
         DB.execute(
             "UPDATE provider_profiles SET model=?,capabilities_json=?,config_json=?,updated_at=? WHERE id=?",
             (model, json_dump(normalized), json_dump(config), utc_now(), provider_id),
@@ -918,15 +1239,22 @@ async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) 
     return {"ok": True, **normalized, "auto_select": auto_select}
 
 
+async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) -> dict[str, Any]:
+    """Deprecated compatibility alias for callers that still use the old name."""
+    return await probe_audio_provider(provider_id, apply_defaults=apply_defaults)
+
+
 async def _synthesize_sandevistan(
     provider: dict[str, Any],
     text: str,
-    voice: str,
+    voice: str | None,
     output: Path,
     *,
     language: str,
     model: str,
     compute_device: str,
+    voice_mode: str,
+    voiceprint_sample_id: str | None,
     instruct: str | None,
     idempotency_key: str,
     cancel_check: Callable[[], bool] | None,
@@ -936,14 +1264,21 @@ async def _synthesize_sandevistan(
     headers["Idempotency-Key"] = idempotency_key
     data = {
         "text": text,
-        "speaker": voice,
         "model": model,
         "language": language,
-        "voice_mode": "preset",
+        "voice_mode": voice_mode,
         "response_format": "wav",
         "compute_device": compute_device,
     }
-    if instruct:
+    if voice_mode == "voiceprint":
+        if not voiceprint_sample_id:
+            raise ProviderError("声纹克隆缺少可用样本，请刷新 AUDIO Provider 配置")
+        data["voiceprint_sample_id"] = voiceprint_sample_id
+    elif voice:
+        data["speaker"] = voice
+    else:
+        raise ProviderError("预置音色不能为空")
+    if instruct and voice_mode == "preset":
         data["instruct"] = instruct
     async with httpx.AsyncClient(timeout=300) as client:
         response = await client.post(f"{provider['base_url'].rstrip('/')}/api/v1/tts/jobs", data=data, headers=headers)
@@ -1004,35 +1339,25 @@ async def _synthesize_sandevistan(
 
 async def synthesize(
     text: str,
-    voice: str,
+    voice: str | None,
     output: Path,
     *,
     language: str = "Chinese",
     cancel_check: Callable[[], bool] | None = None,
     model: str | None = None,
     compute_device: str | None = None,
+    voice_mode: str = "preset",
+    voiceprint_sample_id: str | None = None,
     instruct: str | None = None,
     idempotency_key: str | None = None,
     execution: dict[str, Any] | None = None,
 ) -> Path:
-    provider = active_provider("tts")
+    provider = active_provider("audio")
     if not provider:
-        raise ProviderError("TTS provider is not configured")
+        raise ProviderError("AUDIO provider is not configured")
     output.parent.mkdir(parents=True, exist_ok=True)
     headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
-    if provider["kind"] == "openai_tts":
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(
-                f"{provider['base_url'].rstrip('/')}/v1/audio/speech",
-                json={"model": model or provider["model"], "voice": voice, "input": text, "response_format": "wav"},
-                headers=headers,
-            )
-            response.raise_for_status()
-            output.write_bytes(response.content)
-            if execution is not None:
-                execution.update({"compute_device": "remote", "fallback_used": False})
-            return output
-    if provider["kind"] == "sandevistan_tts":
+    if provider["kind"] in {"sandevistan_audio", "sandevistan_tts"}:
         config = provider.get("config", {})
         selected_model = model or provider["model"]
         selected_device = compute_device or config.get("compute_device", "gpu")
@@ -1046,6 +1371,8 @@ async def synthesize(
                 language=language,
                 model=selected_model,
                 compute_device=selected_device,
+                voice_mode=voice_mode,
+                voiceprint_sample_id=voiceprint_sample_id,
                 instruct=instruct,
                 idempotency_key=key,
                 cancel_check=cancel_check,
@@ -1064,6 +1391,8 @@ async def synthesize(
                 language=language,
                 model=selected_model,
                 compute_device="cpu",
+                voice_mode=voice_mode,
+                voiceprint_sample_id=voiceprint_sample_id,
                 instruct=instruct,
                 idempotency_key=(key + "-cpu")[:128],
                 cancel_check=cancel_check,
@@ -1087,6 +1416,7 @@ async def _transcribe_sandevistan_once(
     path: Path,
     *,
     language: str,
+    model: str,
     compute_device: str,
     idempotency_key: str,
     cancel_check: Callable[[], bool] | None,
@@ -1094,7 +1424,7 @@ async def _transcribe_sandevistan_once(
     headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
     headers["Idempotency-Key"] = idempotency_key
     data = {
-        "model": "qwen3-asr-0.6b",
+        "model": model,
         "language": language,
         "speaker_count": "2",
         "diarize": "true",
@@ -1158,6 +1488,38 @@ async def _transcribe_sandevistan_once(
                     pass
 
 
+async def _transcribe_with_provider(
+    provider: dict[str, Any],
+    path: Path,
+    *,
+    language: str,
+    cancel_check: Callable[[], bool] | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    model, device, allow_fallback = _asr_execution(provider)
+    key = idempotency_key or str(uuid.uuid4())
+    try:
+        result = await _transcribe_sandevistan_once(
+            provider, path, language=language, model=model, compute_device=device, idempotency_key=key,
+            cancel_check=cancel_check,
+        )
+        return {**result, "model": result.get("model") or model, "compute_device": device, "fallback_used": False}
+    except Exception as exc:
+        if device != "gpu" or not allow_fallback or not _device_failure(exc):
+            raise
+        result = await _transcribe_sandevistan_once(
+            provider, path, language=language, model=model, compute_device="cpu", idempotency_key=(key + "-cpu")[:128],
+            cancel_check=cancel_check,
+        )
+        return {
+            **result,
+            "model": result.get("model") or model,
+            "compute_device": "cpu",
+            "fallback_used": True,
+            "fallback_reason": str(exc)[:300],
+        }
+
+
 async def transcribe_audio(
     path: Path,
     *,
@@ -1165,28 +1527,15 @@ async def transcribe_audio(
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Transcribe with the co-located ASR service and a single GPU-to-CPU fallback."""
-    provider = active_provider("tts")
-    if not provider or provider.get("kind") != "sandevistan_tts":
-        raise ProviderError("当前 TTS provider 不提供本地 ASR", code="asr_unsupported")
-    key = idempotency_key or str(uuid.uuid4())
-    try:
-        result = await _transcribe_sandevistan_once(
-            provider, path, language=language, compute_device="gpu", idempotency_key=key,
-            cancel_check=cancel_check,
-        )
-        return {**result, "model": result.get("model") or "qwen3-asr-0.6b", "compute_device": "gpu", "fallback_used": False}
-    except Exception as exc:
-        if not _device_failure(exc):
-            raise
-        result = await _transcribe_sandevistan_once(
-            provider, path, language=language, compute_device="cpu", idempotency_key=(key + "-cpu")[:128],
-            cancel_check=cancel_check,
-        )
-        return {
-            **result,
-            "model": result.get("model") or "qwen3-asr-0.6b",
-            "compute_device": "cpu",
-            "fallback_used": True,
-            "fallback_reason": str(exc)[:300],
-        }
+    """Transcribe with the active AUDIO provider and its independent ASR settings."""
+    provider = active_provider("audio")
+    ready, message = audio_provider_readiness(provider)
+    if not ready or not provider:
+        raise ProviderError(message, code="asr_unsupported")
+    return await _transcribe_with_provider(
+        provider,
+        path,
+        language=language,
+        cancel_check=cancel_check,
+        idempotency_key=idempotency_key,
+    )

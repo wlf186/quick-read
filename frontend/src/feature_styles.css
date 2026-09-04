@@ -1,0 +1,25 @@
+.provider-role-grid{display:grid;gap:10px;margin:14px 0}
+.provider-role-card,.image-policy-card{position:relative;display:grid;gap:8px;border:1px solid #2e4142;background:#081012;padding:14px}
+.provider-role-card.enabled{border-left:3px solid var(--cyan)}
+.provider-role-card.disabled{border-left:3px solid #596466}
+.provider-role-card h3,.image-policy-card h3{margin:3px 0;color:#e1e9e6}
+.provider-role-card p,.image-policy-card p{margin:0;color:var(--muted);font-size:11px}
+.provider-role-card>button{justify-self:start;border:1px solid var(--line);background:#0b1517;color:#c7d1ce;padding:8px 11px;cursor:pointer}
+.role-required{position:absolute;right:14px;top:14px;color:var(--yellow);font-size:10px}
+.role-switch{display:flex!important;align-items:center;gap:7px;color:#b8c4c1;font-size:11px}
+.role-switch input{width:auto;min-height:0}
+.image-policy-card{margin:15px 0}
+.image-policy-order{display:flex;gap:7px;flex-wrap:wrap}
+.image-policy-order button{border:1px solid #3b4b4d;background:transparent;color:#788684;padding:7px 10px}
+.image-policy-order button.active{border-color:var(--cyan);color:var(--cyan);background:#0c2224}
+.image-policy-order>span{display:flex;align-items:center;border:1px solid var(--cyan);color:var(--cyan)}
+.image-policy-order>span b{padding:0 8px;font-size:11px}
+.image-policy-order>span button{min-width:28px;padding:6px;border-width:0 0 0 1px}
+.image-policy-order button:disabled{opacity:.35}
+.provider-role-view>span,.image-policy-card>span{color:var(--cyan);font-size:10px;letter-spacing:1px}
+.upload-confirm{width:min(520px,96vw)}
+.upload-processors{display:grid;gap:8px;margin:15px 0}
+.upload-processors label{display:grid;grid-template-columns:auto 70px 1fr;align-items:center;gap:10px;border:1px solid #2d4142;padding:10px}
+.upload-processors small{color:var(--muted)}
+.visual-citation-label{display:block;margin:10px 0;color:var(--yellow);font-size:11px}
+.citation-visual{display:block;width:100%;max-height:45vh;object-fit:contain;border:1px solid #31494a;background:#030708}

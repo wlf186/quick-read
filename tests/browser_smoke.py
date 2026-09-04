@@ -46,12 +46,27 @@ def main() -> None:
         browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
         context = browser.new_context(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         page = context.new_page()
+        api_requests: list[str] = []
+        page.on("request", lambda request: api_requests.append(request.url) if "/api/" in request.url else None)
         page.set_default_timeout(8000)
         page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
         authenticate(page)
         select_qa_notebook(page)
         page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
         page.wait_for_function("document.querySelectorAll('.artifact').length === 4")
+
+        page.wait_for_timeout(1000)
+        api_requests.clear()
+        if page.locator(".activity .job").count() == 0:
+            page.wait_for_timeout(6500)
+            assert api_requests == [], f"idle workspace still requested: {api_requests}"
+
+        page.locator(".upload-zone input").set_input_files({"name": "diagram.png", "mimeType": "image/png", "buffer": b"visual-preview"})
+        upload_dialog = page.get_by_role("dialog", name="确认上传")
+        upload_dialog.wait_for()
+        assert upload_dialog.get_by_text("VLM → MAIN → OCR", exact=False).is_visible()
+        page.screenshot(path="/tmp/sandevistan-read-upload-policy-desktop.png")
+        upload_dialog.get_by_role("button", name="关闭").click()
 
         assert page.title() == "Sandevistan-Read"
         assert page.get_by_role("heading", name="向资料提问").is_visible()
@@ -70,6 +85,8 @@ def main() -> None:
         settings = page.get_by_role("dialog", name="Provider 配置")
         assert settings.is_visible()
         assert settings.evaluate("element => element.contains(document.activeElement)")
+        assert settings.get_by_role("button", name="管理 MAIN").is_visible()
+        page.screenshot(path="/tmp/sandevistan-read-provider-roles-desktop.png")
 
         inspection_requests: list[dict] = []
 
@@ -77,6 +94,40 @@ def main() -> None:
             request = json.loads(route.request.post_data or "{}")
             inspection_requests.append(request)
             selected = request.get("model", "")
+            if request.get("role") == "audio":
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "status": "passed",
+                            "connection_ok": True,
+                            "activation_eligible": True,
+                            "latency_ms": 42,
+                            "catalog_supported": True,
+                            "models": [{"id": "voice-1.7b", "name": "Voice 1.7B", "installed": True, "voice_modes": ["preset", "voiceprint"], "controls": {"instruction_voice_modes": ["preset"]}, "devices": [{"id": "gpu", "available": True, "precision": "BF16"}]}],
+                            "capabilities": {
+                                "voices": [{"id": "Vivian", "native_language": "zh-CN"}, {"id": "Dylan", "native_language": "zh-CN"}],
+                                "asr": {
+                                    "models": [{"id": "qwen3-asr-0.6b", "name": "Qwen3 ASR 0.6B", "installed": True, "devices": [{"id": "gpu", "available": True, "precision": "BF16"}]}],
+                                    "recommended": {"model": "qwen3-asr-0.6b", "compute_device": "gpu"},
+                                },
+                            },
+                            "voiceprint_library": {
+                                "status": "ready",
+                                "people": [
+                                    {"id": "person-a", "name": "声纹甲", "eligible_sample_count": 1, "latest_sample": {"id": "sample-a", "language": "Chinese", "duration": 9.5, "created_at": "2026-09-01"}},
+                                    {"id": "person-b", "name": "声纹乙", "eligible_sample_count": 1, "latest_sample": {"id": "sample-b", "language": "Chinese", "duration": 18.0, "created_at": "2026-09-02"}},
+                                ],
+                            },
+                            "resolved_audio_config": {"host_a_voice_mode": "preset", "host_b_voice_mode": "preset", "host_a": "Vivian", "host_b": "Dylan"},
+                            "recommended": {"model": "voice-1.7b", "compute_device": "gpu"},
+                            "warning": None,
+                            "error": None,
+                        }
+                    ),
+                )
+                return
             models = [{"id": "alpha-chat", "name": "Alpha Chat"}, {"id": "beta-vision", "name": "Beta Vision"}]
             route.fulfill(
                 status=200,
@@ -106,11 +157,40 @@ def main() -> None:
             )
 
         page.route("**/api/providers/inspect", inspect_provider)
-        settings.get_by_role("button", name="添加 Provider").click()
+        assert settings.get_by_text("IMAGE PIPELINE", exact=True).is_visible()
+        settings.get_by_role("button", name="管理 AUDIO").click()
+        settings.get_by_role("button", name="添加 AUDIO Provider").click()
         assert settings.get_by_role("heading", name="添加 Provider").is_visible()
-        settings.get_by_label("角色").select_option("tts")
-        assert settings.get_by_label("类型").locator("option").count() == 2
-        settings.get_by_label("角色").select_option("main")
+        assert settings.get_by_label("角色").is_disabled()
+        assert settings.get_by_label("类型").locator("option").count() == 1
+        settings.get_by_label("名称").fill("QA Audio")
+        settings.get_by_label("服务地址").fill("http://localhost:20810")
+        settings.get_by_role("button", name="连接并读取模型").click()
+        settings.get_by_text(re.compile("1 个模型 · 42 ms")).wait_for()
+        assert settings.get_by_role("heading", name="TTS 合成").is_visible()
+        assert settings.get_by_role("heading", name="ASR 验收").is_visible()
+        assert "Voice 1.7B" in settings.get_by_role("combobox", name=re.compile("TTS 模型")).inner_text()
+        assert "Qwen3 ASR 0.6B" in settings.get_by_role("combobox", name=re.compile("ASR 模型")).inner_text()
+        assert settings.get_by_label("ASR 设备").input_value() == "gpu"
+        host_a_voice = settings.get_by_role("region", name="Host A 音色")
+        host_b_voice = settings.get_by_role("region", name="Host B 音色")
+        host_a_voice.get_by_role("button", name="声纹克隆").click()
+        host_a_voice.get_by_label("声纹人员").select_option("person-a")
+        host_b_voice.get_by_role("button", name="声纹克隆").click()
+        duplicate_person = host_b_voice.get_by_label("声纹人员").locator('option[value="person-a"]')
+        assert duplicate_person.get_attribute("disabled") is not None, duplicate_person.evaluate("element => element.outerHTML")
+        host_b_voice.get_by_label("声纹人员").select_option("person-b")
+        assert host_b_voice.get_by_text(re.compile("合成时截断")).is_visible()
+        settings.get_by_role("heading", name="ASR 验收").scroll_into_view_if_needed()
+        assert_no_horizontal_overflow(page)
+        page.screenshot(path="/tmp/sandevistan-read-audio-provider-desktop.png")
+        settings.get_by_role("button", name="返回角色配置").click()
+        discard = page.get_by_role("dialog", name="放弃未保存的 Provider 配置？")
+        assert discard.is_visible()
+        discard.get_by_role("button", name="放弃修改").click()
+        settings.get_by_role("button", name="返回角色概览").click()
+        settings.get_by_role("button", name="管理 MAIN").click()
+        settings.get_by_role("button", name="添加 MAIN Provider").click()
         settings.get_by_label("名称").fill("QA Provider")
         settings.get_by_label("服务地址").fill("https://api.example.com/v1")
         settings.get_by_role("button", name="连接并读取模型").click()
@@ -119,10 +199,16 @@ def main() -> None:
         model_picker = settings.get_by_role("combobox", name="模型")
         model_picker.click()
         settings.get_by_role("button", name=re.compile("Alpha Chat")).click()
-        settings.get_by_role("button", name="连接并读取模型").click()
-        settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
-        assert settings.get_by_text(re.compile("2 个模型 · 42 ms")).is_visible()
-        assert settings.get_by_text(re.compile("理论最大 32,768 · 运行 8,192 · 输出 2,048")).is_visible()
+        assert settings.get_by_text(re.compile("模型清单仍可用")).is_visible()
+        model_picker.click()
+        assert settings.get_by_role("button", name=re.compile("Alpha Chat")).is_visible()
+        assert settings.get_by_role("button", name=re.compile("Beta Vision")).is_visible()
+        settings.get_by_label("搜索模型").fill("beta")
+        assert settings.get_by_role("button", name=re.compile("Beta Vision")).is_visible()
+        assert settings.get_by_role("button", name=re.compile("Alpha Chat")).count() == 0
+        page.keyboard.press("Escape")
+        assert settings.get_by_label("搜索模型").count() == 0
+        assert page.get_by_role("dialog", name="放弃未保存的 Provider 配置？").count() == 0
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
         settings.get_by_label("Temperature 覆盖").fill("1")
         settings.get_by_label("上下文窗口覆盖（tokens）").fill("16384")
@@ -134,11 +220,11 @@ def main() -> None:
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
         assert_no_horizontal_overflow(page)
         page.screenshot(path="/tmp/sandevistan-read-provider-desktop.png")
-        settings.get_by_role("button", name=re.compile("返回 Provider 列表")).click()
+        settings.get_by_role("button", name="返回角色配置").click()
         discard = page.get_by_role("dialog", name="放弃未保存的 Provider 配置？")
         assert discard.is_visible()
         discard.get_by_role("button", name="放弃修改").click()
-        assert settings.get_by_role("button", name="添加 Provider").is_visible()
+        assert settings.get_by_role("button", name="添加 MAIN Provider").is_visible()
         page.keyboard.press("Escape")
         assert settings.count() == 0
 
@@ -162,9 +248,80 @@ def main() -> None:
         page.keyboard.press("Escape")
         assert podcast_create.count() == 0
 
+        audio_guard = {"mode": "missing"}
+        guarded_audio_provider = {
+            "id": "qa-audio",
+            "name": "QA Audio",
+            "role": "audio",
+            "kind": "sandevistan_audio",
+            "base_url": "http://localhost:20810",
+            "model": "voice-1.7b",
+            "active": 1,
+            "has_api_key": False,
+            "capabilities": {},
+            "config": {
+                "compute_device": "gpu",
+                "asr_model": "qwen3-asr-0.6b",
+                "asr_compute_device": "gpu",
+            },
+        }
+
+        def guarded_providers(route) -> None:
+            providers = [] if audio_guard["mode"] == "missing" else [guarded_audio_provider]
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(providers))
+
+        def guarded_status(route) -> None:
+            ready = audio_guard["mode"] == "ready"
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "providers": {
+                            "main": {"ok": True, "message": "QA Main"},
+                            "audio": {"ok": ready, "message": "所选 ASR 设备不可用"},
+                        }
+                    }
+                ),
+            )
+
+        guard_page = context.new_page()
+        guard_page.set_viewport_size({"width": 1440, "height": 900})
+        guard_page.route("**/api/providers", guarded_providers)
+        guard_page.route("**/api/status", guarded_status)
+        authenticate(guard_page)
+        select_qa_notebook(guard_page)
+        guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
+        guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人音频")
+        assert guarded_podcast.is_disabled()
+        assert guard_page.get_by_text("请先配置并启用 AUDIO Provider", exact=True).is_visible()
+        assert guard_page.locator(".studio-cards button").filter(has_text="Quiz 题库").is_enabled()
+        guard_page.get_by_role("button", name="配置 AUDIO Provider").click()
+        assert guard_page.get_by_role("dialog", name="Provider 配置").is_visible()
+        assert guard_page.get_by_role("dialog", name="生成双人深度播客").count() == 0
+        guard_page.screenshot(path="/tmp/sandevistan-read-podcast-disabled-desktop.png")
+        guard_page.keyboard.press("Escape")
+
+        audio_guard["mode"] = "unhealthy"
+        guard_page.reload(wait_until="domcontentloaded")
+        guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
+        guard_page.get_by_text("所选 ASR 设备不可用", exact=True).wait_for()
+        assert guard_page.locator(".studio-cards button").filter(has_text="双人音频").is_disabled()
+        guard_page.screenshot(path="/tmp/sandevistan-read-podcast-unhealthy-desktop.png")
+
+        audio_guard["mode"] = "ready"
+        guard_page.reload(wait_until="domcontentloaded")
+        guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
+        guard_page.wait_for_function(
+            "!Array.from(document.querySelectorAll('.studio-cards button')).find(button => button.textContent.includes('双人音频')).disabled"
+        )
+        guard_page.locator(".studio-cards button").filter(has_text="双人音频").click()
+        assert guard_page.get_by_role("dialog", name="生成双人深度播客").is_visible()
+        guard_page.close()
+
         page.locator(".artifact").filter(has_text="资料摘要").click()
         artifact_dialog = page.get_by_role("dialog", name="资料摘要")
-        assert artifact_dialog.is_visible()
+        artifact_dialog.wait_for()
         artifact_dialog.locator(".citation-index summary").click()
         artifact_dialog.locator(".citation").first.click()
         citation_dialog = page.get_by_role("dialog", name=re.compile(r"引用 S\d+"))
@@ -323,18 +480,29 @@ def main() -> None:
 
         tablet = context.new_page()
         tablet.set_viewport_size({"width": 900, "height": 900})
+        audio_guard["mode"] = "missing"
+        tablet.route("**/api/providers", guarded_providers)
+        tablet.route("**/api/status", guarded_status)
         tablet.goto(f"{BASE_URL}/#workspace", wait_until="domcontentloaded")
         tablet.locator(".notebook-menu").wait_for()
         assert tablet.locator(".notebook-menu").is_visible()
         assert not tablet.locator(".workspace > .studio").is_visible()
         tablet.locator(".tablet-studio-trigger").click()
-        assert tablet.get_by_role("dialog", name="Studio").is_visible()
-        assert tablet.get_by_role("dialog", name="Studio").locator(".studio-cards button").count() == 4
+        tablet_studio = tablet.get_by_role("dialog", name="Studio")
+        assert tablet_studio.is_visible()
+        assert tablet_studio.locator(".studio-cards button").count() == 4
+        assert tablet_studio.locator(".studio-cards button").filter(has_text="双人音频").is_disabled()
         assert_no_horizontal_overflow(tablet)
-        tablet.screenshot(path="/tmp/sandevistan-read-ui-tablet.png")
+        tablet.screenshot(path="/tmp/sandevistan-read-podcast-disabled-tablet.png")
+        tablet_studio.get_by_role("button", name="配置 AUDIO Provider").click()
+        assert tablet_studio.count() == 0
+        assert tablet.get_by_role("dialog", name="Provider 配置").is_visible()
+        tablet.keyboard.press("Escape")
 
         mobile = context.new_page()
         mobile.set_viewport_size({"width": 390, "height": 844})
+        mobile.route("**/api/providers", guarded_providers)
+        mobile.route("**/api/status", guarded_status)
         mobile.goto(f"{BASE_URL}/#workspace", wait_until="domcontentloaded")
         mobile.locator(".notebook-menu").wait_for()
         assert_no_horizontal_overflow(mobile)
@@ -343,12 +511,32 @@ def main() -> None:
         assert mobile.locator(".sources").is_visible()
         mobile.get_by_role("button", name="Studio", exact=True).click()
         assert mobile.locator(".workspace > .studio").is_visible()
-        mobile.screenshot(path="/tmp/sandevistan-read-ui-mobile.png")
+        assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人音频").is_disabled()
+        assert mobile.locator(".workspace > .studio").get_by_role("button", name="配置 AUDIO Provider").is_visible()
+        mobile.screenshot(path="/tmp/sandevistan-read-podcast-disabled-mobile.png")
 
+        mobile.route("**/api/providers/inspect", inspect_provider)
         mobile.get_by_role("button", name="设置").click()
         mobile_settings = mobile.get_by_role("dialog", name="Provider 配置")
-        mobile_settings.get_by_role("button", name="添加 Provider").click()
+        mobile.screenshot(path="/tmp/sandevistan-read-provider-roles-mobile.png")
+        mobile_settings.get_by_role("button", name="管理 AUDIO").click()
+        mobile_settings.get_by_role("button", name="添加 AUDIO Provider").click()
         assert mobile_settings.get_by_role("heading", name="添加 Provider").is_visible()
+        assert mobile_settings.get_by_label("角色").is_disabled()
+        mobile_settings.get_by_label("名称").fill("QA Audio Mobile")
+        mobile_settings.get_by_label("服务地址").fill("http://localhost:20810")
+        mobile_settings.get_by_role("button", name="连接并读取模型").click()
+        mobile_settings.get_by_role("heading", name="ASR 验收").wait_for()
+        mobile_settings.get_by_role("heading", name="ASR 验收").scroll_into_view_if_needed()
+        assert "Qwen3 ASR 0.6B" in mobile_settings.get_by_role("combobox", name=re.compile("ASR 模型")).inner_text()
+        assert_no_horizontal_overflow(mobile)
+        mobile.screenshot(path="/tmp/sandevistan-read-audio-provider-mobile.png")
+        mobile_settings.get_by_role("button", name="返回角色配置").click()
+        mobile_discard = mobile.get_by_role("dialog", name="放弃未保存的 Provider 配置？")
+        mobile_discard.get_by_role("button", name="放弃修改").click()
+        mobile_settings.get_by_role("button", name="返回角色概览").click()
+        mobile_settings.get_by_role("button", name="管理 MAIN").click()
+        mobile_settings.get_by_role("button", name="添加 MAIN Provider").click()
         mobile_temperature = mobile_settings.get_by_label("Temperature 覆盖")
         assert mobile_temperature.is_visible()
         mobile_temperature.scroll_into_view_if_needed()
@@ -356,7 +544,11 @@ def main() -> None:
         panel_metrics = mobile_settings.evaluate("element => ({scroll: element.scrollWidth, client: element.clientWidth})")
         assert panel_metrics["scroll"] <= panel_metrics["client"], panel_metrics
         mobile.screenshot(path="/tmp/sandevistan-read-provider-temperature-mobile.png")
+        mobile_temperature.fill("1")
         mobile.keyboard.press("Escape")
+        mobile_discard = mobile.get_by_role("dialog", name="放弃未保存的 Provider 配置？")
+        assert mobile_discard.is_visible()
+        mobile_discard.get_by_role("button", name="放弃修改").click()
         assert mobile_settings.count() == 0
 
         mobile.goto(f"{BASE_URL}/#jobs", wait_until="domcontentloaded")

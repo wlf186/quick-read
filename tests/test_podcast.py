@@ -57,6 +57,22 @@ def test_scene_validation_accepts_substantive_chinese_turn_below_spoken_cap() ->
     assert not any("长度不合格" in issue for issue in issues)
 
 
+def test_scene_validation_rejects_punctuation_that_drives_emotional_tts() -> None:
+    text = "这个结论确实值得继续讨论！"
+    accepted, issues = podcast.validate_scene_turns(
+        [{"speaker": "HOST_A", "text": text, "dialogue_act": "explain", "claim_ids": ["C1"]}],
+        {"C1": {"id": "C1", "text": text, "evidence_ids": ["E1"]}},
+        {"E1": {"id": "E1", "content": text}},
+        last_speaker=None,
+        existing_turns=[],
+        language="zh-CN",
+        expected_count=1,
+        scene_kind="act",
+    )
+    assert accepted == []
+    assert any("放大口播情绪" in issue for issue in issues)
+
+
 def test_duration_budget_and_audio_gate_are_language_aware() -> None:
     english = podcast._scene_duration_budget("en", 5, 18, 0)
     chinese = podcast._scene_duration_budget("zh-CN", 5, 18, 0)
@@ -828,6 +844,7 @@ async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, mo
     artifacts = tmp_path / "artifacts"
     monkeypatch.setattr(jobs, "PATHS", SimpleNamespace(job_work=work, artifacts=artifacts, root=tmp_path))
     monkeypatch.setattr(jobs, "active_provider", lambda role: {"name": "TTS", "model": "tts", "config": {}, "capabilities": {}})
+    monkeypatch.setattr(jobs, "audio_provider_readiness", lambda provider: (True, "ready"))
     monkeypatch.setattr(jobs, "register_resource", lambda *args: None)
     monkeypatch.setattr(jobs, "DB", SimpleNamespace(fetchone=lambda *args: {"cancel_requested": 0}, execute=lambda *args: None))
 

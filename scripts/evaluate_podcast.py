@@ -16,7 +16,7 @@ from sandevistan_read.config import CONFIG
 from sandevistan_read.jobs import _actual_duration_check, _run_ffmpeg
 from sandevistan_read.paths import PATHS
 from sandevistan_read.podcast import PodcastQualityError, _content_minutes, _repeated_stem_ratio, build_podcast_script
-from sandevistan_read.providers import active_provider, synthesize, transcribe_audio
+from sandevistan_read.providers import active_provider, host_voice_instruction, host_voice_selection, synthesize, transcribe_audio
 
 
 def transcript(payload: dict[str, Any]) -> str:
@@ -94,24 +94,27 @@ async def render_candidate(
     tts_model: str | None = None,
     tts_device: str | None = None,
 ) -> dict[str, Any]:
-    provider = active_provider("tts")
+    provider = active_provider("audio")
     if not provider:
-        raise RuntimeError("请先启用 TTS Provider")
+        raise RuntimeError("请先启用 AUDIO Provider")
     ffmpeg = CONFIG.tools.ffmpeg_path
     if not ffmpeg:
         raise RuntimeError("完整候选评测需要项目内 FFmpeg")
     config = provider.get("config") or {}
     language = str(candidate.get("language") or "zh-CN")
-    defaults = ("Ryan", "Aiden") if language == "en" else ("Vivian", "Dylan")
     voices = {
-        "HOST_A": config.get("host_a_en" if language == "en" else "host_a", defaults[0]),
-        "HOST_B": config.get("host_b_en" if language == "en" else "host_b", defaults[1]),
+        "HOST_A": host_voice_selection(config, "host_a", language),
+        "HOST_B": host_voice_selection(config, "host_b", language),
     }
     # tts_model/tts_device 只覆盖本次渲染；显式参数经 synthesize() 透传，不修改已保存的 provider
     model = str(tts_model or provider.get("model") or "")
     device = str(tts_device or config.get("compute_device") or "gpu")
     model_caps = next((item for item in (provider.get("capabilities") or {}).get("models", []) if item.get("id") == model), {})
     supports_instruction = "preset" in ((model_caps.get("controls") or {}).get("instruction_voice_modes") or [])
+    instructions = {
+        "HOST_A": host_voice_instruction(config, "host_a", language, supported=supports_instruction),
+        "HOST_B": host_voice_instruction(config, "host_b", language, supported=supports_instruction),
+    }
     parts_dir = output / "candidate-parts"
     normalized_dir = output / "candidate-normalized"
     parts_dir.mkdir(exist_ok=True)
@@ -119,26 +122,21 @@ async def render_candidate(
     turns = candidate.get("turns") or []
     execution: dict[str, Any] = {"requested_device": device, "compute_device": device, "fallback_used": False, "model": model}
 
-    def instruction(turn: dict[str, Any]) -> str | None:
-        if not supports_instruction:
-            return None
-        base = str(config.get("host_a_instruct" if turn["speaker"] == "HOST_A" else "host_b_instruct") or "").strip()
-        act = str(turn.get("dialogue_act") or "")
-        if language == "en":
-            cue = {"question": "Ask with genuine curiosity, without sounding theatrical.", "challenge": "Sound thoughtful and mildly skeptical.", "synthesis": "Slow slightly and land the conclusion clearly.", "bridge": "Keep this brief and conversational.", "acknowledgement": "Use a light, natural acknowledgement."}.get(act, "Use an engaged, natural knowledge-podcast cadence.")
-        else:
-            cue = {"question": "带着真实好奇追问，不要表演化。", "challenge": "语气克制、认真，带一点审慎质疑。", "synthesis": "略微放慢，把结论自然落稳。", "bridge": "简短自然地承接，不要播报腔。", "acknowledgement": "用轻微、自然的回应语气。"}.get(act, "使用投入、自然的知识播客节奏。")
-        return f"{base} {cue}".strip()
-
     async def synthesize_turn(index: int, retry: bool = False) -> None:
         turn = turns[index]
         part = parts_dir / f"{index:04d}.wav"
-        digest = hashlib.sha256(f"{model}|{device}|{voices[turn['speaker']]}|{turn['text']}".encode()).hexdigest()[:20]
+        selection = voices[turn["speaker"]]
+        instruction = instructions[turn["speaker"]]
+        digest = hashlib.sha256(json.dumps({
+            "model": model, "device": device, "voice": selection,
+            "instruction": instruction, "text": turn["text"],
+        }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
         turn_execution: dict[str, Any] = {}
         await synthesize(
-            turn["text"], voices[turn["speaker"]], part,
+            turn["text"], selection.get("speaker"), part,
             language="English" if language == "en" else "Chinese",
-            model=model, compute_device=device, instruct=instruction(turn),
+            model=model, compute_device=device, voice_mode=selection["mode"],
+            voiceprint_sample_id=selection.get("sample_id"), instruct=instruction,
             idempotency_key=f"sread-eval-{stamp[:20]}-{index:04d}-{digest}{'-r1' if retry else ''}",
             execution=turn_execution,
         )

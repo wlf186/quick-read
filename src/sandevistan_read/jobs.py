@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .config import CONFIG
 from .paths import PATHS
-from .providers import ProviderError, active_provider, study_generation_profile, synthesize, transcribe_audio
+from .providers import ProviderError, active_provider, audio_provider_readiness, host_voice_instruction, host_voice_selection, provider_by_id, study_generation_profile, synthesize, transcribe_audio
 from .audio_quality import assess_transcription, repair_turn_indexes
 from .podcast import PODCAST_DURATION_CALIBRATION_VERSION, PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script
 from .services import ingest_source, make_summary
@@ -23,12 +23,24 @@ from .context_budget import TokenLimits
 
 
 def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_id: str | None = None) -> dict[str, Any]:
+    payload = dict(payload)
     job_id, now = new_id("job"), utc_now()
     source_count = len(payload.get("source_ids") or []) or (1 if payload.get("source_id") else 0)
     workload = {"source_count": source_count, "count": payload.get("count"), "minutes": payload.get("minutes"), "bucket": "single" if source_count <= 1 else "small_multi" if source_count <= 4 else "large_multi"}
-    provider = active_provider("tts" if kind == "podcast" else "main") if kind != "ingest" else None
+    provider = active_provider("audio" if kind == "podcast" else "main") if kind != "ingest" else None
     context_provider = active_provider("main") if kind not in {"ingest"} else None
+    if kind == "podcast":
+        payload["provider_ids"] = {
+            "audio": provider.get("id") if provider else None,
+            "main": context_provider.get("id") if context_provider else None,
+        }
     profile = {"kind": provider.get("kind") if provider else "local", "model": provider.get("model") if provider else CONFIG.models.embedding, "device": (provider.get("config") or {}).get("compute_device") if provider else "local"}
+    if kind == "podcast" and provider:
+        audio_config = provider.get("config") or {}
+        profile["asr"] = {
+            "model": audio_config.get("asr_model"),
+            "device": audio_config.get("asr_compute_device"),
+        }
     if context_provider:
         limits = TokenLimits.from_provider(context_provider)
         profile["context"] = {
@@ -96,10 +108,12 @@ def _actual_duration_check(target_minutes: float, actual_seconds: float) -> dict
 
 
 async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
-    provider = active_provider("tts")
-    if not provider:
-        raise RuntimeError("请先配置并启用 TTS provider")
-    main_provider = active_provider("main")
+    snapshot = payload.get("provider_ids") or {}
+    provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
+    ready, readiness_message = audio_provider_readiness(provider)
+    if not ready or not provider:
+        raise RuntimeError(readiness_message)
+    main_provider = provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main")
     if not main_provider:
         raise RuntimeError("请先配置并启用 MAIN provider")
     config = provider.get("config", {})
@@ -114,7 +128,22 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             {
                 "payload": payload,
                 "main": {"name": main_provider.get("name"), "model": main_provider.get("model"), "config": main_provider.get("config")},
-                "tts": {"name": provider.get("name"), "model": provider.get("model"), "device": config.get("compute_device")},
+                "audio": {
+                    "name": provider.get("name"),
+                    "tts_model": provider.get("model"),
+                    "tts_device": config.get("compute_device"),
+                    "asr_model": config.get("asr_model"),
+                    "asr_device": config.get("asr_compute_device"),
+                    "voices": {
+                        key: config.get(key) for key in (
+                            "host_a", "host_b", "host_a_en", "host_b_en",
+                            "host_a_voice_mode", "host_b_voice_mode",
+                            "host_a_voiceprint_person_id", "host_b_voiceprint_person_id",
+                            "host_a_voiceprint_sample_id", "host_b_voiceprint_sample_id",
+                            "host_a_instruct", "host_b_instruct",
+                        )
+                    },
+                },
                 "script_engine": PODCAST_ENGINE_VERSION,
                 "duration_calibration": PODCAST_DURATION_CALIBRATION_VERSION,
             }
@@ -142,18 +171,17 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         save_manifest(manifest)
 
     language = generated["language"]
-    defaults = ("Ryan", "Aiden") if language == "en" else ("Vivian", "Dylan")
     voices = {
-        "HOST_A": payload.get("host_a") or config.get("host_a_en" if language == "en" else "host_a", defaults[0]),
-        "HOST_B": payload.get("host_b") or config.get("host_b_en" if language == "en" else "host_b", defaults[1]),
+        "HOST_A": host_voice_selection(config, "host_a", language, preset_override=payload.get("host_a")),
+        "HOST_B": host_voice_selection(config, "host_b", language, preset_override=payload.get("host_b")),
     }
     selected_model = provider.get("model") or ""
     selected_device = config.get("compute_device", "gpu")
     model_caps = next((item for item in provider.get("capabilities", {}).get("models", []) if item.get("id") == selected_model), {})
     instruction_modes = (model_caps.get("controls") or {}).get("instruction_voice_modes") or []
     instructions = {
-        "HOST_A": config.get("host_a_instruct") if "preset" in instruction_modes else None,
-        "HOST_B": config.get("host_b_instruct") if "preset" in instruction_modes else None,
+        "HOST_A": host_voice_instruction(config, "host_a", language, supported="preset" in instruction_modes),
+        "HOST_B": host_voice_instruction(config, "host_b", language, supported="preset" in instruction_modes),
     }
     parts_dir = work_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -162,30 +190,6 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     turns = generated["turns"]
     tts_execution: dict[str, Any] = {"requested_device": selected_device, "compute_device": selected_device, "fallback_used": False}
 
-    def turn_instruction(turn: dict[str, Any]) -> str | None:
-        configured = instructions.get(turn["speaker"])
-        if configured is None:
-            return None  # 模型不支持 preset instruction，与评测路径一致不发送
-        base = configured.strip()
-        act = str(turn.get("dialogue_act") or "")
-        if language == "en":
-            cue = {
-                "question": "Ask with genuine curiosity, without sounding theatrical.",
-                "challenge": "Sound thoughtful and mildly skeptical.",
-                "synthesis": "Slow slightly and land the conclusion clearly.",
-                "bridge": "Keep this brief and conversational.",
-                "acknowledgement": "Use a light, natural acknowledgement.",
-            }.get(act, "Use an engaged, natural knowledge-podcast cadence.")
-        else:
-            cue = {
-                "question": "带着真实好奇追问，不要表演化。",
-                "challenge": "语气克制、认真，带一点审慎质疑。",
-                "synthesis": "略微放慢，把结论自然落稳。",
-                "bridge": "简短自然地承接，不要播报腔。",
-                "acknowledgement": "用轻微、自然的回应语气。",
-            }.get(act, "使用投入、自然的知识播客节奏。")
-        return (base + " " + cue).strip() if base or cue else None
-
     async def synthesize_turn(index: int, *, retry: bool = False) -> Path:
         turn = turns[index]
         if cancel_check():
@@ -193,17 +197,29 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         part = parts_dir / f"{index:04d}.wav"
         if retry or not part.exists() or part.stat().st_size < 128:
             Reporter(job_id).update("tts", f"高质量语音合成 {index + 1}/{len(turns)}", 0.40 + 0.50 * index / max(1, len(turns)), current=index + 1, total=len(turns), unit="段")
-            digest = hashlib.sha256(f"{selected_model}|{selected_device}|{voices[turn['speaker']]}|{turn['text']}".encode()).hexdigest()[:20]
+            selection = voices[turn["speaker"]]
+            instruction = instructions[turn["speaker"]]
+            digest = hashlib.sha256(
+                json_dump({
+                    "model": selected_model,
+                    "device": selected_device,
+                    "voice": selection,
+                    "instruction": instruction,
+                    "text": turn["text"],
+                }).encode()
+            ).hexdigest()[:20]
             execution: dict[str, Any] = {}
             await synthesize(
                 turn["text"],
-                voices[turn["speaker"]],
+                selection.get("speaker"),
                 part,
                 language="English" if language == "en" else "Chinese",
                 cancel_check=cancel_check,
                 model=selected_model,
                 compute_device=selected_device,
-                instruct=turn_instruction(turn),
+                voice_mode=selection["mode"],
+                voiceprint_sample_id=selection.get("sample_id"),
+                instruct=instruction,
                 idempotency_key=f"sread-{suffix[:24]}-{index:04d}-{digest}{'-r1' if retry else ''}",
                 execution=execution,
             )
@@ -327,8 +343,22 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         save_manifest(manifest)
         raise RuntimeError("成品音频未通过本地 ASR 质量门槛")
     generated["duration"]["actual_seconds"] = round(cursor, 3)
-    generated["voices"] = voices
-    generated["provider"] = {"name": provider.get("name"), "model": selected_model, **tts_execution}
+    generated["voices"] = {
+        speaker: {"mode": selection["mode"], "label": selection["label"]}
+        for speaker, selection in voices.items()
+    }
+    generated["provider"] = {
+        "name": provider.get("name"),
+        "kind": provider.get("kind"),
+        "model": selected_model,
+        **tts_execution,
+        "asr": {
+            "model": audio_quality.get("asr_model"),
+            "compute_device": audio_quality.get("compute_device"),
+            "fallback_used": audio_quality.get("device_fallback"),
+            "fallback_reason": audio_quality.get("fallback_reason"),
+        },
+    }
     generated["audio_quality"] = audio_quality
     generated["quality"]["actual_minutes"] = round(cursor / 60, 2)
     generated["quality"]["actual_duration_ratio"] = duration_check["duration_ratio"]
@@ -356,6 +386,8 @@ async def execute(job: dict[str, Any]) -> Any:
             payload["source_id"],
             progress=ingest_progress,
             cancel_check=lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job["id"],)) or {}).get("cancel_requested")),
+            image_policy=payload.get("image_policy"),
+            image_provider_ids=payload.get("image_provider_ids"),
         )
     if job["kind"] == "summary": return await make_summary(job["notebook_id"], payload.get("source_ids"), payload.get("language", "auto"), job["id"])
     if job["kind"] in {"quiz", "flashcard"}:

@@ -25,14 +25,47 @@ class SourceSelection(BaseModel):
     selected: bool
 
 
-ProviderRole = Literal["main", "vlm", "tts"]
-ProviderKind = Literal["ollama", "openai", "sandevistan_tts", "openai_tts"]
+class ImageProcessingPolicy(BaseModel):
+    mode: Literal["process", "off"] = "process"
+    processors: list[Literal["vlm", "main", "ocr"]] = Field(default_factory=lambda: ["vlm", "main", "ocr"])
+
+    @model_validator(mode="after")
+    def validate_processors(self):
+        if len(self.processors) != len(set(self.processors)):
+            raise ValueError("图片处理步骤不能重复")
+        if self.mode == "process" and not self.processors:
+            raise ValueError("启用图片处理时至少选择一个处理步骤")
+        return self
+
+
+class ProviderRoleUpdate(BaseModel):
+    enabled: bool | None = None
+    selected_provider_id: str | None = None
+    validation_mode: Literal["catalog", "deep"] = "catalog"
+
+
+ProviderRole = Literal["main", "vlm", "audio", "tts_only", "tts"]
+ProviderKind = Literal["ollama", "openai", "sandevistan_audio", "openai_tts", "sandevistan_tts"]
 ProviderValidationMode = Literal["catalog", "deep"]
 StudyDifficulty = Literal["easy", "medium", "hard", "mixed"]
 
 
-def _validate_provider_pair(role: str, kind: str) -> None:
-    allowed = {"main": {"ollama", "openai"}, "vlm": {"ollama", "openai"}, "tts": {"sandevistan_tts", "openai_tts"}}
+def _normalize_provider_pair(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    normalized = dict(value)
+    role, kind = normalized.get("role"), normalized.get("kind")
+    if role == "tts" and kind == "sandevistan_tts":
+        normalized.update({"role": "audio", "kind": "sandevistan_audio"})
+    elif role == "tts" and kind == "openai_tts":
+        normalized["role"] = "tts_only"
+    return normalized
+
+
+def _validate_provider_pair(role: str, kind: str, *, allow_tts_only: bool = False) -> None:
+    allowed = {"main": {"ollama", "openai"}, "vlm": {"ollama", "openai"}, "audio": {"sandevistan_audio"}}
+    if allow_tts_only:
+        allowed["tts_only"] = {"openai_tts"}
     if kind not in allowed.get(role, set()):
         raise ValueError(f"{role.upper()} 角色不支持 {kind} Provider")
 
@@ -43,6 +76,38 @@ def _validate_provider_config(config: dict[str, Any]) -> None:
     tier = config.get("study_generation_tier", "auto")
     if tier not in {"auto", "lite", "full"}:
         raise ValueError("学习生成档位必须是 auto、lite 或 full")
+    for field in ("asr_auto_select", "asr_allow_device_fallback"):
+        if field in config and not isinstance(config[field], bool):
+            raise ValueError(f"{field} 必须是布尔值")
+    for field, maximum in (
+        ("asr_model", 240),
+        ("asr_compute_device", 64),
+        ("host_a_voiceprint_person_id", 240),
+        ("host_a_voiceprint_sample_id", 240),
+        ("host_b_voiceprint_person_id", 240),
+        ("host_b_voiceprint_sample_id", 240),
+    ):
+        if field in config and (not isinstance(config[field], str) or len(config[field]) > maximum):
+            raise ValueError(f"{field} 必须是长度不超过 {maximum} 的字符串")
+    for host in ("host_a", "host_b"):
+        mode = config.get(f"{host}_voice_mode", "preset")
+        if mode not in {"preset", "voiceprint"}:
+            raise ValueError(f"{host}_voice_mode 必须是 preset 或 voiceprint")
+    if (
+        config.get("host_a_voice_mode", "preset") == "preset"
+        and config.get("host_b_voice_mode", "preset") == "preset"
+        and str(config.get("host_a") or "").strip()
+        and str(config.get("host_a") or "").strip() == str(config.get("host_b") or "").strip()
+    ):
+        raise ValueError("Host A 与 Host B 不能使用同一个预置音色")
+    if (
+        config.get("host_a_voice_mode") == "voiceprint"
+        and config.get("host_b_voice_mode") == "voiceprint"
+        and str(config.get("host_a_voiceprint_person_id") or "").strip()
+        and str(config.get("host_a_voiceprint_person_id") or "").strip()
+        == str(config.get("host_b_voiceprint_person_id") or "").strip()
+    ):
+        raise ValueError("Host A 与 Host B 不能使用同一个声纹人员")
 
 
 class ProviderCreate(BaseModel):
@@ -56,6 +121,11 @@ class ProviderCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     active: bool = True
     validation_mode: ProviderValidationMode = "catalog"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_pair(cls, value: Any):
+        return _normalize_provider_pair(value)
 
     @model_validator(mode="after")
     def validate_provider_pair(self):
@@ -91,9 +161,14 @@ class ProviderInspectionRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     mode: ProviderValidationMode = "catalog"
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_pair(cls, value: Any):
+        return _normalize_provider_pair(value)
+
     @model_validator(mode="after")
     def validate_provider_pair(self):
-        _validate_provider_pair(self.role, self.kind)
+        _validate_provider_pair(self.role, self.kind, allow_tts_only=True)
         _validate_provider_config(self.config)
         return self
 

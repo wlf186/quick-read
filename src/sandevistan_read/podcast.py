@@ -1041,6 +1041,9 @@ def validate_scene_turns(
         if not text_matches_language(text, language):
             issues.append(f"第 {index + 1} 轮语言不符合输出要求")
             continue
+        if re.search(r"[!！]|[?？]{2,}|\.{3,}|…{2,}", text):
+            issues.append(f"第 {index + 1} 轮包含会放大口播情绪的标点")
+            continue
         lowered = text.lower()
         if any(stem in lowered for stem in GENERIC_STEMS):
             issues.append(f"第 {index + 1} 轮使用机械模板")
@@ -1115,6 +1118,19 @@ def _scene_instruction(scene_kind: str, language: str) -> str:
     }[scene_kind]
 
 
+def _delivery_instruction(language: str) -> str:
+    if language == "en":
+        return (
+            "Keep both hosts in a restrained knowledge-podcast register. Do not use exclamation marks, repeated "
+            "punctuation, all-caps emphasis, stage directions, or wording that asks for shouting, anger, or abrupt "
+            "emotional changes; questions and challenges must remain calm."
+        )
+    return (
+        "两位主持人始终使用克制、稳定的知识播客表达；禁止感叹号、重复标点、舞台式情绪说明，"
+        "也不要用要求喊叫、愤怒或情绪骤变的措辞；提问和质疑都保持平静。"
+    )
+
+
 def _act_output_tokens(duration_budget: dict[str, Any] | None, target: int, language: str) -> int:
     units = float((duration_budget or {}).get("maximum_units") or target * (55 if language == "en" else 110))
     visible = units * (2.0 if language == "en" else 1.5) + target * 24
@@ -1160,6 +1176,7 @@ async def _draft_scene(
         duration_rule = ""
     prompt_prefix = f"""你是严格资料内的双人深度播客编剧。{language_rule}。两位主持人都能解释、质疑和综合；本 Act 由 {chapter.get('lead_host') or 'HOST_A'} 主导，但另一位必须贡献实质判断，禁止机械采访和孤立事实罗列。
 {_scene_instruction(scene_kind, language)}
+{_delivery_instruction(language)}
 生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。问句占本 Act 的 20%–35%，不得连续出现超过两个问句；长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
 只输出一个 JSON 对象，键名为 turns；turns 的每一项必须是四元素数组，依次为 speaker、act_code、text、claim_ids。speaker 只能为 A/B；act_code 只能为 I/F/B/Q/A/X/E/M/C/S/O；claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。不要输出示例、统计、解释或额外字段。
 剧集记忆：{memory_json}
@@ -1284,6 +1301,7 @@ async def _continue_scene(
     remaining_question_cap = max(0, math.floor(target * 0.40) - sum(_is_question_turn(turn) for turn in partial))
     remaining_minutes = minimum_units / (LATIN_WORDS_PER_MINUTE if language == "en" else CJK_CHARS_PER_MINUTE)
     prompt_prefix = f"""你正在补全一段提前结束、结构不完整的资料型双人播客。{language_rule}。不要重写或复述已有轮次，只续写缺失的 {missing} 轮，从 HOST_{start_speaker} 开始严格交替。
+{_delivery_instruction(language)}
 续写需要补足约 {remaining_minutes:.1f} 分钟自然口播，其中最多 {remaining_question_cap} 轮可以是问句（包括以问号结尾的非 Q 标签轮）。{_slot_plan_instruction(slot_plan, language)} 继续当前推理并完成本 Act 的目的与后续钩子；事实轮必须带受支持的 claim_ids。
 只输出一个 JSON 对象，键名为 turns；每一项是 speaker、act_code、text、claim_ids 组成的四元素数组。不要输出短示例、统计或解释。act code 只能使用 I/F/B/Q/A/X/E/M/C/S/O。
 当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；后续钩子：{chapter.get('bridge_out')}。

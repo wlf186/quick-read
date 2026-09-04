@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import html
+import base64
+import io
 import os
 import posixpath
 import re
@@ -19,12 +21,13 @@ import fitz
 from bs4 import BeautifulSoup
 from docx import Document
 from pptx import Presentation
+from PIL import Image
 
 from .config import CONFIG
 from .paths import PATHS
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".epub", ".txt", ".md", ".markdown", ".html", ".htm"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".epub", ".txt", ".md", ".markdown", ".html", ".htm", ".png", ".jpg", ".jpeg", ".webp"}
 EPUB_MAX_ENTRIES = 10_000
 EPUB_MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 EPUB_MAX_TEXT_MEMBER_BYTES = 32 * 1024 * 1024
@@ -75,6 +78,31 @@ def _render_pdf_page(page: fitz.Page, destination: Path) -> str:
     return str(destination.relative_to(PATHS.root))
 
 
+def _store_visual(data: bytes, destination: Path) -> str:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.convert("RGB").save(destination, "PNG")
+    except Exception as exc:
+        raise ValueError("图片格式无法解码") from exc
+    return str(destination.relative_to(PATHS.root))
+
+
+def _store_svg(data: bytes, destination: Path) -> str:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if len(data) > 16 * 1024 * 1024 or re.search(br"<!DOCTYPE|<script|<foreignObject", data, re.I):
+            raise ValueError("SVG 包含不允许的内容")
+        if re.search(br"(?:href|xlink:href)\s*=\s*['\"](?!data:|#)", data, re.I):
+            raise ValueError("SVG 不允许引用外部资源")
+        with fitz.open(stream=data, filetype="svg") as document:
+            pixmap = document[0].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            pixmap.save(destination)
+    except Exception as exc:
+        raise ValueError("SVG 无法安全渲染") from exc
+    return str(destination.relative_to(PATHS.root))
+
+
 def parse_pdf(path: Path, source_id: str) -> ParsedDocument:
     document = fitz.open(path)
     result = ParsedDocument(page_count=len(document), parser="pymupdf", preview_path=str(path.relative_to(PATHS.root)), metadata={"locator_unit": "page"})
@@ -83,9 +111,10 @@ def parse_pdf(path: Path, source_id: str) -> ParsedDocument:
         blocks = page.get_text("blocks", sort=True)
         text = _clean_text("\n".join(str(block[4]) for block in blocks if len(block) > 4))
         image_count = len(page.get_images(full=True))
+        drawing_count = len(page.get_drawings())
         page_area = max(page.rect.width * page.rect.height, 1)
         text_density = len(text) / page_area
-        visual_needed = len(text) < 80 or image_count > 0 or text_density < 0.00018
+        visual_needed = len(text) < 80 or image_count > 0 or drawing_count > 0 or text_density < 0.00018
         image_path = None
         if visual_needed:
             image_path = _render_pdf_page(page, render_dir / f"page-{index + 1:04d}.png")
@@ -160,6 +189,10 @@ def parse_docx(path: Path, source_id: str) -> ParsedDocument:
     if preview:
         with fitz.open(preview) as pdf:
             page_count = len(pdf)
+            render_dir = PATHS.renders / source_id
+            for index, page in enumerate(pdf):
+                image_path = _render_pdf_page(page, render_dir / f"page-{index + 1:04d}.png")
+                blocks.append(ParsedBlock(text="", locator={"kind": "page", "page": index + 1, "visual_only": True}, image_path=image_path, visual_needed=True))
     return ParsedDocument(
         blocks=blocks,
         page_count=page_count or max(1, len(document.sections)),
@@ -223,7 +256,7 @@ def _xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def parse_epub(path: Path) -> ParsedDocument:
+def parse_epub(path: Path, source_id: str = "preview") -> ParsedDocument:
     try:
         archive = zipfile.ZipFile(path)
     except zipfile.BadZipFile as exc:
@@ -288,6 +321,29 @@ def parse_epub(path: Path) -> ParsedDocument:
                 raise ValueError("EPUB 单个正文文件超过安全限制")
             raw = archive.read(member).decode("utf-8", errors="replace")
             soup = BeautifulSoup(raw, "html.parser")
+            for image_index, image in enumerate(soup.find_all("img"), start=1):
+                src = str(image.get("src") or "")
+                if not src or src.startswith(("http://", "https://")):
+                    continue
+                try:
+                    image_member = _epub_member(posixpath.dirname(member), src)
+                    if image_member not in names or image_member in encrypted:
+                        continue
+                    image_data = archive.read(image_member)
+                    destination = PATHS.renders / source_id / f"epub-{spine_index:04d}-{image_index:04d}.png"
+                    stored = _store_svg(image_data, destination) if image_member.lower().endswith(".svg") else _store_visual(image_data, destination)
+                    blocks.append(ParsedBlock(
+                        text="", image_path=stored, visual_needed=True,
+                        locator={"kind": "epub-image", "spine": spine_index, "href": href, "asset": src, "visual_only": True},
+                    ))
+                except (KeyError, ValueError):
+                    continue
+            for svg_index, svg in enumerate(soup.find_all("svg"), start=1):
+                try:
+                    stored = _store_svg(str(svg).encode(), PATHS.renders / source_id / f"epub-svg-{spine_index:04d}-{svg_index:04d}.png")
+                    blocks.append(ParsedBlock("", {"kind": "epub-svg", "spine": spine_index, "href": href, "visual_only": True}, stored, True))
+                except ValueError:
+                    continue
             for unsafe in soup(["script", "style", "iframe", "object", "embed", "svg"]):
                 unsafe.decompose()
             heading = soup.find(re.compile(r"^h[1-6]$"))
@@ -306,8 +362,27 @@ def parse_epub(path: Path) -> ParsedDocument:
         return ParsedDocument(blocks=blocks, page_count=len(blocks), parser="epub-spine", preview_path=preview_path, metadata=metadata)
 
 
-def parse_text(path: Path, extension: str) -> ParsedDocument:
+def parse_text(path: Path, extension: str, source_id: str = "preview") -> ParsedDocument:
     raw = path.read_text(encoding="utf-8", errors="replace")
+    visual_blocks: list[ParsedBlock] = []
+    if extension in {".html", ".htm", ".md", ".markdown"}:
+        pattern = re.compile(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)", re.I)
+        for index, match in enumerate(pattern.finditer(raw), start=1):
+            try:
+                data = base64.b64decode(re.sub(r"\s+", "", match.group(2)), validate=True)
+                stored = _store_visual(data, PATHS.renders / source_id / f"inline-{index:04d}.png")
+                line = raw.count("\n", 0, match.start()) + 1
+                visual_blocks.append(ParsedBlock("", {"kind": "inline-image", "line": line, "visual_only": True}, stored, True))
+            except (ValueError, base64.binascii.Error):
+                continue
+        if extension in {".html", ".htm"}:
+            inline_soup = BeautifulSoup(raw, "html.parser")
+            for index, svg in enumerate(inline_soup.find_all("svg"), start=1):
+                try:
+                    stored = _store_svg(str(svg).encode(), PATHS.renders / source_id / f"inline-svg-{index:04d}.png")
+                    visual_blocks.append(ParsedBlock("", {"kind": "inline-svg", "visual_only": True}, stored, True))
+                except ValueError:
+                    continue
     if extension in {".html", ".htm"}:
         soup = BeautifulSoup(raw, "html.parser")
         for unsafe in soup(["script", "style", "iframe", "object", "embed"]):
@@ -334,7 +409,18 @@ def parse_text(path: Path, extension: str) -> ParsedDocument:
             buffer = []
     if buffer:
         blocks.append(ParsedBlock(_clean_text("\n".join(buffer)), {"kind": "lines", "line_start": start_line, "line_end": len(lines), "section": section}))
-    return ParsedDocument(blocks=[block for block in blocks if block.text], page_count=max(1, len(blocks)), parser=f"text-{extension.lstrip('.')}", metadata={"locator_unit": "section"})
+    return ParsedDocument(blocks=[block for block in blocks if block.text] + visual_blocks, page_count=max(1, len(blocks)), parser=f"text-{extension.lstrip('.')}", metadata={"locator_unit": "section", "inline_visuals": len(visual_blocks)})
+
+
+def parse_image(path: Path, source_id: str) -> ParsedDocument:
+    stored = _store_visual(path.read_bytes(), PATHS.renders / source_id / "image-0001.png")
+    return ParsedDocument(
+        blocks=[ParsedBlock("", {"kind": "image", "visual_only": True}, stored, True)],
+        page_count=1,
+        parser="pymupdf-image",
+        preview_path=stored,
+        metadata={"locator_unit": "image"},
+    )
 
 
 def parse_document(path: Path, source_id: str) -> ParsedDocument:
@@ -348,8 +434,10 @@ def parse_document(path: Path, source_id: str) -> ParsedDocument:
     if extension == ".pptx":
         return parse_pptx(path, source_id)
     if extension == ".epub":
-        return parse_epub(path)
-    return parse_text(path, extension)
+        return parse_epub(path, source_id)
+    if extension in {".png", ".jpg", ".jpeg", ".webp"}:
+        return parse_image(path, source_id)
+    return parse_text(path, extension, source_id)
 
 
 def chunk_blocks(blocks: list[ParsedBlock], target_chars: int = 1800, overlap_chars: int = 260) -> list[ParsedBlock]:

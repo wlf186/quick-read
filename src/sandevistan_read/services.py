@@ -11,7 +11,7 @@ from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import chunk_blocks, parse_document
 from .paths import PATHS
 from .context_budget import ContextUsage, PromptBudget, estimate_messages_tokens, pack_items, structured_output_tokens, truncate_text_tokens
-from .providers import PromptBuild, ProviderError, budgeted_chat, describe_image
+from .providers import PromptBuild, ProviderError, budgeted_chat, describe_image, provider_by_id
 from .retrieval import EMBEDDINGS, retrieve, select_quality_evidence
 from .observability import Reporter
 from .languages import resolve_output_language
@@ -37,7 +37,13 @@ def scope_hash(source_ids: list[str]) -> str:
     return hashlib.sha256("|".join(revisions).encode()).hexdigest()
 
 
-async def ingest_source(source_id: str, progress: Callable[[str, float], None] | None = None, cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
+async def ingest_source(
+    source_id: str,
+    progress: Callable[[str, float], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    image_policy: dict[str, Any] | None = None,
+    image_provider_ids: dict[str, str] | None = None,
+) -> dict[str, Any]:
     source = DB.fetchone("SELECT * FROM sources WHERE id=?", (source_id,))
     if not source:
         raise ValueError("source not found")
@@ -48,47 +54,61 @@ async def ingest_source(source_id: str, progress: Callable[[str, float], None] |
     parsed = await asyncio.to_thread(parse_document, path, source_id)
     if cancel_check and cancel_check():
         raise RuntimeError("任务已取消")
-    vision_count = 0
-    visual_indexes = [index for index, block in enumerate(parsed.blocks) if block.visual_needed and block.image_path]
-    selected_visual = set(visual_indexes)
-    if len(visual_indexes) > 48:
-        low_text = [index for index in visual_indexes if len(parsed.blocks[index].text.strip()) < 200][:24]
-        remaining = [index for index in visual_indexes if index not in set(low_text)]
-        slots = max(0, 48 - len(low_text))
-        if slots and remaining:
-            positions = {round(position * (len(remaining) - 1) / max(1, slots - 1)) for position in range(slots)}
-            sampled = [remaining[position] for position in sorted(positions)]
-        else:
-            sampled = []
-        selected_visual = set(low_text + sampled)
-    processed_visual = 0
-    for block_index, block in enumerate(parsed.blocks):
-        if block.visual_needed and block.image_path:
-            if block_index not in selected_visual:
-                continue
-            if cancel_check and cancel_check():
-                raise RuntimeError("任务已取消")
-            if progress:
-                progress(f"视觉解析 {processed_visual + 1}/{len(selected_visual)}", 0.12 + 0.38 * processed_visual / max(1, len(selected_visual)))
-            visual = ""
+    policy = image_policy or {"mode": "process", "processors": ["vlm", "main", "ocr"]}
+    processors = list(policy.get("processors") or []) if policy.get("mode") == "process" else []
+    visual_blocks = [block for block in parsed.blocks if block.visual_needed and block.image_path]
+    successful_visuals = 0
+    processor_counts: dict[str, int] = {}
+    visual_rows: list[dict[str, Any]] = []
+    derived_blocks = []
+    for visual_index, block in enumerate(visual_blocks, start=1):
+        attempts: list[dict[str, Any]] = []
+        if cancel_check and cancel_check():
+            raise RuntimeError("任务已取消")
+        if progress:
+            progress(f"视觉解析 {visual_index}/{len(visual_blocks)}", 0.12 + 0.38 * (visual_index - 1) / max(1, len(visual_blocks)))
+        description, used = "", None
+        for processor in processors:
             try:
-                visual = await describe_image(PATHS.root / block.image_path, block.text)
-                if visual:
-                    block.text = (block.text + "\n\n[视觉解析]\n" + visual).strip()
-                    vision_count += 1
-            except Exception:
-                pass
-            if not visual:
-                try:
+                if processor in {"vlm", "main"}:
+                    provider_id = (image_provider_ids or {}).get(processor)
+                    provider = provider_by_id(provider_id) if provider_id else None
+                    if not provider:
+                        attempts.append({"processor": processor, "status": "unavailable"})
+                        continue
+                    if not provider.get("capabilities", {}).get("vision"):
+                        attempts.append({"processor": processor, "status": "unsupported"})
+                        continue
+                    description = (await describe_image(PATHS.root / block.image_path, block.text, provider)).strip()
+                else:
                     from rapidocr import RapidOCR
                     result = await asyncio.to_thread(RapidOCR(), str(PATHS.root / block.image_path))
                     lines = [item if isinstance(item, str) else getattr(item, "txt", "") for item in (getattr(result, "txts", []) or [])]
-                    lines = [line for line in lines if line]
-                    if lines:
-                        block.text = (block.text + "\n\n[本地OCR]\n" + "\n".join(lines)).strip()
-                except Exception:
-                    pass
-            processed_visual += 1
+                    description = "\n".join(line.strip() for line in lines if line and line.strip())
+                if len(description) >= 2:
+                    used = processor
+                    attempts.append({"processor": processor, "status": "success"})
+                    break
+                attempts.append({"processor": processor, "status": "empty"})
+            except Exception as exc:
+                attempts.append({"processor": processor, "status": "failed", "error": str(exc)[:240]})
+                description = ""
+        visual_id = new_id("visual")
+        locator = dict(block.locator)
+        locator.update({"visual_id": visual_id, "derived_visual": True})
+        if description:
+            label = "本地 OCR" if used == "ocr" else f"{str(used).upper()} 视觉解析"
+            derived_blocks.append(type(block)(f"[{label}]\n{description}", locator))
+            successful_visuals += 1
+            processor_counts[used or "unknown"] = processor_counts.get(used or "unknown", 0) + 1
+        image_bytes = (PATHS.root / block.image_path).read_bytes()
+        visual_rows.append({
+            "id": visual_id, "ordinal": visual_index, "kind": str(block.locator.get("kind") or "image"),
+            "locator": locator, "path": block.image_path, "status": "ready" if description else "skipped" if not processors else "unresolved",
+            "processor": used, "description": description, "attempts": attempts,
+            "checksum": hashlib.sha256(image_bytes).hexdigest(),
+        })
+    parsed.blocks.extend(derived_blocks)
     chunks = chunk_blocks(parsed.blocks)
     vectors: list[list[float]] = []
     batch_size = 32
@@ -104,15 +124,29 @@ async def ingest_source(source_id: str, progress: Callable[[str, float], None] |
     with DB.transaction() as connection:
         connection.execute("DELETE FROM chunks_fts WHERE source_id=?", (source_id,))
         connection.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+        connection.execute("DELETE FROM source_visuals WHERE source_id=?", (source_id,))
         for ordinal, (chunk, vector) in enumerate(zip(chunks, vectors), start=1):
             chunk_id = new_id("chunk")
             checksum = hashlib.sha256(chunk.text.encode()).hexdigest()
             connection.execute("INSERT INTO chunks VALUES(?,?,?,?,?,?,?,?,?)", (chunk_id, source_id, source["revision_id"], ordinal, chunk.text, json_dump(chunk.locator), json_dump(vector), checksum, now))
             connection.execute("INSERT INTO chunks_fts(chunk_id,source_id,content) VALUES(?,?,?)", (chunk_id, source_id, chunk.text))
+        for item in visual_rows:
+            connection.execute(
+                """INSERT INTO source_visuals
+                (id,source_id,ordinal,kind,locator_json,relative_path,mime_type,width,height,status,processor,description,attempts_json,checksum,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item["id"], source_id, item["ordinal"], item["kind"], json_dump(item["locator"]), item["path"], "image/png", None, None,
+                 item["status"], item["processor"], item["description"], json_dump(item["attempts"]), item["checksum"], now, now),
+            )
         metadata = dict(parsed.metadata)
-        metadata.update({"vision_pages": vision_count, "vision_candidates": len(visual_indexes), "vision_budget": len(selected_visual), "chunk_count": len(chunks), "embedding_mode": EMBEDDINGS.mode})
-        connection.execute("UPDATE sources SET state='ready',page_count=?,parser=?,preview_path=?,metadata_json=?,updated_at=? WHERE id=?", (parsed.page_count, parsed.parser, parsed.preview_path, json_dump(metadata), now, source_id))
-    return {"source_id": source_id, "chunks": len(chunks), "vision_pages": vision_count}
+        metadata.update({
+            "vision_pages": successful_visuals, "vision_candidates": len(visual_blocks), "vision_budget": len(visual_blocks),
+            "chunk_count": len(chunks), "embedding_mode": EMBEDDINGS.mode,
+            "image_processing": {"policy": policy, "processed": successful_visuals, "processors": processor_counts},
+            "indexable": bool(chunks),
+        })
+        connection.execute("UPDATE sources SET state='ready',selected=?,page_count=?,parser=?,preview_path=?,metadata_json=?,updated_at=? WHERE id=?", (int(bool(chunks)), parsed.page_count, parsed.parser, parsed.preview_path, json_dump(metadata), now, source_id))
+    return {"source_id": source_id, "chunks": len(chunks), "vision_pages": successful_visuals, "visuals": len(visual_blocks)}
 
 
 def _context(chunks: list[dict[str, Any]], labels: list[str] | None = None) -> tuple[str, list[dict[str, Any]]]:

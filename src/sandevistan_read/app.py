@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,9 +19,9 @@ from .jobs import WORKER, enqueue
 from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete, request_notebook_deletes
 from .observability import Reporter, present_job
 from .paths import PATHS
-from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_chat_provider, probe_tts_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
+from .providers import ProviderError, active_provider, audio_provider_readiness, health, inspect_provider, normalize_provider_base_url, probe_audio_provider, probe_chat_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
 from .retrieval import EMBEDDINGS
-from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSessionReview, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderUpdate, QuizAnswer, QuizRequest, QuizSubmission, SourceSelection, StudySessionCreate, SummaryRequest
+from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSessionReview, ImageProcessingPolicy, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderRoleUpdate, ProviderUpdate, QuizAnswer, QuizRequest, QuizSubmission, SourceSelection, StudySessionCreate, SummaryRequest
 from .security import VAULT
 from .services import grounded_generate, source_scope
 from .study_sessions import answer_quiz, create_session, flashcards_csv, get_session, public_artifact, review_flashcard, suspend_flashcard
@@ -28,12 +29,12 @@ from .study_sessions import answer_quiz, create_session, flashcards_csv, get_ses
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    DB.initialize(); DB.seed(CONFIG.development.ollama_url, CONFIG.development.ollama_model, CONFIG.development.tts_url); DB.reset_running_jobs()
+    DB.initialize(); DB.seed(CONFIG.development.ollama_url, CONFIG.development.ollama_model, CONFIG.development.audio_url); DB.reset_running_jobs()
     backfill_resources(); reconcile_legacy_podcast_temps(); process_cleanup_operations()
-    tts = active_provider("tts")
-    if tts:
+    audio = active_provider("audio")
+    if audio:
         try:
-            await probe_tts_provider(tts["id"], apply_defaults=True)
+            await probe_audio_provider(audio["id"], apply_defaults=True)
         except Exception:
             pass
     refresh_task = asyncio.create_task(refresh_active_chat_capabilities())
@@ -58,6 +59,12 @@ def require_access(request: Request, authorization: str | None = Header(default=
 
 
 api = FastAPI(dependencies=[Depends(require_access)])
+_STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_STATUS_LOCK = asyncio.Lock()
+
+
+def invalidate_status_cache() -> None:
+    _STATUS_CACHE.update({"at": 0.0, "value": None})
 
 
 def normalize(row: dict[str, Any]) -> dict[str, Any]:
@@ -85,15 +92,22 @@ def auth_status(request: Request, authorization: str | None = Header(default=Non
 
 @api.get("/status")
 async def status():
-    ffmpeg = CONFIG.tools.ffmpeg_path
-    libreoffice = CONFIG.tools.libreoffice_path
-    tool_status = {
-        "ffmpeg": {"available": bool(ffmpeg), "scope": CONFIG.tools.scope(ffmpeg), "version": CONFIG.tools.version(ffmpeg), "path": str(Path(ffmpeg).resolve().relative_to(PATHS.root)) if ffmpeg and CONFIG.tools.scope(ffmpeg) == "project" else ffmpeg},
-        "libreoffice": {"available": bool(libreoffice), "scope": CONFIG.tools.scope(libreoffice), "version": CONFIG.tools.version(libreoffice), "path": str(Path(libreoffice).resolve().relative_to(PATHS.root)) if libreoffice and CONFIG.tools.scope(libreoffice) == "project" else libreoffice},
-    }
-    roles = ("main", "vlm", "tts")
-    health_results = await asyncio.gather(*(health(role) for role in roles))
-    return {"name": "Sandevistan-Read", "version": "0.4.0", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
+    if _STATUS_CACHE["value"] is not None and time.monotonic() - float(_STATUS_CACHE["at"]) < 30:
+        return _STATUS_CACHE["value"]
+    async with _STATUS_LOCK:
+        if _STATUS_CACHE["value"] is not None and time.monotonic() - float(_STATUS_CACHE["at"]) < 30:
+            return _STATUS_CACHE["value"]
+        ffmpeg = CONFIG.tools.ffmpeg_path
+        libreoffice = CONFIG.tools.libreoffice_path
+        tool_status = {
+            "ffmpeg": {"available": bool(ffmpeg), "scope": CONFIG.tools.scope(ffmpeg), "version": CONFIG.tools.version(ffmpeg), "path": str(Path(ffmpeg).resolve().relative_to(PATHS.root)) if ffmpeg and CONFIG.tools.scope(ffmpeg) == "project" else ffmpeg},
+            "libreoffice": {"available": bool(libreoffice), "scope": CONFIG.tools.scope(libreoffice), "version": CONFIG.tools.version(libreoffice), "path": str(Path(libreoffice).resolve().relative_to(PATHS.root)) if libreoffice and CONFIG.tools.scope(libreoffice) == "project" else libreoffice},
+        }
+        roles = ("main", "vlm", "audio")
+        health_results = await asyncio.gather(*(health(role) for role in roles))
+        value = {"name": "Sandevistan-Read", "version": "0.4.0", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
+        _STATUS_CACHE.update({"at": time.monotonic(), "value": value})
+        return value
 
 
 @api.get("/notebooks")
@@ -174,8 +188,16 @@ def notebook(notebook_id: str):
 
 
 @api.post("/notebooks/{notebook_id}/sources")
-async def upload_sources(notebook_id: str, files: list[UploadFile] = File(...)):
+async def upload_sources(notebook_id: str, files: list[UploadFile] = File(...), image_policy: str | None = Form(default=None)):
     _require_notebook(notebook_id)
+    stored_policy = DB.fetchone("SELECT value_json FROM app_settings WHERE key='image_processing'")
+    try:
+        policy = ImageProcessingPolicy.model_validate(json_load(image_policy, None) if image_policy else json_load((stored_policy or {}).get("value_json"), {}))
+    except Exception as exc:
+        raise HTTPException(422, f"图片处理策略无效：{exc}") from exc
+    provider_ids = {
+        role: provider["id"] for role in ("vlm", "main") if (provider := active_provider(role))
+    }
     named = [(upload, sanitize_filename(upload.filename or "document")) for upload in files]
     unsupported = [name for _, name in named if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS]
     if unsupported:
@@ -208,7 +230,9 @@ async def upload_sources(notebook_id: str, files: list[UploadFile] = File(...)):
         with DB.transaction() as connection:
             for item in staged:
                 connection.execute("INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (item["id"], notebook_id, item["revision"], item["name"], item["media_type"], item["size"], item["sha256"], str(item["target"].relative_to(PATHS.root)), None, "queued", 1, 0, None, None, "{}", item["now"], item["now"]))
-        return [{"source_id": item["id"], "job": enqueue("ingest", notebook_id, {"source_id": item["id"]})} for item in staged]
+        return [{"source_id": item["id"], "job": enqueue("ingest", notebook_id, {
+            "source_id": item["id"], "image_policy": policy.model_dump(), "image_provider_ids": provider_ids,
+        })} for item in staged]
     except Exception:
         for item in staged:
             DB.execute("DELETE FROM sources WHERE id=?", (item["id"],))
@@ -301,12 +325,19 @@ def flashcards(notebook_id: str, body: FlashcardRequest): _require_notebook(note
 
 
 @api.post("/notebooks/{notebook_id}/podcasts")
-def podcast(notebook_id: str, body: PodcastRequest): _require_notebook(notebook_id); return enqueue("podcast", notebook_id, body.model_dump())
+def podcast(notebook_id: str, body: PodcastRequest):
+    _require_notebook(notebook_id)
+    ready, message = audio_provider_readiness(active_provider("audio"))
+    if not ready:
+        raise HTTPException(409, message)
+    return enqueue("podcast", notebook_id, body.model_dump())
 
 
 @api.get("/notebooks/{notebook_id}/artifacts")
-def artifacts(notebook_id: str, type: str | None = None):
+def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     rows = DB.fetchall("SELECT * FROM artifacts WHERE notebook_id=? AND (? IS NULL OR type=?) ORDER BY created_at DESC", (notebook_id, type, type))
+    if view == "summary":
+        return [{key: row.get(key) for key in ("id", "notebook_id", "type", "title", "language", "status", "created_at", "updated_at")} | {"payload": {}, "citations": []} for row in rows]
     output = [normalize(row) for row in rows]
     for item in output:
         if item.get("media_path"):
@@ -331,6 +362,19 @@ def artifact_media(artifact_id: str):
     if not path or not path.exists(): raise HTTPException(404, "音频不存在")
     media_type = "audio/mp4" if path.suffix.lower() in {".m4a", ".mp4"} else "audio/wav"
     return FileResponse(path, media_type=media_type, filename=f"sandevistan-podcast{path.suffix.lower()}")
+
+
+@api.get("/visuals/{visual_id}/image")
+def visual_image(visual_id: str):
+    row = DB.fetchone("SELECT relative_path,mime_type FROM source_visuals WHERE id=?", (visual_id,))
+    path = (PATHS.root / row["relative_path"]).resolve() if row else None
+    if not path or not path.exists():
+        raise HTTPException(404, "图片不存在")
+    try:
+        path.relative_to(PATHS.renders.resolve())
+    except ValueError as exc:
+        raise HTTPException(404, "图片不存在") from exc
+    return FileResponse(path, media_type=row["mime_type"])
 
 
 @api.post("/artifacts/{artifact_id}/quiz/submit")
@@ -412,7 +456,7 @@ def export_flashcards(artifact_id: str):
 
 
 @api.get("/jobs")
-def jobs(notebook_id: str | None = None, q: str = "", kind: str = "all", state: str = "all", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+def jobs(notebook_id: str | None = None, q: str = "", kind: str = "all", state: str = "all", view: str = "full", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
     filters, values = ["(j.display_name LIKE ? OR j.stage LIKE ? OR j.id LIKE ? OR COALESCE(n.title,'') LIKE ?)", "(? IS NULL OR j.notebook_id=?)"], [f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", notebook_id, notebook_id]
     if kind != "all": filters.append("j.kind=?"); values.append(kind)
     if state != "all": filters.append("j.state=?"); values.append(state)
@@ -421,7 +465,32 @@ def jobs(notebook_id: str | None = None, q: str = "", kind: str = "all", state: 
     rows = DB.fetchall(f"SELECT j.*,n.title notebook_title FROM jobs j LEFT JOIN notebooks n ON n.id=j.notebook_id WHERE {where} ORDER BY j.created_at DESC LIMIT ? OFFSET ?", tuple(values + [page_size, (page - 1) * page_size]))
     queued = [item["id"] for item in DB.fetchall("SELECT id FROM jobs WHERE state='queued' ORDER BY created_at")]
     items = [present_job(row, queued.index(row["id"]) + 1 if row["id"] in queued else 0) for row in rows]
+    if view == "summary":
+        keep = {"id", "notebook_id", "notebook_title", "display_name", "kind", "state", "stage", "stage_code", "progress", "stage_current", "stage_total", "stage_unit", "progress_basis", "error", "created_at", "updated_at", "started_at", "finished_at", "eta"}
+        items = [{key: value for key, value in item.items() if key in keep} for item in items]
     return {"items": items, "page": page, "page_size": page_size, "total": total, "pages": max(1, (total + page_size - 1) // page_size)}
+
+
+@api.get("/workspace-state")
+def workspace_state(notebook_id: str):
+    _require_notebook(notebook_id)
+    stamps = {
+        "notebook": DB.fetchone("SELECT updated_at FROM notebooks WHERE id=?", (notebook_id,)),
+        "sources": DB.fetchone("SELECT COUNT(*) count,MAX(updated_at) updated_at FROM sources WHERE notebook_id=?", (notebook_id,)),
+        "artifacts": DB.fetchone("SELECT COUNT(*) count,MAX(updated_at) updated_at FROM artifacts WHERE notebook_id=?", (notebook_id,)),
+        "jobs": DB.fetchone("SELECT COUNT(*) count,MAX(updated_at) updated_at FROM jobs WHERE notebook_id=?", (notebook_id,)),
+    }
+    active_rows = DB.fetchall("SELECT * FROM jobs WHERE notebook_id=? AND state IN ('queued','running','cancelling') ORDER BY created_at LIMIT 6", (notebook_id,))
+    failed_rows = DB.fetchall("SELECT * FROM jobs WHERE notebook_id=? AND state='failed' ORDER BY updated_at DESC LIMIT 2", (notebook_id,))
+    active = [present_job(row) for row in active_rows]
+    failed = [present_job(row) for row in failed_rows]
+    keep = {"id", "notebook_id", "display_name", "kind", "state", "stage", "stage_code", "progress", "stage_current", "stage_total", "stage_unit", "error", "created_at", "updated_at", "eta"}
+    return {
+        "versions": {key: f"{(value or {}).get('count', '')}:{(value or {}).get('updated_at', '')}" for key, value in stamps.items()},
+        "active_jobs": [{key: value for key, value in item.items() if key in keep} for item in active],
+        "failed_jobs": [{key: value for key, value in item.items() if key in keep} for item in failed],
+        "has_active_jobs": bool(active),
+    }
 
 
 @api.get("/jobs/{job_id}")
@@ -476,6 +545,60 @@ def providers():
     return rows
 
 
+@api.get("/provider-roles")
+def provider_roles():
+    settings = {row["role"]: bool(row["enabled"]) for row in DB.fetchall("SELECT role,enabled FROM provider_role_settings")}
+    result = []
+    for role in ("main", "vlm", "audio"):
+        selected = DB.fetchone("SELECT id FROM provider_profiles WHERE role=? AND selected=1 LIMIT 1", (role,))
+        result.append({"role": role, "enabled": True if role == "main" else settings.get(role, False), "required": role == "main", "selected_provider_id": (selected or {}).get("id")})
+    return result
+
+
+@api.patch("/provider-roles/{role}")
+async def update_provider_role(role: str, body: ProviderRoleUpdate):
+    if role not in {"main", "vlm", "audio"}:
+        raise HTTPException(404, "Provider 角色不存在")
+    if role == "main" and body.enabled is False:
+        raise HTTPException(409, "MAIN 是必需角色，不能禁用")
+    selected = None
+    if body.selected_provider_id:
+        selected = provider_by_id(body.selected_provider_id)
+        if not selected or selected["role"] != role:
+            raise HTTPException(422, "所选 Provider 不属于该角色")
+    current = DB.fetchone("SELECT enabled FROM provider_role_settings WHERE role=?", (role,)) or {"enabled": role == "main"}
+    enabled = bool(current["enabled"] if body.enabled is None else body.enabled)
+    if enabled:
+        selected = selected or active_provider(role) or (provider_by_id((DB.fetchone("SELECT id FROM provider_profiles WHERE role=? AND selected=1 LIMIT 1", (role,)) or {}).get("id", "")))
+        if not selected:
+            raise HTTPException(409, f"请先为 {role.upper()} 选择一个 Provider")
+        inspection = await inspect_provider(selected, body.validation_mode)
+        if not inspection.get("activation_eligible"):
+            raise _inspection_conflict(inspection)
+    now = utc_now()
+    with DB.transaction() as connection:
+        if selected:
+            connection.execute("UPDATE provider_profiles SET selected=0,active=0 WHERE role=?", (role,))
+            connection.execute("UPDATE provider_profiles SET selected=1,active=? WHERE id=?", (int(enabled), selected["id"]))
+        else:
+            connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (role,))
+        connection.execute("INSERT INTO provider_role_settings(role,enabled,updated_at) VALUES(?,?,?) ON CONFLICT(role) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at", (role, int(enabled), now))
+    invalidate_status_cache()
+    return {"role": role, "enabled": enabled, "selected_provider_id": selected["id"] if selected else None}
+
+
+@api.get("/settings/image-processing")
+def image_processing_setting():
+    row = DB.fetchone("SELECT value_json FROM app_settings WHERE key='image_processing'") or {}
+    return ImageProcessingPolicy.model_validate(json_load(row.get("value_json"), {})).model_dump()
+
+
+@api.put("/settings/image-processing")
+def update_image_processing_setting(body: ImageProcessingPolicy):
+    DB.execute("INSERT INTO app_settings(key,value_json,updated_at) VALUES('image_processing',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (json_dump(body.model_dump()), utc_now()))
+    return body.model_dump()
+
+
 def _provider_candidate(body: ProviderCreate | ProviderInspectionRequest, *, api_key: str | None = None) -> dict[str, Any]:
     return {
         "name": getattr(body, "name", "Provider"),
@@ -488,9 +611,11 @@ def _provider_candidate(body: ProviderCreate | ProviderInspectionRequest, *, api
     }
 
 
-def _persisted_capabilities(kind: str, inspection: dict[str, Any]) -> dict[str, Any]:
+def _persisted_capabilities(kind: str, inspection: dict[str, Any], role: str | None = None) -> dict[str, Any]:
     capabilities = dict(inspection.get("capabilities") or {})
-    if kind == "sandevistan_tts":
+    if role == "vlm" and inspection.get("activation_eligible"):
+        capabilities["vision"] = True
+    if kind in {"sandevistan_audio", "sandevistan_tts"}:
         capabilities["models"] = inspection.get("models") or []
         capabilities["recommended"] = inspection.get("recommended")
     return capabilities
@@ -499,9 +624,17 @@ def _persisted_capabilities(kind: str, inspection: dict[str, Any]) -> dict[str, 
 def _apply_recommendation(candidate: dict[str, Any], inspection: dict[str, Any]) -> None:
     recommended = inspection.get("recommended") or {}
     config = candidate.get("config") or {}
-    if candidate.get("kind") == "sandevistan_tts" and config.get("auto_select") and recommended.get("model"):
-        candidate["model"] = recommended["model"]
-        config["compute_device"] = recommended.get("compute_device")
+    if candidate.get("kind") in {"sandevistan_audio", "sandevistan_tts"}:
+        if config.get("auto_select") and recommended.get("model"):
+            candidate["model"] = recommended["model"]
+            config["compute_device"] = recommended.get("compute_device")
+        asr_recommended = ((inspection.get("capabilities") or {}).get("asr") or {}).get("recommended") or {}
+        if config.get("asr_auto_select", True) and asr_recommended.get("model"):
+            config["asr_auto_select"] = True
+            config["asr_model"] = asr_recommended["model"]
+            config["asr_compute_device"] = asr_recommended.get("compute_device")
+        config.setdefault("asr_allow_device_fallback", True)
+        config.update(inspection.get("resolved_audio_config") or {})
         candidate["config"] = config
 
 
@@ -536,16 +669,19 @@ async def create_provider(body: ProviderCreate):
         if not inspection.get("activation_eligible"):
             raise _inspection_conflict(inspection)
         _apply_recommendation(candidate, inspection)
-    capabilities = _persisted_capabilities(body.kind, inspection) if inspection else body.capabilities
+    capabilities = _persisted_capabilities(body.kind, inspection, body.role) if inspection else body.capabilities
     with DB.transaction() as connection:
         if body.active:
-            connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (body.role,))
+            connection.execute("UPDATE provider_profiles SET active=0,selected=0 WHERE role=?", (body.role,))
         connection.execute(
             """INSERT INTO provider_profiles
-            (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (identifier, body.name, body.role, body.kind, candidate["base_url"], candidate["model"], VAULT.encrypt(body.api_key), json_dump(capabilities), json_dump(candidate["config"]), int(body.active), now, now),
+            (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at,selected)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (identifier, body.name, body.role, body.kind, candidate["base_url"], candidate["model"], VAULT.encrypt(body.api_key), json_dump(capabilities), json_dump(candidate["config"]), int(body.active), now, now, int(body.active)),
         )
+        if body.active:
+            connection.execute("UPDATE provider_role_settings SET enabled=1,updated_at=? WHERE role=?", (now, body.role))
+    invalidate_status_cache()
     return {"id": identifier, "active": body.active, "inspection": inspection}
 
 
@@ -579,7 +715,7 @@ async def update_provider(provider_id: str, body: ProviderUpdate):
         _apply_recommendation(candidate, inspection)
         values["model"] = candidate["model"]
         values["config"] = candidate["config"]
-        values["capabilities"] = _persisted_capabilities(row["kind"], inspection)
+        values["capabilities"] = _persisted_capabilities(row["kind"], inspection, row["role"])
     mapping = {"capabilities": "capabilities_json", "config": "config_json", "api_key": "secret_enc"}
     sets, params = [], []
     for key, value in values.items():
@@ -588,8 +724,12 @@ async def update_provider(provider_id: str, body: ProviderUpdate):
     sets.append("updated_at=?"); params.extend([utc_now(), provider_id])
     with DB.transaction() as connection:
         if values.get("active"):
-            connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (row["role"],))
+            connection.execute("UPDATE provider_profiles SET active=0,selected=0 WHERE role=?", (row["role"],))
+            connection.execute("UPDATE provider_role_settings SET enabled=1,updated_at=? WHERE role=?", (utc_now(), row["role"]))
         connection.execute(f"UPDATE provider_profiles SET {','.join(sets)} WHERE id=?", tuple(params))
+        if values.get("active"):
+            connection.execute("UPDATE provider_profiles SET selected=1 WHERE id=?", (provider_id,))
+    invalidate_status_cache()
     return {"ok": True, "active": target_active}
 
 
@@ -608,9 +748,12 @@ async def probe_provider(provider_id: str):
     if not row:
         raise HTTPException(404, "Provider 不存在")
     try:
-        if row["role"] == "tts":
-            return await probe_tts_provider(provider_id, apply_defaults=True)
-        return await probe_chat_provider(provider_id, apply=True)
+        if row["role"] == "audio":
+            result = await probe_audio_provider(provider_id, apply_defaults=True)
+        else:
+            result = await probe_chat_provider(provider_id, apply=True)
+        invalidate_status_cache()
+        return result
     except Exception as exc:
         raise HTTPException(502, f"Provider 能力探测失败：{exc}") from exc
 

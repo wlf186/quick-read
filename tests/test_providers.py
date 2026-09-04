@@ -1,6 +1,9 @@
 import importlib
 import json
+import sqlite3
+from urllib.parse import parse_qs
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,7 +12,7 @@ from pydantic import ValidationError
 
 from sandevistan_read.database import Database, json_dump, utc_now
 from sandevistan_read import providers
-from sandevistan_read.schemas import ProviderCreate, ProviderUpdate
+from sandevistan_read.schemas import PodcastRequest, ProviderCreate, ProviderUpdate
 
 
 def mock_client(monkeypatch: pytest.MonkeyPatch, handler) -> None:
@@ -37,11 +40,88 @@ def candidate(**overrides):
     return value
 
 
+def audio_capabilities() -> dict:
+    return {
+        "models": [{
+            "id": "qwen3-tts-1.7b",
+            "name": "Qwen3 TTS 1.7B",
+            "installed": True,
+            "devices": [{"id": "gpu", "available": True}, {"id": "cpu", "available": True}],
+        }],
+        "asr": {
+            "default_model": "qwen3-asr-0.6b",
+            "recommended": {"model": "qwen3-asr-0.6b", "compute_device": "gpu"},
+            "models": [{
+                "id": "qwen3-asr-0.6b",
+                "name": "Qwen3 ASR 0.6B",
+                "installed": True,
+                "devices": [
+                    {"id": "gpu", "available": True, "default": True},
+                    {"id": "cpu", "available": True, "default": False},
+                ],
+            }],
+            "diarization": "CAM++",
+            "languages": ["Chinese", "English"],
+            "aligner_languages": ["Chinese", "English"],
+            "timestamp_precisions": ["segment", "word_or_character"],
+        }
+    }
+
+
 def test_provider_role_kind_and_base_url_are_normalized() -> None:
     with pytest.raises(ValidationError, match="MAIN 角色不支持 openai_tts"):
         ProviderCreate(name="Broken", role="main", kind="openai_tts", base_url="https://example.com", model="tts-1")
     assert providers.normalize_provider_base_url("openai", "https://example.com/proxy/v1/") == "https://example.com/proxy"
     assert providers.normalize_provider_base_url("ollama", "http://localhost:11434/api") == "http://localhost:11434"
+    legacy = ProviderCreate(name="Audio", role="tts", kind="sandevistan_tts", base_url="http://localhost:20810")
+    assert (legacy.role, legacy.kind) == ("audio", "sandevistan_audio")
+    with pytest.raises(ValidationError, match="TTS_ONLY 角色不支持 openai_tts"):
+        ProviderCreate(name="Legacy", role="tts", kind="openai_tts", base_url="https://example.com", model="tts-1")
+
+
+def test_audio_host_voice_configuration_rejects_collisions() -> None:
+    with pytest.raises(ValidationError, match="同一个预置音色"):
+        ProviderCreate(
+            name="Audio", role="audio", kind="sandevistan_audio", base_url="http://localhost:20810",
+            config={"host_a": "Vivian", "host_b": "Vivian"},
+        )
+    with pytest.raises(ValidationError, match="同一个声纹人员"):
+        ProviderCreate(
+            name="Audio", role="audio", kind="sandevistan_audio", base_url="http://localhost:20810",
+            config={
+                "host_a_voice_mode": "voiceprint", "host_b_voice_mode": "voiceprint",
+                "host_a_voiceprint_person_id": "person_1", "host_b_voiceprint_person_id": "person_1",
+            },
+        )
+
+
+def test_v5_migrates_audio_and_preserves_tts_only_profiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from sandevistan_read import database as database_module
+
+    path = tmp_path / "legacy-audio.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_versions VALUES (4, 'old');
+            CREATE TABLE provider_profiles (
+                id TEXT PRIMARY KEY,name TEXT NOT NULL,role TEXT NOT NULL,kind TEXT NOT NULL,base_url TEXT NOT NULL,
+                model TEXT NOT NULL,secret_enc TEXT NOT NULL,capabilities_json TEXT NOT NULL,config_json TEXT NOT NULL,
+                active INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            );
+            INSERT INTO provider_profiles VALUES ('audio','Sandevistan Audio','tts','sandevistan_tts','http://localhost:20810','tts','secret','{}','{}',1,'old','old');
+            INSERT INTO provider_profiles VALUES ('cloud','Cloud Voice','tts','openai_tts','https://example.com','tts-1','secret','{}','{}',1,'old','old');
+            """
+        )
+    monkeypatch.setattr(database_module, "PATHS", SimpleNamespace(backups=tmp_path / "backups"))
+    database = Database(path)
+    database._migrate_v5()
+    audio = database.fetchone("SELECT role,kind,active,config_json FROM provider_profiles WHERE id='audio'")
+    cloud = database.fetchone("SELECT role,kind,active,secret_enc FROM provider_profiles WHERE id='cloud'")
+    assert audio and (audio["role"], audio["kind"], audio["active"]) == ("audio", "sandevistan_audio", 1)
+    assert json.loads(audio["config_json"])["asr_auto_select"] is True
+    assert cloud == {"role": "tts_only", "kind": "openai_tts", "active": 0, "secret_enc": "secret"}
+    assert database.fetchone("SELECT MAX(version) AS version FROM schema_versions")["version"] == 5
 
 
 @pytest.mark.asyncio
@@ -245,7 +325,7 @@ async def test_deep_verification_surfaces_upstream_error(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
-async def test_sandevistan_tts_catalog_recommends_installed_gpu_model(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_sandevistan_audio_catalog_recommends_tts_and_asr_models(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/capabilities"
         assert request.headers["authorization"] == "Bearer local-key"
@@ -265,24 +345,123 @@ async def test_sandevistan_tts_catalog_recommends_installed_gpu_model(monkeypatc
                     "preset_speakers": ["Vivian", "Dylan"],
                     "preset_speaker_native_languages": {"Vivian": "zh-CN"},
                     "languages": ["Chinese"],
-                }
+                },
+                "asr": {
+                    "default_model": "qwen3-asr-0.6b",
+                    "models": [{
+                        "id": "qwen3-asr-0.6b", "name": "Qwen3 ASR 0.6B", "installed": True, "default": True,
+                        "compute_devices": [{"id": "gpu", "available": True, "default": True, "precision": "bf16"}],
+                    }],
+                    "diarization": "CAM++", "languages": ["Chinese", "English"],
+                    "aligner_languages": ["Chinese", "English"], "timestamp_precisions": ["segment", "word_or_character"],
+                },
             },
         )
 
     mock_client(monkeypatch, handler)
-    result = await providers.inspect_provider(candidate(role="tts", kind="sandevistan_tts", base_url="http://localhost:20810", model="", api_key="local-key", config={"auto_select": True}))
+    result = await providers.inspect_provider(candidate(role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", model="", api_key="local-key", config={"auto_select": True, "asr_auto_select": True}))
     assert result["activation_eligible"] is True
     assert result["recommended"] == {"model": "voice-1.7b", "compute_device": "gpu"}
     assert result["capabilities"]["voices"][0]["id"] == "Vivian"
+    assert result["capabilities"]["asr"]["recommended"] == {"model": "qwen3-asr-0.6b", "compute_device": "gpu"}
+
+
+@pytest.mark.asyncio
+async def test_audio_catalog_exposes_people_and_locks_latest_voiceprint_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/capabilities":
+            return httpx.Response(200, json={
+                "tts": {
+                    "model_capabilities": [{
+                        "id": "voice-1.7b", "name": "Voice 1.7B", "installed": True,
+                        "voice_modes": ["preset", "voiceprint"],
+                        "compute_devices": [{"id": "cpu", "available": True, "default": True}],
+                        "controls": {"instruction_voice_modes": ["preset"]},
+                    }],
+                    "preset_speakers": ["Vivian", "Dylan"],
+                },
+                "asr": {
+                    "default_model": "asr", "models": [{
+                        "id": "asr", "name": "ASR", "installed": True, "default": True,
+                        "compute_devices": [{"id": "cpu", "available": True, "default": True}],
+                    }],
+                    "diarization": "CAM++", "languages": ["Chinese", "English"],
+                    "aligner_languages": ["Chinese", "English"], "timestamp_precisions": ["segment"],
+                },
+            })
+        if request.url.path == "/api/v1/voiceprints/people":
+            return httpx.Response(200, json={"items": [{
+                "id": "person_1", "name": "Sample Person", "note": "host",
+                "samples": [
+                    {"id": "sample_old", "tts_eligible": True, "language": "Chinese", "duration": 8.0, "created_at": "2026-01-01", "transcript": "private"},
+                    {"id": "sample_new", "tts_eligible": True, "language": "Chinese", "duration": 18.0, "created_at": "2026-02-01", "transcript": "private"},
+                ],
+            }]})
+        raise AssertionError(request.url.path)
+
+    mock_client(monkeypatch, handler)
+    result = await providers.inspect_provider(candidate(
+        role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", model="voice-1.7b",
+        config={
+            "auto_select": False, "compute_device": "cpu", "asr_auto_select": True,
+            "host_a_voice_mode": "voiceprint", "host_a_voiceprint_person_id": "person_1",
+            "host_b": "Dylan",
+        },
+    ))
+    assert result["activation_eligible"] is True
+    person = result["voiceprint_library"]["people"][0]
+    assert person["latest_sample"]["id"] == "sample_new"
+    assert "transcript" not in person["latest_sample"]
+    assert result["resolved_audio_config"]["host_a_voiceprint_sample_id"] == "sample_new"
+
+
+@pytest.mark.asyncio
+async def test_voiceprint_synthesis_uses_sample_and_omits_preset_controls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    submitted: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/api/v1/tts/jobs":
+            submitted.update(parse_qs(request.content.decode()))
+            return httpx.Response(202, json={"id": "tts-job"})
+        if request.method == "GET" and request.url.path == "/api/v1/jobs/tts-job":
+            return httpx.Response(200, json={"state": "succeeded", "result": {"artifacts": [{"name": "voice.wav", "mime_type": "audio/wav"}]}})
+        if request.method == "GET" and request.url.path == "/api/v1/jobs/tts-job/artifacts/voice.wav":
+            return httpx.Response(200, content=b"RIFFaudio", headers={"content-type": "audio/wav"})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        raise AssertionError(f"{request.method} {request.url.path}")
+
+    mock_client(monkeypatch, handler)
+    output = tmp_path / "clone.wav"
+    await providers._synthesize_sandevistan(
+        candidate(role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", config={}),
+        "测试克隆", None, output, language="Chinese", model="voice-1.7b", compute_device="cpu",
+        voice_mode="voiceprint", voiceprint_sample_id="sample_new", instruct="不应发送",
+        idempotency_key="voiceprint-test", cancel_check=None,
+    )
+    assert output.read_bytes() == b"RIFFaudio"
+    assert submitted["voice_mode"] == ["voiceprint"]
+    assert submitted["voiceprint_sample_id"] == ["sample_new"]
+    assert "speaker" not in submitted and "instruct" not in submitted
+
+
+def test_host_instruction_is_stable_and_clone_mode_omits_it() -> None:
+    config = {"host_a_instruct": "自然沉稳", "host_a_voice_mode": "preset"}
+    first = providers.host_voice_instruction(config, "host_a", "zh-CN", supported=True)
+    second = providers.host_voice_instruction(config, "host_a", "zh-CN", supported=True)
+    assert first == second
+    assert "突然兴奋" in str(first)
+    assert providers.host_voice_instruction({**config, "host_a_voice_mode": "voiceprint"}, "host_a", "zh-CN", supported=True) is None
 
 
 @pytest.mark.asyncio
 async def test_local_asr_retries_device_failure_once_on_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    profile = candidate(role="tts", kind="sandevistan_tts", base_url="http://localhost:20810", model="qwen3-tts-1.7b")
+    profile = candidate(role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", model="qwen3-tts-1.7b", capabilities=audio_capabilities(), config={"compute_device": "gpu", "asr_auto_select": True})
     monkeypatch.setattr(providers, "active_provider", lambda role: profile)
     devices: list[str] = []
 
-    async def fake_once(provider, path, *, language, compute_device, idempotency_key, cancel_check):
+    async def fake_once(provider, path, *, language, model, compute_device, idempotency_key, cancel_check):
+        assert model == "qwen3-asr-0.6b"
         devices.append(compute_device)
         if compute_device == "gpu":
             raise providers.ProviderError("CUDA out of memory", code="insufficient_gpu_memory")
@@ -299,11 +478,11 @@ async def test_local_asr_retries_device_failure_once_on_cpu(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_local_asr_does_not_retry_non_device_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    profile = candidate(role="tts", kind="sandevistan_tts", base_url="http://localhost:20810", model="qwen3-tts-1.7b")
+    profile = candidate(role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", model="qwen3-tts-1.7b", capabilities=audio_capabilities(), config={"compute_device": "gpu", "asr_auto_select": True})
     monkeypatch.setattr(providers, "active_provider", lambda role: profile)
     devices: list[str] = []
 
-    async def fake_once(provider, path, *, language, compute_device, idempotency_key, cancel_check):
+    async def fake_once(provider, path, *, language, model, compute_device, idempotency_key, cancel_check):
         devices.append(compute_device)
         raise providers.ProviderError("invalid language", code="validation_error")
 
@@ -316,17 +495,74 @@ async def test_local_asr_does_not_retry_non_device_errors(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_openai_tts_requires_both_host_voices(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_local_asr_uses_manual_model_and_device_without_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile = candidate(
+        role="audio",
+        kind="sandevistan_audio",
+        base_url="http://localhost:20810",
+        model="qwen3-tts-1.7b",
+        capabilities=audio_capabilities(),
+        config={
+            "compute_device": "gpu",
+            "asr_auto_select": False,
+            "asr_model": "qwen3-asr-0.6b",
+            "asr_compute_device": "cpu",
+            "asr_allow_device_fallback": False,
+        },
+    )
+    monkeypatch.setattr(providers, "active_provider", lambda role: profile)
+    executions: list[tuple[str, str]] = []
+
+    async def fake_once(provider, path, *, language, model, compute_device, idempotency_key, cancel_check):
+        executions.append((model, compute_device))
+        return {"text": "ok", "segments": []}
+
+    monkeypatch.setattr(providers, "_transcribe_sandevistan_once", fake_once)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    result = await providers.transcribe_audio(audio, language="Chinese")
+    assert executions == [("qwen3-asr-0.6b", "cpu")]
+    assert result["compute_device"] == "cpu" and result["fallback_used"] is False
+
+
+def test_audio_readiness_requires_asr_acceptance_capabilities() -> None:
+    profile = candidate(
+        role="audio",
+        kind="sandevistan_audio",
+        model="qwen3-tts-1.7b",
+        config={"compute_device": "gpu"},
+        capabilities={"models": audio_capabilities()["models"]},
+    )
+    ready, message = providers.audio_provider_readiness(profile)
+    assert ready is False
+    assert "ASR 模型" in message
+
+
+def test_podcast_is_rejected_before_enqueue_when_audio_is_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("sandevistan_read.app")
+    enqueued: list[str] = []
+    monkeypatch.setattr(app_module, "_require_notebook", lambda notebook_id: None)
+    monkeypatch.setattr(app_module, "active_provider", lambda role: None)
+    monkeypatch.setattr(app_module, "enqueue", lambda *args: enqueued.append("called"))
+    with pytest.raises(HTTPException, match="AUDIO Provider") as captured:
+        app_module.podcast("n1", PodcastRequest(minutes=5))
+    assert captured.value.status_code == 409
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_is_retained_as_ineligible_tts_only_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"id": "tts-1", "owned_by": "vendor"}]})
 
     mock_client(monkeypatch, handler)
-    profile = candidate(role="tts", kind="openai_tts", base_url="https://speech.example.com", model="tts-1")
+    profile = candidate(role="tts_only", kind="openai_tts", base_url="https://speech.example.com", model="tts-1")
     incomplete = await providers.inspect_provider(profile)
     complete = await providers.inspect_provider({**profile, "config": {"host_a": "alloy", "host_b": "nova"}})
     assert incomplete["activation_eligible"] is False
     assert "两位主持人" in incomplete["warning"]
-    assert complete["activation_eligible"] is True
+    assert complete["activation_eligible"] is False
+    assert "不能用于 Podcast" in complete["warning"]
 
 
 @pytest.mark.asyncio

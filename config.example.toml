@@ -10,7 +10,6 @@ access_key = ""
 [runtime]
 max_upload_mib = 512
 minimum_free_mib = 2048
-job_poll_seconds = 0.5
 
 [models]
 embedding = "intfloat/multilingual-e5-small"
@@ -25,4 +24,4 @@ libreoffice = ""
 [development]
 ollama_url = "http://127.0.0.1:11434"
 ollama_model = "qwen3.5:2b"
-tts_url = "http://127.0.0.1:20810"
+audio_url = "http://127.0.0.1:20810"

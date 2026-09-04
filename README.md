@@ -1,6 +1,6 @@
 # Sandevistan-Read
 
-本地部署、资料严格溯源的 NotebookLM 类研究工作台。上传 PDF、EPUB、DOCX、PPTX、TXT、Markdown 或 HTML 后，可获得引用到页码/章节/幻灯片/段落的摘要与问答，并生成双人音频、单选 Quiz 和 Flashcards。
+本地部署、资料严格溯源的 NotebookLM 类研究工作台。上传 PDF、EPUB、DOCX、PPTX、TXT、Markdown、HTML 或 PNG/JPEG/WebP 图片后，可获得引用到页码/章节/幻灯片/段落/原图的摘要与问答，并生成双人音频、单选 Quiz 和 Flashcards。
 
 ## 快速开始
 
@@ -22,22 +22,26 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\start.ps1
 ```
 
-Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署、Ollama/云端 Provider/TTS 配置、更新备份和故障处理详见 [Windows 11 原生部署手册](docs/windows-deployment.md)。
+Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署、Ollama/云端 Provider/AUDIO 配置、更新备份和故障处理详见 [Windows 11 原生部署手册](docs/windows-deployment.md)。
 
 当前部署可在 `runtime/config.toml` 配置为监听 `0.0.0.0:20830`（需访问密钥）；本机浏览器打开 <http://127.0.0.1:20830>。停止服务运行 `scripts/stop.sh` 或 `scripts\stop.ps1`。
 
-首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://127.0.0.1:11434` 的 `qwen3.5:2b`，TTS 是 `http://127.0.0.1:20810`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
+首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://127.0.0.1:11434` 的 `qwen3.5:2b`，AUDIO 服务是 `http://127.0.0.1:20810`。旧配置中的 `development.tts_url` 仍可读取，新配置使用 `development.audio_url`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
 
 ## Provider 配置
+
+设置页按 MAIN、VLM、AUDIO 三种职责分开管理。MAIN 是必需能力；VLM 和 AUDIO 可以临时暂停而不删除当前选择，暂停只影响之后创建的任务。图片处理默认按 `VLM → MAIN → 本地 RapidOCR` 依次兜底，任一步得到结果即停止；可调整参与步骤、全局关闭，或在每次上传确认时临时覆盖。图片策略仅应用于新上传，不会自动重建已有索引。云端 VLM/MAIN 参与视觉处理时，对应原图会发送给所选服务。
 
 设置页按角色限制可选协议：
 
 | 角色 | 支持的 Provider 类型 |
 | --- | --- |
 | MAIN、VLM | Ollama、OpenAI-compatible |
-| TTS | Sandevistan TTS、OpenAI TTS |
+| AUDIO | Sandevistan Audio（TTS + ASR） |
 
-推荐流程是“连接并读取模型 → 选择或手填模型 → 验证并启用”。连接检查会读取服务实时公开的模型、设备和音色清单；若兼容服务不提供清单，可手填模型并执行深度验证。服务地址可直接粘贴带 `/v1`、`/api` 或 `/api/v1` 的常见形式，保存时会规范化为服务根地址。
+推荐流程是“连接并读取模型 → 从完整清单选择模型 → 验证并启用”。模型搜索与当前选中值相互独立，重新展开仍会显示完整清单；仅当兼容服务不提供清单或目标模型未公开时才切换为手动模型 ID。修改地址、Key 或类型后需要重新读取清单；只修改模型或能力参数不会丢失已读取的清单，保存时会重新验证。服务地址可直接粘贴带 `/v1`、`/api` 或 `/api/v1` 的常见形式，保存时会规范化为服务根地址。
+
+AUDIO 配置同时读取 TTS、ASR、设备、预置音色和可用声纹人员；只有 TTS 与 ASR 都满足 Podcast 验收要求时才能启用，深度验证会分别合成两位主持人的短句，再执行一次 TTS→ASR 闭环。主持人可使用不同的预置音色，或从 Audio Intel 声纹库中选择已有且具有可用样本的人员；系统锁定该人员最新的可用样本，不提供手工声纹 ID 或临时上传入口，两位主持人不能选择相同音色或人员。预置音色支持模型公开的基础表达指令，并会在整集追加稳定语速、音高和情绪范围约束；声纹克隆由固定参考样本控制，不发送模型不支持的表达指令。升级前保存的 Sandevistan TTS 会自动迁移为 AUDIO；OpenAI TTS 会保留为停用的 TTS-only 记录，但不能再用于 Podcast。
 
 MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提供时）和最大输出。Ollama 优先采用当前运行实例的 `context_length`，其次采用 Modelfile 的 `num_ctx`，不会把模型理论最大窗口直接当作运行窗口；OpenAI-compatible 服务则读取模型清单或详情中公开的限制。无法探测时使用 4096 tokens 安全回退并显示警告，最大输出默认按有效窗口的 25% 推导且不超过 4096。设置页可人工覆盖上下文窗口和最大输出；人工值优先，但不能超过模型明确报告的理论最大值。也可按 Provider 覆盖 temperature；留空时使用各任务默认值，运行记录会标明实际温度及来源。
 
@@ -45,7 +49,7 @@ MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提�
 
 连接检查不保存配置。深度验证只发送内置的极短测试文本或测试图片，不会发送 Notebook 资料；使用云端模型时仍可能产生少量 API 费用。未通过验证的配置可以保存为未启用状态，启用失败不会替换当前同角色的活跃 Provider。
 
-程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求和响应模型以 `/api/docs` 为准。
+程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；AUDIO catalog 还会返回脱敏的 `voiceprint_library` 和可持久化的 `resolved_audio_config`。角色状态分别通过 `GET /api/provider-roles` 与 `PATCH /api/provider-roles/{role}` 读取和更新，全局图片策略使用 `GET/PUT /api/settings/image-processing`；上传接口可在 multipart `image_policy` 字段中传入单次覆盖。已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求和响应模型以 `/api/docs` 为准。
 
 ## 本地数据边界
 
@@ -60,7 +64,7 @@ MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提�
 - `runtime/models/`：项目内多语言向量模型（安装时下载一次，运行时离线）
 - `runtime/cache/`、`runtime/logs/`、`runtime/tmp/`
 
-卸载时停止服务并删除整个项目目录即可。注意：启用云端 LLM/VLM/TTS Provider 时，问题上下文或页面图片会发送给用户主动配置的服务；除此之外应用不调用外部业务服务。默认绑定 localhost；如果改为局域网地址，必须同时设置 `security.access_key`。
+卸载时停止服务并删除整个项目目录即可。注意：启用云端 MAIN/VLM/AUDIO Provider 时，问题上下文、资料片段、页面图片或 Podcast 文本会发送给用户主动配置的服务。声纹克隆时 quick-read 只读取人员与样本元数据并向该 AUDIO 服务提交所选样本 ID，不上传临时参考音频；声纹原始文件由 Audio Intel 自己管理。除此之外应用不调用外部业务服务。默认绑定 localhost；如果改为局域网地址，必须同时设置 `security.access_key`。
 
 项目内媒体工具位于：
 
@@ -92,7 +96,7 @@ Quiz 按题作答，提交前不会通过产物 API 暴露答案、解释或引�
 
 多样本冻结验收使用 `scripts/evaluate_podcast_suite.py prepare --manifest <runtime-manifest.json> --mode frozen`。它会为每个样本生成新候选、执行 TTS/ASR、按音频 ASR 生成匿名 A/B 包，并按音频 SHA 缓存参考 ASR；开发模式允许在 manifest 中提供已通过门禁的 `candidate_json`，避免因音频或评审问题重复调用 MAIN。`--sample <id>` 可重复指定以只跑 manifest 子集（选样集合参与套件身份哈希），`--tts-model/--tts-device` 同样支持单次覆盖；中断后 resume 会保留已生成的匿名映射，缺失时用不变的 seed 确定性重建。独立评审完成 `scores-template.json` 后，以 `finalize --run-dir <目录> --scores <评分.json>` 解盲并执行六维分数、音频质量及 45k MAIN token 硬门槛。
 
-Sandevistan TTS Provider 可在设置中探测实时能力。自动模式选择已安装的最高质量模型：该模型支持 GPU 时优先 GPU，否则使用同一模型的 CPU；不会为了速度静默降低模型质量。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
+Sandevistan Audio Provider 可在设置中分别配置 TTS 合成、两位主持人的预置/声纹音色与 ASR 验收。TTS 自动模式选择已安装的最高质量模型；ASR 自动模式采用服务推荐的模型与设备，两者分别控制 GPU 失败时是否回退同模型 CPU，不会为了速度静默降低模型质量。脚本提示词限制突发愤怒、高亢和夸张标点，TTS 对支持表达指令的预置音色使用整集固定的稳定约束；声纹模式始终使用配置时解析的固定样本。双说话人分离、时间对齐及 CER/WER 等验收门槛保持固定。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
 
 ## 任务与 Notebook 管理
 

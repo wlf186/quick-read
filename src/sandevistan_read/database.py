@@ -243,6 +243,8 @@ class Database:
         self._migrate_v2()
         self._migrate_v3()
         self._migrate_v4()
+        self._migrate_v5()
+        self._migrate_v6()
         with self.transaction() as connection:
             connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
                 WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
@@ -405,6 +407,114 @@ class Database:
             """)
             connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(4, ?)", (utc_now(),))
 
+    def _migrate_v5(self) -> None:
+        """Promote the co-located speech service to AUDIO while retaining TTS-only profiles."""
+        current = self.fetchone("SELECT MAX(version) AS version FROM schema_versions") or {}
+        if int(current.get("version") or 0) >= 5:
+            return
+        if self.path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = PATHS.backups / f"sandevistan-read.pre-v5.{stamp}.db"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            source = sqlite3.connect(self.path)
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        with self.transaction() as connection:
+            audio_rows = connection.execute(
+                "SELECT id,config_json FROM provider_profiles WHERE role='tts' AND kind='sandevistan_tts'"
+            ).fetchall()
+            for row in audio_rows:
+                config = json_load(row["config_json"], {}) or {}
+                config.setdefault("asr_auto_select", True)
+                config.setdefault("asr_allow_device_fallback", True)
+                connection.execute(
+                    "UPDATE provider_profiles SET role='audio',kind='sandevistan_audio',config_json=?,updated_at=? WHERE id=?",
+                    (json_dump(config), utc_now(), row["id"]),
+                )
+            connection.execute(
+                "UPDATE provider_profiles SET role='tts_only',active=0,updated_at=? WHERE role='tts' AND kind='openai_tts'",
+                (utc_now(),),
+            )
+            connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(5, ?)", (utc_now(),))
+
+    def _migrate_v6(self) -> None:
+        """Separate provider role state and persist image-processing settings/results."""
+        current = self.fetchone("SELECT MAX(version) AS version FROM schema_versions") or {}
+        if int(current.get("version") or 0) >= 6:
+            return
+        if self.path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            backup = PATHS.backups / f"sandevistan-read.pre-v6.{stamp}.db"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            source = sqlite3.connect(self.path)
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        now = utc_now()
+        with self.transaction() as connection:
+            provider_columns = {row[1] for row in connection.execute("PRAGMA table_info(provider_profiles)")}
+            if "selected" not in provider_columns:
+                connection.execute("ALTER TABLE provider_profiles ADD COLUMN selected INTEGER NOT NULL DEFAULT 0")
+            connection.execute("UPDATE provider_profiles SET selected=active")
+            for role in ("main", "vlm", "audio"):
+                rows = connection.execute(
+                    "SELECT id FROM provider_profiles WHERE role=? AND selected=1 ORDER BY updated_at DESC", (role,)
+                ).fetchall()
+                for row in rows[1:]:
+                    connection.execute("UPDATE provider_profiles SET selected=0,active=0 WHERE id=?", (row["id"],))
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS provider_role_settings (
+                    role TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_visuals (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    locator_json TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    status TEXT NOT NULL,
+                    processor TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    attempts_json TEXT NOT NULL DEFAULT '[]',
+                    checksum TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_source_visuals_source ON source_visuals(source_id, ordinal);
+            """)
+            for role in ("main", "vlm", "audio"):
+                active = connection.execute(
+                    "SELECT 1 FROM provider_profiles WHERE role=? AND selected=1 LIMIT 1", (role,)
+                ).fetchone()
+                enabled = 1 if role == "main" or active else 0
+                connection.execute(
+                    "INSERT OR IGNORE INTO provider_role_settings(role,enabled,updated_at) VALUES(?,?,?)",
+                    (role, enabled, now),
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)",
+                ("image_processing", json_dump({"mode": "process", "processors": ["vlm", "main", "ocr"]}), now),
+            )
+            connection.execute("INSERT INTO schema_versions(version, applied_at) VALUES(6, ?)", (now,))
+
     def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
         with self.transaction() as connection:
             connection.execute(sql, parameters)
@@ -418,7 +528,7 @@ class Database:
         with self.connect() as connection:
             return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
 
-    def seed(self, ollama_url: str, ollama_model: str, tts_url: str) -> None:
+    def seed(self, ollama_url: str, ollama_model: str, audio_url: str) -> None:
         now = utc_now()
         with self.transaction() as connection:
             if not connection.execute("SELECT 1 FROM notebooks LIMIT 1").fetchone():
@@ -429,25 +539,26 @@ class Database:
             if not connection.execute("SELECT 1 FROM provider_profiles LIMIT 1").fetchone():
                 connection.executemany(
                     """INSERT INTO provider_profiles
-                    (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,name,role,kind,base_url,model,secret_enc,capabilities_json,config_json,active,created_at,updated_at,selected)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             new_id("provider"), "Local Ollama", "main", "ollama", ollama_url.rstrip("/"),
-                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now,
+                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now, 1,
                         ),
                         (
                             new_id("provider"), "Local Vision", "vlm", "ollama", ollama_url.rstrip("/"),
-                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now,
+                            ollama_model, "", json_dump({"vision": True, "json": True}), "{}", 1, now, now, 1,
                         ),
                         (
-                            new_id("provider"), "Sandevistan Audio", "tts", "sandevistan_tts", tts_url.rstrip("/"),
+                            new_id("provider"), "Sandevistan Audio", "audio", "sandevistan_audio", audio_url.rstrip("/"),
                             "qwen3-tts-0.6b", "", json_dump({"async": True}),
-                            json_dump({"host_a": "Vivian", "host_b": "Dylan", "language": "Chinese", "response_format": "wav", "compute_device": "cpu"}),
-                            1, now, now,
+                            json_dump({"host_a": "Vivian", "host_b": "Dylan", "language": "Chinese", "response_format": "wav", "compute_device": "cpu", "asr_auto_select": True, "asr_allow_device_fallback": True}),
+                            1, now, now, 1,
                         ),
                     ],
                 )
+                connection.execute("UPDATE provider_role_settings SET enabled=1,updated_at=? WHERE role IN ('vlm','audio')", (now,))
 
     def reset_running_jobs(self) -> None:
         now = utc_now()

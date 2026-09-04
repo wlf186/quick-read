@@ -27,7 +27,6 @@ class SecurityConfig:
 class RuntimeConfig:
     max_upload_mib: int = 512
     minimum_free_mib: int = 2048
-    job_poll_seconds: float = 0.5
 
 
 @dataclass
@@ -102,7 +101,7 @@ class ToolConfig:
 class DevelopmentConfig:
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:2b"
-    tts_url: str = "http://127.0.0.1:20810"
+    audio_url: str = "http://127.0.0.1:20810"
 
 
 @dataclass
@@ -139,13 +138,19 @@ def load_config() -> AppConfig:
     if PATHS.config.exists():
         with PATHS.config.open("rb") as handle:
             data = tomllib.load(handle)
+    runtime = dict(_section(data, "runtime"))
+    runtime.pop("job_poll_seconds", None)  # Deprecated in 0.4; retained configs must still load.
+    development = dict(_section(data, "development"))
+    legacy_audio_url = development.pop("tts_url", None)
+    if "audio_url" not in development and legacy_audio_url is not None:
+        development["audio_url"] = legacy_audio_url
     config = AppConfig(
         server=ServerConfig(**_section(data, "server")),
         security=SecurityConfig(**_section(data, "security")),
-        runtime=RuntimeConfig(**_section(data, "runtime")),
+        runtime=RuntimeConfig(**runtime),
         models=ModelConfig(**_section(data, "models")),
         tools=ToolConfig(**_section(data, "tools")),
-        development=DevelopmentConfig(**_section(data, "development")),
+        development=DevelopmentConfig(**development),
     )
     config.validate()
     return config
