@@ -608,6 +608,7 @@ async def test_build_podcast_script_emits_v4_editorial_payload(monkeypatch: pyte
     monkeypatch.setattr(podcast, "build_claim_ledger", lambda values: claims)
     monkeypatch.setattr(podcast, "create_episode_plan", lambda *args: _async_value((plan, False)))
     monkeypatch.setattr(podcast, "podcast_generation_profile", lambda: {"tier": "lite", "model": "test-main", "scene_turns": 4, "recent_turns": 4})
+    monkeypatch.setattr(podcast, "scope_hash", lambda source_ids: "test-scope")
 
     counter = {"value": 0}
 

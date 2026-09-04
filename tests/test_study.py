@@ -9,7 +9,7 @@ from sandevistan_read.database import Database, json_dump
 from sandevistan_read.context_budget import PromptBudget
 from sandevistan_read.providers import BudgetedCompletion, study_generation_profile
 from sandevistan_read.study import generate_study_artifact, validate_flashcard_item, validate_quiz_item
-from sandevistan_read import study
+from sandevistan_read import retrieval, study
 from sandevistan_read import study_sessions
 
 
@@ -94,6 +94,7 @@ async def test_lite_quiz_generation_uses_model_items_without_template_fillers(tm
             (f"ch{index}", "s1", "r1", index, f"光合作用把光能转化为化学能，并由叶绿体产生有机物。过程阶段 {index}。", json_dump({"section": "光合作用"}), "[]", f"h{index}", "now"),
         )
     monkeypatch.setattr(study, "DB", database)
+    monkeypatch.setattr(retrieval, "DB", database)
     monkeypatch.setattr(study, "active_provider", lambda role: {"kind": "ollama", "config": {}, "capabilities": {"model_profile": {"parameter_count": 2_000_000_000}, "token_limits": {"effective_context_tokens": 4096, "max_output_tokens": 1024}}})
     calls = 0
 
@@ -138,6 +139,7 @@ async def test_full_generation_keeps_one_recovery_after_candidate_round_limit(tm
             (f"ch{index}", "s1", "r1", index, f"核心机制证据 {index}，用于验证恢复流程。", f"h{index}"),
         )
     monkeypatch.setattr(study, "DB", database)
+    monkeypatch.setattr(retrieval, "DB", database)
     monkeypatch.setattr(study, "active_provider", lambda role: {"kind": "openai", "model": "full", "config": {"study_generation_tier": "full"}, "capabilities": {"token_limits": {"effective_context_tokens": 32768, "max_output_tokens": 8192}}})
     async def fake_blueprint(*args):
         return ([{"title": "机制", "objective": "理解机制", "difficulty": "medium", "citations": ["S1"]}] * 3, False)

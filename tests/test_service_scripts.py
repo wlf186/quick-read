@@ -14,6 +14,7 @@ import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX service-script lifecycle tests")
 
 
 def available_port() -> int:
