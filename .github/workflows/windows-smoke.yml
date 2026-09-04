@@ -47,7 +47,8 @@ jobs:
 
       - name: Check frontend
         shell: powershell
-        run: corepack pnpm --dir frontend lint
+        working-directory: frontend
+        run: corepack pnpm lint
 
       - name: Start and probe application
         shell: powershell
