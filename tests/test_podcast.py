@@ -19,6 +19,11 @@ def test_duration_modes_are_backward_compatible() -> None:
     assert podcast.target_turn_count(20) == 56
 
 
+def test_question_rule_translates_ratio_into_actionable_counts() -> None:
+    assert podcast._question_count_rule(9) == "问句必须有 2–3 轮（占本 Act 的 20%–35%）"
+    assert podcast._question_count_rule(4) == "问句必须恰好有 1 轮"
+
+
 def test_remaining_duration_budget_carries_short_act_debt_forward() -> None:
     targets = [22, 22, 23, 23]
     first = podcast._remaining_scene_duration_budget("zh-CN", 23.75, 0, 90, targets, 0)
@@ -78,6 +83,9 @@ def test_duration_budget_and_audio_gate_are_language_aware() -> None:
     chinese = podcast._scene_duration_budget("zh-CN", 5, 18, 0)
     assert english["unit"] == "words" and chinese["unit"] == "cjk_equivalent_chars"
     assert chinese["minimum_units"] > english["minimum_units"]
+    assert podcast._content_minutes([{
+        "text": "知" * 225, "speaker": "HOST_A", "dialogue_act": "explain", "claim_ids": ["C1"],
+    }]) == pytest.approx(1 + podcast.TURN_PAUSE_SECONDS / 60)
     assert jobs._actual_duration_check(20, 20 * 60)["passed"] is True
     assert jobs._actual_duration_check(20, 16 * 60)["passed"] is False
 
@@ -580,6 +588,82 @@ async def test_duration_expansion_uses_grounded_replacements_once(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_duration_compression_preserves_questions_and_uses_recovery_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim_texts = [
+        "公开记录让参与者验证交易顺序与一致结果",
+        "时间戳结构把历史条目按可复核顺序连接",
+        "参与者依据共同记录识别并排除冲突交易",
+        "验证过程让不同参与者检查相同历史状态",
+    ]
+    claims = {
+        f"C{index}": {"id": f"C{index}", "text": text, "evidence_ids": [f"E{index}"]}
+        for index, text in enumerate(claim_texts, start=1)
+    }
+    cards = {
+        f"E{index}": {"id": f"E{index}", "content": text}
+        for index, text in enumerate(claim_texts, start=1)
+    }
+    turns = []
+    for index, text in enumerate(claim_texts, start=1):
+        turns.append({
+            "speaker": "HOST_A" if index % 2 else "HOST_B",
+            "text": (text * 20)[:200],
+            "dialogue_act": "explain",
+            "claim_ids": [f"C{index}"],
+            "citation_ids": [f"E{index}"],
+        })
+    question = {
+        "speaker": "HOST_A", "text": "那么共同记录究竟怎样帮助参与者复核？",
+        "dialogue_act": "question", "claim_ids": [], "citation_ids": [],
+    }
+    turns.insert(2, question)
+    chapters = [{"turn_start": 0, "turn_end": 2}, {"turn_start": 3, "turn_end": 4}]
+
+    async def fake_chat(builder, **kwargs):
+        assert kwargs["max_tokens"] == 10_000
+        build = builder(PromptBudget(16_000, 12_000, 4000, 2048, 1.0))
+        replacements = []
+        for item in build.metadata["items"]:
+            source = claims[item["claim_ids"][0]]["text"]
+            text = (source * 20)[: item["safe_minimum_units"]]
+            replacements.append([item["index"], text])
+        return SimpleNamespace(
+            content=json.dumps({"replacements": replacements}, ensure_ascii=False),
+            build=build,
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_chat)
+    state = podcast.EpisodeGenerationState()
+    compressed, report = await podcast._compress_episode_duration(
+        turns, chapters, claims, cards, "zh-CN", 2.0, podcast.ContextUsage(), state
+    )
+    assert report["used"] is True
+    assert report["after_minutes"] <= 2.4
+    assert any(item["actual_units"] < item["requested_maximum_units"] for item in report["unit_results"])
+    assert all(item["minimum_units"] >= item["requested_maximum_units"] * 0.80 - 1 for item in report["unit_results"])
+    assert compressed[2] == question
+    assert state.recovery_kind == "duration_compression"
+
+    with pytest.raises(podcast.PodcastQualityError, match="唯一恢复槽"):
+        await podcast._compress_episode_duration(
+            turns, chapters, claims, cards, "zh-CN", 2.0, podcast.ContextUsage(), state
+        )
+
+
+def test_recovery_reserves_final_episode_audit_without_exceeding_hard_cap() -> None:
+    trace = podcast.ContextUsage(total_token_limit=27_500)
+    podcast._reserve_episode_audit_after_recovery(trace)
+    assert trace.total_token_limit == 35_500
+
+    capped = podcast.ContextUsage(total_token_limit=42_000)
+    podcast._reserve_episode_audit_after_recovery(capped)
+    assert capped.total_token_limit == 45_000
+
+
+@pytest.mark.asyncio
 async def test_build_podcast_script_emits_v4_editorial_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     cards = [
         {"id": "E1", "source_id": "s1", "filename": "source.md", "locator": {"section": "一"}, "content": "公开记录支持验证交易顺序。"},
@@ -638,12 +722,30 @@ async def test_build_podcast_script_emits_v4_editorial_payload(monkeypatch: pyte
     )
     monkeypatch.setattr(podcast, "_audit_episode", lambda *args: _async_value({"passed": True, "scores": {"coherence": 5}, "invalid_boundaries": [], "issues": []}))
     monkeypatch.setattr(podcast, "_quality_metrics_v3", lambda *args: {"passed": True, "estimated_minutes": 5.0})
-    result = await podcast.build_podcast_script("n1", {"source_ids": ["s1"], "minutes": 5, "duration_mode": "fixed"})
+    ready_acts: list[dict] = []
+    result = await podcast.build_podcast_script(
+        "n1", {"source_ids": ["s1"], "minutes": 5, "duration_mode": "fixed"},
+        act_ready=ready_acts.append,
+    )
     assert result["version"] == 4
     assert result["engine"]["strategy"] == "editorial_acts"
     assert result["quality_report"]["passed"] is True
     assert result["chapters"][0]["turn_start"] < result["chapters"][1]["turn_start"]
     assert {citation["id"] for citation in result["citations"]} == {"S1", "S2"}
+    assert [item["start_index"] for item in ready_acts] == [0, 9]
+    assert all(item["language"] == "zh-CN" and item["turns"] for item in ready_acts)
+
+
+def test_podcast_overlap_requires_distinct_remote_main_and_audio_hosts() -> None:
+    assert jobs._podcast_overlap_safe(
+        {"base_url": "https://main.example.com"}, {"base_url": "http://audio.lan:20810"},
+    )
+    assert not jobs._podcast_overlap_safe(
+        {"base_url": "http://127.0.0.1:11434"}, {"base_url": "http://audio.lan:20810"},
+    )
+    assert not jobs._podcast_overlap_safe(
+        {"base_url": "https://shared.example.com:11434/api"}, {"base_url": "https://shared.example.com:20810/audio"},
+    )
 
 
 @pytest.mark.asyncio
@@ -927,7 +1029,7 @@ def _run_quality_gate(turns: list[dict], chapters: list[dict] | None = None) -> 
     return podcast._quality_metrics_v3(
         turns,
         [{"source_id": "s1", "id": "S1"}],
-        5,
+        6,
         30,
         {"passed": True, "scores": {"grounding": 5, "coherence": 5, "depth": 5, "roles": 5, "repetition": 5, "completeness": 5}},
         [],

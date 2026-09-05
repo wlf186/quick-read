@@ -160,10 +160,13 @@ def _fake_tts_provider() -> dict:
     return {
         "name": "saved-tts", "kind": "sandevistan_tts", "model": "saved-tts-1.7b",
         "config": {"compute_device": "gpu", "host_a": "Vivian", "host_b": "Dylan"},
-        "capabilities": {"models": [
-            {"id": "saved-tts-1.7b", "controls": {"instruction_voice_modes": ["preset"]}},
-            {"id": "qwen3-tts-0.6b", "controls": {}},
-        ]},
+        "capabilities": {
+            "models": [
+                {"id": "saved-tts-1.7b", "controls": {"instruction_voice_modes": ["preset"]}},
+                {"id": "qwen3-tts-0.6b", "controls": {}},
+            ],
+            "sequence_jobs": {"supported": True, "contract_version": 1, "max_items": 100, "max_total_chars": 50000},
+        },
     }
 
 
@@ -199,11 +202,14 @@ def _render_candidate(monkeypatch: pytest.MonkeyPatch, captured: list[dict]) -> 
 
 def test_parser_accepts_tts_overrides() -> None:
     args = evaluate_podcast.build_parser().parse_args(["--notebook-id", "n1"])
-    assert args.tts_model is None and args.tts_device is None
+    assert args.tts_model is None and args.tts_device is None and args.tts_mode == "single"
     args = evaluate_podcast.build_parser().parse_args(
-        ["--candidate-json", "c.json", "--render-candidate", "--tts-model", "qwen3-tts-0.6b", "--tts-device", "gpu"]
+        [
+            "--candidate-json", "c.json", "--render-candidate",
+            "--tts-model", "qwen3-tts-0.6b", "--tts-device", "gpu", "--tts-mode", "sequence",
+        ]
     )
-    assert args.tts_model == "qwen3-tts-0.6b" and args.tts_device == "gpu"
+    assert args.tts_model == "qwen3-tts-0.6b" and args.tts_device == "gpu" and args.tts_mode == "sequence"
 
 
 @pytest.mark.asyncio
@@ -232,6 +238,32 @@ async def test_render_candidate_defaults_to_saved_provider(tmp_path: Path, monke
     assert captured[0]["instruct"]
     assert "突然兴奋" in captured[0]["instruct"]
     assert "voice_mode" in captured[0] and captured[0]["voice_mode"] == "preset"
+
+
+@pytest.mark.asyncio
+async def test_render_candidate_uses_sequence_mode_and_records_provider_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict] = []
+    candidate = _render_candidate(monkeypatch, captured)
+
+    async def fake_sequence(items, outputs, **kwargs):
+        captured.append({"items": items, **kwargs})
+        for item_id, output in outputs.items():
+            assert item_id == items[0]["id"]
+            _write_wav(output)
+        kwargs["execution"].update({"generation_batch_size": 2, "oom_fallbacks": []})
+        return outputs
+
+    monkeypatch.setattr(evaluate_podcast, "synthesize_sequence", fake_sequence)
+    result = await evaluate_podcast.render_candidate(
+        candidate, tmp_path, "stamp0001", tts_model="qwen3-tts-0.6b", tts_mode="sequence",
+    )
+
+    assert result["passed"] is True
+    assert captured[0]["items"][0]["speaker"] == "Vivian"
+    assert result["execution"]["sequence_jobs"] == 1
+    assert result["execution"]["generation_batch_sizes"] == [2]
 
 
 @pytest.mark.asyncio

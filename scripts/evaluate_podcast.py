@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import time
 import wave
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from sandevistan_read.config import CONFIG
 from sandevistan_read.jobs import _actual_duration_check, _run_ffmpeg
 from sandevistan_read.paths import PATHS
 from sandevistan_read.podcast import PodcastQualityError, _content_minutes, _repeated_stem_ratio, build_podcast_script
-from sandevistan_read.providers import active_provider, host_voice_instruction, host_voice_selection, synthesize, transcribe_audio
+from sandevistan_read.providers import active_provider, host_voice_instruction, host_voice_selection, synthesize, synthesize_sequence, transcribe_audio
 
 
 def transcript(payload: dict[str, Any]) -> str:
@@ -93,6 +94,7 @@ async def render_candidate(
     *,
     tts_model: str | None = None,
     tts_device: str | None = None,
+    tts_mode: str = "single",
 ) -> dict[str, Any]:
     provider = active_provider("audio")
     if not provider:
@@ -120,7 +122,16 @@ async def render_candidate(
     parts_dir.mkdir(exist_ok=True)
     normalized_dir.mkdir(exist_ok=True)
     turns = candidate.get("turns") or []
-    execution: dict[str, Any] = {"requested_device": device, "compute_device": device, "fallback_used": False, "model": model}
+    if tts_mode not in {"single", "sequence"}:
+        raise ValueError("tts_mode must be single or sequence")
+    sequence_capability = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
+    if tts_mode == "sequence" and not sequence_capability.get("supported"):
+        raise RuntimeError("当前 AUDIO Provider 未声明批量 TTS 能力")
+    execution: dict[str, Any] = {
+        "requested_device": device, "compute_device": device, "fallback_used": False,
+        "model": model, "tts_mode": tts_mode, "single_jobs": 0, "sequence_jobs": 0,
+        "sequence_item_counts": [], "generation_batch_sizes": [], "oom_fallbacks": [],
+    }
 
     async def synthesize_turn(index: int, retry: bool = False) -> None:
         turn = turns[index]
@@ -142,6 +153,55 @@ async def render_candidate(
         )
         if turn_execution.get("fallback_used"):
             execution.update(turn_execution)
+        execution["single_jobs"] += 1
+
+    async def synthesize_indexes(indexes: list[int], retry: bool = False) -> None:
+        if tts_mode == "single":
+            for index in indexes:
+                await synthesize_turn(index, retry=retry)
+            return
+        max_items = max(1, min(100, int(sequence_capability.get("max_items") or 100)))
+        max_chars = max(1, int(sequence_capability.get("max_total_chars") or 100000))
+        for voice_mode in ("preset", "voiceprint"):
+            pending = [index for index in indexes if voices[turns[index]["speaker"]]["mode"] == voice_mode]
+            while pending:
+                batch: list[int] = []
+                chars = 0
+                while pending and len(batch) < max_items:
+                    length = len(str(turns[pending[0]]["text"]))
+                    if batch and chars + length > max_chars:
+                        break
+                    batch.append(pending.pop(0))
+                    chars += length
+                items: list[dict[str, Any]] = []
+                outputs: dict[str, Path] = {}
+                for index in batch:
+                    turn = turns[index]
+                    selection = voices[turn["speaker"]]
+                    item_id = f"turn-{index:04d}"
+                    items.append({
+                        "id": item_id, "text": turn["text"], "speaker": selection.get("speaker"),
+                        "voiceprint_sample_id": selection.get("sample_id"),
+                        "instruct": instructions[turn["speaker"]],
+                    })
+                    outputs[item_id] = parts_dir / f"{index:04d}.wav"
+                batch_execution: dict[str, Any] = {}
+                digest = hashlib.sha256(
+                    "".join(str(turns[index]["text"]) for index in batch).encode()
+                ).hexdigest()[:24]
+                await synthesize_sequence(
+                    items, outputs,
+                    language="English" if language == "en" else "Chinese",
+                    model=model, compute_device=device, voice_mode=voice_mode,
+                    idempotency_key=f"sread-eval-seq-{stamp[:18]}-{digest}{'-r1' if retry else ''}",
+                    execution=batch_execution, provider=provider,
+                )
+                execution["sequence_jobs"] += 1
+                execution["sequence_item_counts"].append(len(batch))
+                execution["generation_batch_sizes"].append(int(batch_execution.get("generation_batch_size") or 1))
+                execution["oom_fallbacks"].extend(batch_execution.get("oom_fallbacks") or [])
+                if batch_execution.get("fallback_used"):
+                    execution.update(batch_execution)
 
     async def render(force_indexes: set[int] | None = None) -> tuple[Path, float]:
         force_indexes = force_indexes or set()
@@ -178,9 +238,10 @@ async def render_candidate(
             raise RuntimeError(f"FFmpeg 音频合并失败: {stderr[-500:]}")
         return destination, cursor
 
-    for index in range(len(turns)):
-        if not (parts_dir / f"{index:04d}.wav").is_file():
-            await synthesize_turn(index)
+    synthesis_started = time.perf_counter()
+    missing = [index for index in range(len(turns)) if not (parts_dir / f"{index:04d}.wav").is_file()]
+    await synthesize_indexes(missing)
+    execution["tts_seconds"] = round(time.perf_counter() - synthesis_started, 3)
     destination, seconds = await render()
     duration = _actual_duration_check(float(candidate["duration"]["target_minutes"]), seconds)
     if not duration["passed"]:
@@ -193,8 +254,9 @@ async def render_candidate(
     quality = assess_transcription(turns, asr, language)
     retry_indexes = repair_turn_indexes(quality)
     if retry_indexes and len(retry_indexes) <= 6:
-        for index in retry_indexes:
-            await synthesize_turn(index, retry=True)
+        repair_started = time.perf_counter()
+        await synthesize_indexes(retry_indexes, retry=True)
+        execution["tts_seconds"] = round(execution["tts_seconds"] + time.perf_counter() - repair_started, 3)
         destination, seconds = await render(set(retry_indexes))
         duration = _actual_duration_check(float(candidate["duration"]["target_minutes"]), seconds)
         if not duration["passed"]:
@@ -249,7 +311,8 @@ async def run(args: argparse.Namespace) -> tuple[Path, bool]:
     if args.render_candidate:
         try:
             audio_quality = await render_candidate(
-                candidate, output, stamp, tts_model=args.tts_model, tts_device=args.tts_device
+                candidate, output, stamp, tts_model=args.tts_model, tts_device=args.tts_device,
+                tts_mode=args.tts_mode,
             )
         except Exception as exc:
             audio_quality = {"passed": False, "stage": "render", "error": f"{type(exc).__name__}: {exc}"}
@@ -299,6 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-json", help="复用已通过门禁的候选 JSON，跳过 MAIN 生成")
     parser.add_argument("--tts-model", help="仅本次渲染覆盖 TTS 模型（如 qwen3-tts-0.6b），不修改已保存的 Provider")
     parser.add_argument("--tts-device", help="仅本次渲染覆盖 TTS 设备（gpu/cpu），不修改已保存的 Provider")
+    parser.add_argument("--tts-mode", choices=("single", "sequence"), default="single", help="逐轮或批量渲染")
     return parser
 
 

@@ -215,7 +215,7 @@ export default function App(){
         {studio}
       </div>
     </section>}
-    <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.0</span></footer>
+    <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.1</span></footer>
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
     {settings?<SettingsDrawer status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}

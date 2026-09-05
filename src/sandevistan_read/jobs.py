@@ -5,14 +5,16 @@ import hashlib
 import json
 import re
 import shutil
+import time
 import wave
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .config import CONFIG
 from .paths import PATHS
-from .providers import ProviderError, active_provider, audio_provider_readiness, host_voice_instruction, host_voice_selection, provider_by_id, study_generation_profile, synthesize, transcribe_audio
+from .providers import ProviderError, active_provider, audio_provider_readiness, host_voice_instruction, host_voice_selection, provider_by_id, study_generation_profile, synthesize, synthesize_sequence, transcribe_audio
 from .audio_quality import assess_transcription, repair_turn_indexes
 from .podcast import PODCAST_DURATION_CALIBRATION_VERSION, PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script
 from .services import ingest_source, make_summary
@@ -107,7 +109,19 @@ def _actual_duration_check(target_minutes: float, actual_seconds: float) -> dict
     }
 
 
+def _podcast_overlap_safe(main_provider: dict[str, Any], audio_provider: dict[str, Any]) -> bool:
+    """Avoid resource contention when MAIN is local or shares the AUDIO service host."""
+    main = urlsplit(str(main_provider.get("base_url") or ""))
+    audio = urlsplit(str(audio_provider.get("base_url") or ""))
+    main_host = (main.hostname or "").lower()
+    audio_host = (audio.hostname or "").lower()
+    if main_host in {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return False
+    return main_host != audio_host
+
+
 async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
+    podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
     provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
     ready, readiness_message = audio_provider_readiness(provider)
@@ -156,19 +170,180 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         temporary.replace(manifest_path)
 
     manifest = json_load(manifest_path.read_text(encoding="utf-8"), {}) if manifest_path.exists() else {}
+    selected_model_early = str(provider.get("model") or "")
+    selected_device_early = str(config.get("compute_device") or "gpu")
+    model_caps_early = next(
+        (item for item in provider.get("capabilities", {}).get("models", []) if item.get("id") == selected_model_early), {}
+    )
+    checkpoint_revisions_early = {
+        str(item.get("variant") or ""): str(item.get("revision") or "")
+        for item in model_caps_early.get("checkpoints") or [] if isinstance(item, dict)
+    }
+    sequence_capability_early = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
+    overlap_enabled = bool(
+        config.get("podcast_sequence_tts", True)
+        and sequence_capability_early.get("supported")
+        and int(sequence_capability_early.get("contract_version") or 0) == 1
+        and _podcast_overlap_safe(main_provider, provider)
+        and not manifest.get("generated")
+    )
+    parts_dir_early = work_dir / "parts"
+    parts_dir_early.mkdir(parents=True, exist_ok=True)
+    cancel_check_early = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
+    speculative_stats: dict[str, Any] = {
+        "jobs": 0, "turns": 0, "started": None, "finished": None,
+        "indexes": set(), "generation_batch_sizes": [], "oom_fallbacks": [],
+    }
+    speculative_queue: asyncio.Queue[dict[str, Any] | None] | None = asyncio.Queue() if overlap_enabled else None
+    speculative_task: asyncio.Task[None] | None = None
+
+    def speculative_digest(
+        turn: dict[str, Any], language_code: str, voices_value: dict[str, Any], instructions_value: dict[str, Any],
+    ) -> str:
+        selection = voices_value[turn["speaker"]]
+        return hashlib.sha256(json_dump({
+            "contract": 1, "model": selected_model_early,
+            "checkpoint_revisions": checkpoint_revisions_early, "device": selected_device_early,
+            "language": "English" if language_code == "en" else "Chinese", "speaker": turn["speaker"],
+            "voice": selection, "instruction": instructions_value[turn["speaker"]], "text": turn["text"],
+        }).encode()).hexdigest()
+
+    async def consume_speculative_acts() -> None:
+        assert speculative_queue is not None
+        stop_after_batch = False
+        sequence_failed = False
+        while not stop_after_batch:
+            first = await speculative_queue.get()
+            if first is None:
+                break
+            acts = [first]
+            while True:
+                try:
+                    pending = speculative_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if pending is None:
+                    stop_after_batch = True
+                    break
+                acts.append(pending)
+            if sequence_failed:
+                continue
+            language_code = str(acts[0]["language"])
+            voices_value = {
+                "HOST_A": host_voice_selection(config, "host_a", language_code, preset_override=payload.get("host_a")),
+                "HOST_B": host_voice_selection(config, "host_b", language_code, preset_override=payload.get("host_b")),
+            }
+            instruction_modes = (model_caps_early.get("controls") or {}).get("instruction_voice_modes") or []
+            instructions_value = {
+                "HOST_A": host_voice_instruction(config, "host_a", language_code, supported="preset" in instruction_modes),
+                "HOST_B": host_voice_instruction(config, "host_b", language_code, supported="preset" in instruction_modes),
+            }
+            indexed = [
+                (int(act["start_index"]) + offset, turn)
+                for act in acts for offset, turn in enumerate(act["turns"])
+            ]
+            max_items = max(1, min(100, int(sequence_capability_early.get("max_items") or 100)))
+            max_chars = max(1, int(sequence_capability_early.get("max_total_chars") or 100000))
+            for mode in ("preset", "voiceprint"):
+                candidates = [(index, turn) for index, turn in indexed if voices_value[turn["speaker"]]["mode"] == mode]
+                while candidates:
+                    batch: list[tuple[int, dict[str, Any]]] = []
+                    chars = 0
+                    while candidates and len(batch) < max_items:
+                        length = len(str(candidates[0][1]["text"]))
+                        if batch and chars + length > max_chars:
+                            break
+                        value = candidates.pop(0)
+                        batch.append(value)
+                        chars += length
+                    items: list[dict[str, Any]] = []
+                    outputs: dict[str, Path] = {}
+                    digests: dict[int, str] = {}
+                    part_hashes = manifest.setdefault("tts_parts", {})
+                    for index, turn in batch:
+                        digest = speculative_digest(turn, language_code, voices_value, instructions_value)
+                        part = parts_dir_early / f"{index:04d}.wav"
+                        if part_hashes.get(str(index)) == digest and part.exists() and part.stat().st_size >= 128:
+                            continue
+                        selection = voices_value[turn["speaker"]]
+                        item_id = f"turn-{index:04d}"
+                        items.append({
+                            "id": item_id, "text": turn["text"], "speaker": selection.get("speaker"),
+                            "voiceprint_sample_id": selection.get("sample_id"),
+                            "instruct": instructions_value[turn["speaker"]],
+                        })
+                        outputs[item_id] = part
+                        digests[index] = digest
+                    if not items:
+                        continue
+                    if speculative_stats["started"] is None:
+                        speculative_stats["started"] = time.perf_counter()
+                    batch_key = hashlib.sha256("".join(digests.values()).encode()).hexdigest()[:24]
+                    try:
+                        execution: dict[str, Any] = {}
+                        await synthesize_sequence(
+                            items, outputs, language="English" if language_code == "en" else "Chinese",
+                            cancel_check=cancel_check_early, model=selected_model_early,
+                            compute_device=selected_device_early, voice_mode=mode,
+                            idempotency_key=f"sread-spec-{suffix[:18]}-{batch_key}", provider=provider,
+                            execution=execution,
+                        )
+                    except Exception as exc:
+                        speculative_stats["failure"] = str(exc)[:300]
+                        sequence_failed = True
+                        break
+                    speculative_stats["jobs"] += 1
+                    speculative_stats["turns"] += len(items)
+                    speculative_stats["indexes"].update(digests)
+                    speculative_stats["generation_batch_sizes"].append(
+                        int(execution.get("generation_batch_size") or 1)
+                    )
+                    speculative_stats["oom_fallbacks"].extend(execution.get("oom_fallbacks") or [])
+                    speculative_stats["finished"] = time.perf_counter()
+                    for index, digest in digests.items():
+                        part_hashes[str(index)] = digest
+                    save_manifest(manifest)
+
+    def on_act_ready(value: dict[str, Any]) -> None:
+        if speculative_queue is not None:
+            speculative_queue.put_nowait(value)
+
+    if speculative_queue is not None:
+        speculative_task = asyncio.create_task(consume_speculative_acts())
+    script_started = time.perf_counter()
     if manifest.get("signature") == signature and manifest.get("generated"):
         generated = manifest["generated"]
+        script_finished = time.perf_counter()
     else:
         def report(stage: str, progress: float) -> None:
             Reporter(job_id).update("script", stage, progress, current=progress, total=1, unit="阶段")
 
         try:
-            generated = await build_podcast_script(notebook_id, payload, progress=report)
+            generated = await build_podcast_script(
+                notebook_id, payload, progress=report, act_ready=on_act_ready if overlap_enabled else None,
+            )
+            script_finished = time.perf_counter()
         except PodcastQualityError as exc:
+            if speculative_task:
+                speculative_task.cancel()
+                await asyncio.gather(speculative_task, return_exceptions=True)
             save_manifest({"version": PODCAST_ENGINE_VERSION, "signature": signature, "quality_failure": exc.report})
             raise RuntimeError(f"播客脚本未通过质量门槛：{exc}") from exc
-        manifest = {"version": PODCAST_ENGINE_VERSION, "signature": signature, "generated": generated}
+        except Exception:
+            if speculative_task:
+                speculative_task.cancel()
+                await asyncio.gather(speculative_task, return_exceptions=True)
+            raise
+        if speculative_queue is not None:
+            speculative_queue.put_nowait(None)
+        if speculative_task:
+            await speculative_task
+        manifest = {
+            "version": PODCAST_ENGINE_VERSION, "signature": signature, "generated": generated,
+            "tts_parts": manifest.get("tts_parts") or {},
+        }
         save_manifest(manifest)
+    script_seconds = script_finished - script_started
 
     language = generated["language"]
     voices = {
@@ -188,26 +363,59 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     parts: list[Path] = []
     cancel_check = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
     turns = generated["turns"]
-    tts_execution: dict[str, Any] = {"requested_device": selected_device, "compute_device": selected_device, "fallback_used": False}
+    sequence_capability = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
+    sequence_enabled = bool(
+        config.get("podcast_sequence_tts", True)
+        and sequence_capability.get("supported")
+        and int(sequence_capability.get("contract_version") or 0) == 1
+    )
+    max_sequence_items = max(1, min(100, int(sequence_capability.get("max_items") or 100)))
+    max_sequence_chars = max(1, int(sequence_capability.get("max_total_chars") or 100000))
+    part_hashes = manifest.setdefault("tts_parts", {})
+    tts_execution: dict[str, Any] = {
+        "requested_device": selected_device, "compute_device": selected_device, "fallback_used": False,
+        "sequence_supported": bool(sequence_capability.get("supported")), "sequence_enabled": sequence_enabled,
+        "sequence_jobs": 0, "single_jobs": 0, "batch_sizes": [], "reused_turns": 0,
+        "generation_batch_sizes": [], "oom_fallbacks": [],
+        "speculative_jobs": speculative_stats["jobs"], "speculative_turns": speculative_stats["turns"],
+        "speculative_generation_batch_sizes": speculative_stats["generation_batch_sizes"],
+        "speculative_oom_fallbacks": speculative_stats["oom_fallbacks"],
+    }
+
+    checkpoint_revisions = {
+        str(item.get("variant") or ""): str(item.get("revision") or "")
+        for item in model_caps.get("checkpoints") or [] if isinstance(item, dict)
+    }
+
+    def turn_digest(index: int) -> str:
+        turn = turns[index]
+        selection = voices[turn["speaker"]]
+        return hashlib.sha256(json_dump({
+            "contract": 1,
+            "model": selected_model,
+            "checkpoint_revisions": checkpoint_revisions,
+            "device": selected_device,
+            "language": "English" if language == "en" else "Chinese",
+            "speaker": turn["speaker"],
+            "voice": selection,
+            "instruction": instructions[turn["speaker"]],
+            "text": turn["text"],
+        }).encode()).hexdigest()
+
+    def reusable_part(index: int, digest: str) -> bool:
+        part = parts_dir / f"{index:04d}.wav"
+        return part_hashes.get(str(index)) == digest and part.exists() and part.stat().st_size >= 128
 
     async def synthesize_turn(index: int, *, retry: bool = False) -> Path:
         turn = turns[index]
         if cancel_check():
             raise RuntimeError("任务已取消")
         part = parts_dir / f"{index:04d}.wav"
-        if retry or not part.exists() or part.stat().st_size < 128:
+        digest = turn_digest(index)
+        if retry or not reusable_part(index, digest):
             Reporter(job_id).update("tts", f"高质量语音合成 {index + 1}/{len(turns)}", 0.40 + 0.50 * index / max(1, len(turns)), current=index + 1, total=len(turns), unit="段")
             selection = voices[turn["speaker"]]
             instruction = instructions[turn["speaker"]]
-            digest = hashlib.sha256(
-                json_dump({
-                    "model": selected_model,
-                    "device": selected_device,
-                    "voice": selection,
-                    "instruction": instruction,
-                    "text": turn["text"],
-                }).encode()
-            ).hexdigest()[:20]
             execution: dict[str, Any] = {}
             await synthesize(
                 turn["text"],
@@ -220,16 +428,106 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
                 voice_mode=selection["mode"],
                 voiceprint_sample_id=selection.get("sample_id"),
                 instruct=instruction,
-                idempotency_key=f"sread-{suffix[:24]}-{index:04d}-{digest}{'-r1' if retry else ''}",
+                idempotency_key=f"sread-{suffix[:18]}-{index:04d}-{digest[:20]}{'-r1' if retry else ''}",
                 execution=execution,
+                provider=provider,
             )
+            tts_execution["single_jobs"] += 1
             if execution.get("fallback_used"):
                 tts_execution.update(execution)
+            part_hashes[str(index)] = digest
+            save_manifest(manifest)
+        else:
+            tts_execution["reused_turns"] += 1
         return part
 
-    for index in range(len(turns)):
-        part = await synthesize_turn(index)
-        parts.append(part)
+    def sequence_batches(indexes: list[int]) -> list[list[int]]:
+        batches: list[list[int]] = []
+        for mode in ("preset", "voiceprint"):
+            pending = [index for index in indexes if voices[turns[index]["speaker"]]["mode"] == mode]
+            current: list[int] = []
+            chars = 0
+            for index in pending:
+                length = len(str(turns[index]["text"]))
+                if current and (len(current) >= max_sequence_items or chars + length > max_sequence_chars):
+                    batches.append(current)
+                    current, chars = [], 0
+                current.append(index)
+                chars += length
+            if current:
+                batches.append(current)
+        return batches
+
+    async def synthesize_indexes(indexes: list[int], *, retry: bool = False) -> None:
+        missing: list[int] = []
+        for index in indexes:
+            if retry or not reusable_part(index, turn_digest(index)):
+                missing.append(index)
+            else:
+                tts_execution["reused_turns"] += 1
+        if not missing:
+            return
+        if not sequence_enabled:
+            for index in missing:
+                await synthesize_turn(index, retry=retry)
+            return
+        for batch in sequence_batches(missing):
+            mode = voices[turns[batch[0]]["speaker"]]["mode"]
+            items = []
+            outputs: dict[str, Path] = {}
+            for index in batch:
+                selection = voices[turns[index]["speaker"]]
+                item_id = f"turn-{index:04d}"
+                items.append({
+                    "id": item_id, "text": turns[index]["text"], "speaker": selection.get("speaker"),
+                    "voiceprint_sample_id": selection.get("sample_id"), "instruct": instructions[turns[index]["speaker"]],
+                })
+                outputs[item_id] = parts_dir / f"{index:04d}.wav"
+            Reporter(job_id).update(
+                "tts", f"批量高质量语音合成 {batch[0] + 1}–{batch[-1] + 1}/{len(turns)}",
+                0.40 + 0.50 * batch[0] / max(1, len(turns)), current=batch[-1] + 1, total=len(turns), unit="段",
+            )
+            execution: dict[str, Any] = {}
+            batch_digest = hashlib.sha256("".join(turn_digest(index) for index in batch).encode()).hexdigest()[:24]
+            try:
+                await synthesize_sequence(
+                    items, outputs, language="English" if language == "en" else "Chinese",
+                    cancel_check=cancel_check, model=selected_model, compute_device=selected_device,
+                    voice_mode=mode, idempotency_key=f"sread-seq-{suffix[:18]}-{batch_digest}{'-r1' if retry else ''}",
+                    execution=execution, provider=provider,
+                )
+                tts_execution["sequence_jobs"] += 1
+                tts_execution["batch_sizes"].append(len(batch))
+                tts_execution["generation_batch_sizes"].append(
+                    int(execution.get("generation_batch_size") or 1)
+                )
+                tts_execution["oom_fallbacks"].extend(execution.get("oom_fallbacks") or [])
+                if execution.get("fallback_used"):
+                    tts_execution.update(execution)
+                for index in batch:
+                    part_hashes[str(index)] = turn_digest(index)
+                save_manifest(manifest)
+            except ProviderError as exc:
+                if exc.code == "cancelled" or cancel_check():
+                    raise RuntimeError("任务已取消") from exc
+                tts_execution["sequence_fallback_reason"] = str(exc)[:300]
+                for index in batch:
+                    await synthesize_turn(index, retry=retry)
+
+    speculative_indexes = set(speculative_stats.get("indexes") or set())
+    speculative_reused_turns = sum(
+        reusable_part(index, turn_digest(index))
+        for index in speculative_indexes if 0 <= index < len(turns)
+    )
+    tts_execution["speculative_reused_turns"] = speculative_reused_turns
+    tts_execution["speculative_reuse_ratio"] = round(
+        speculative_reused_turns / max(1, len(speculative_indexes)), 3,
+    ) if speculative_indexes else 0.0
+
+    tts_started = time.perf_counter()
+    await synthesize_indexes(list(range(len(turns))))
+    tts_seconds = time.perf_counter() - tts_started
+    parts.extend(parts_dir / f"{index:04d}.wav" for index in range(len(turns)))
     out_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = CONFIG.tools.ffmpeg_path
 
@@ -320,8 +618,9 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     audio_quality = assess_transcription(turns, asr_result, language)
     retry_indexes = repair_turn_indexes(audio_quality)
     if retry_indexes and len(retry_indexes) <= 6:
-        for index in retry_indexes:
-            await synthesize_turn(index, retry=True)
+        repair_started = time.perf_counter()
+        await synthesize_indexes(retry_indexes, retry=True)
+        tts_seconds += time.perf_counter() - repair_started
         destination, cursor = await render_audio(set(retry_indexes))
         duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
         if not duration_check["passed"]:
@@ -360,6 +659,27 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         },
     }
     generated["audio_quality"] = audio_quality
+    speculative_started = speculative_stats.get("started")
+    speculative_finished = speculative_stats.get("finished")
+    overlap_seconds = (
+        max(0.0, min(script_finished, speculative_finished) - max(script_started, speculative_started))
+        if speculative_started is not None and speculative_finished is not None else 0.0
+    )
+    speculative_seconds = (
+        max(0.0, speculative_finished - speculative_started)
+        if speculative_started is not None and speculative_finished is not None else 0.0
+    )
+    total_seconds = time.perf_counter() - podcast_started
+    serial_estimate_seconds = total_seconds + overlap_seconds
+    generated["performance"] = {
+        "script_seconds": round(script_seconds, 3),
+        "tts_seconds": round(tts_seconds + speculative_seconds, 3),
+        "total_seconds": round(total_seconds, 3),
+        "overlap_enabled": overlap_enabled,
+        "overlap_seconds": round(overlap_seconds, 3),
+        "serial_estimate_seconds": round(serial_estimate_seconds, 3),
+        "overlap_gain_ratio": round(overlap_seconds / max(serial_estimate_seconds, 0.001), 4),
+    }
     generated["quality"]["actual_minutes"] = round(cursor / 60, 2)
     generated["quality"]["actual_duration_ratio"] = duration_check["duration_ratio"]
     manifest["generated"] = generated

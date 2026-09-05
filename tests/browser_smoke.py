@@ -108,6 +108,7 @@ def main() -> None:
                             "models": [{"id": "voice-1.7b", "name": "Voice 1.7B", "installed": True, "voice_modes": ["preset", "voiceprint"], "controls": {"instruction_voice_modes": ["preset"]}, "devices": [{"id": "gpu", "available": True, "precision": "BF16"}]}],
                             "capabilities": {
                                 "voices": [{"id": "Vivian", "native_language": "zh-CN"}, {"id": "Dylan", "native_language": "zh-CN"}],
+                                "sequence_jobs": {"supported": True, "contract_version": 1, "max_items": 100, "max_total_chars": 5000},
                                 "asr": {
                                     "models": [{"id": "qwen3-asr-0.6b", "name": "Qwen3 ASR 0.6B", "installed": True, "devices": [{"id": "gpu", "available": True, "precision": "BF16"}]}],
                                     "recommended": {"model": "qwen3-asr-0.6b", "compute_device": "gpu"},
@@ -121,7 +122,7 @@ def main() -> None:
                                 ],
                             },
                             "resolved_audio_config": {"host_a_voice_mode": "preset", "host_b_voice_mode": "preset", "host_a": "Vivian", "host_b": "Dylan"},
-                            "recommended": {"model": "voice-1.7b", "compute_device": "gpu"},
+                            "recommended": {"model": "voice-1.7b", "compute_device": "gpu", "reason": "service_default"},
                             "warning": None,
                             "error": None,
                         }
@@ -172,6 +173,7 @@ def main() -> None:
         assert "Voice 1.7B" in settings.get_by_role("combobox", name=re.compile("TTS 模型")).inner_text()
         assert "Qwen3 ASR 0.6B" in settings.get_by_role("combobox", name=re.compile("ASR 模型")).inner_text()
         assert settings.get_by_label("ASR 设备").input_value() == "gpu"
+        assert settings.get_by_label("Podcast 使用批量合成与安全并行加速").is_checked()
         host_a_voice = settings.get_by_role("region", name="Host A 音色")
         host_b_voice = settings.get_by_role("region", name="Host B 音色")
         host_a_voice.get_by_role("button", name="声纹克隆").click()

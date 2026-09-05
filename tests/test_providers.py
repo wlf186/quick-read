@@ -68,6 +68,117 @@ def audio_capabilities() -> dict:
     }
 
 
+def test_audio_capability_uses_only_qualified_service_default_and_normalizes_sequence(monkeypatch) -> None:
+    monkeypatch.setattr(
+        providers,
+        "PODCAST_TTS_QUALIFIED_TARGETS",
+        {"qwen3-tts-0.6b": {
+            "checkpoints": providers.PODCAST_TTS_CANDIDATE_REVISIONS["qwen3-tts-0.6b"],
+            "devices": ["gpu"],
+        }},
+    )
+    payload = {
+        "tts": {
+            "default_model": "qwen3-tts-0.6b",
+            "model_capabilities": [{
+                "id": "qwen3-tts-0.6b", "installed": True, "default": True,
+                "compute_devices": [{"id": "gpu", "available": True}],
+                "checkpoints": [
+                    {"variant": variant, "revision": revision}
+                    for variant, revision in providers.PODCAST_TTS_CANDIDATE_REVISIONS["qwen3-tts-0.6b"].items()
+                ],
+            }],
+            "sequence_jobs": {
+                "supported": True, "contract_version": 1, "endpoint": "/api/v1/tts/sequence-jobs",
+                "voice_modes": ["preset", "voiceprint"], "artifact_mode": "per_item", "format": "wav",
+                "max_items": 100, "max_total_chars": 5000,
+            },
+        }
+    }
+    result = providers._normalized_audio_capabilities(payload)
+    assert result["recommended"] == {
+        "model": "qwen3-tts-0.6b", "compute_device": "gpu", "reason": "service_default",
+    }
+    assert result["sequence_jobs"]["supported"] is True
+    payload["tts"]["model_capabilities"][0]["checkpoints"][0]["revision"] = "changed"
+    assert providers._normalized_audio_capabilities(payload)["recommended"] is None
+
+
+def test_qualified_gpu_default_does_not_authorize_cpu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        providers,
+        "PODCAST_TTS_QUALIFIED_TARGETS",
+        {"qwen3-tts-0.6b": {
+            "checkpoints": providers.PODCAST_TTS_CANDIDATE_REVISIONS["qwen3-tts-0.6b"],
+            "devices": ["gpu"],
+        }},
+    )
+    checkpoints = [
+        {"variant": variant, "revision": revision}
+        for variant, revision in providers.PODCAST_TTS_CANDIDATE_REVISIONS["qwen3-tts-0.6b"].items()
+    ]
+    payload = {"tts": {
+        "default_model": "qwen3-tts-0.6b",
+        "model_capabilities": [
+            {
+                "id": "qwen3-tts-0.6b", "installed": True, "default": True,
+                "compute_devices": [{"id": "cpu", "available": True}], "checkpoints": checkpoints,
+            },
+            {
+                "id": "qwen3-tts-1.7b", "installed": True,
+                "compute_devices": [{"id": "cpu", "available": True}], "checkpoints": [],
+            },
+        ],
+    }}
+    assert providers._normalized_audio_capabilities(payload)["recommended"] == {
+        "model": "qwen3-tts-1.7b", "compute_device": "cpu", "reason": "installed_fallback",
+    }
+
+
+def test_unqualified_service_default_does_not_replace_higher_quality_model() -> None:
+    payload = {
+        "tts": {
+            "default_model": "qwen3-tts-0.6b",
+            "model_capabilities": [
+                {
+                    "id": "qwen3-tts-0.6b", "name": "Qwen3 TTS 0.6B", "installed": True,
+                    "default": True, "compute_devices": [{"id": "gpu", "available": True}],
+                    "checkpoints": [],
+                },
+                {
+                    "id": "qwen3-tts-1.7b", "name": "Qwen3 TTS 1.7B", "installed": True,
+                    "compute_devices": [{"id": "cpu", "available": True}],
+                    "checkpoints": [],
+                },
+            ],
+        }
+    }
+
+    assert providers._normalized_audio_capabilities(payload)["recommended"] == {
+        "model": "qwen3-tts-1.7b", "compute_device": "cpu", "reason": "installed_fallback",
+    }
+
+
+def test_tts_auto_selection_preserves_user_authored_preset_instructions() -> None:
+    normalized = {
+        "models": [
+            {"id": "fast", "installed": True, "devices": [{"id": "gpu", "available": True}], "controls": {}},
+            {
+                "id": "expressive-1.7b", "name": "Expressive 1.7B", "installed": True,
+                "devices": [{"id": "gpu", "available": True}],
+                "controls": {"instruction_voice_modes": ["preset"]},
+            },
+        ]
+    }
+    result = providers._instruction_safe_tts_recommendation(
+        normalized, {"host_a_instruct": "我自己的稳定表达规范"},
+        {"model": "fast", "compute_device": "gpu", "reason": "service_default"},
+    )
+    assert result == {
+        "model": "expressive-1.7b", "compute_device": "gpu", "reason": "preserve_custom_instructions",
+    }
+
+
 def test_provider_role_kind_and_base_url_are_normalized() -> None:
     with pytest.raises(ValidationError, match="MAIN 角色不支持 openai_tts"):
         ProviderCreate(name="Broken", role="main", kind="openai_tts", base_url="https://example.com", model="tts-1")
@@ -361,7 +472,7 @@ async def test_sandevistan_audio_catalog_recommends_tts_and_asr_models(monkeypat
     mock_client(monkeypatch, handler)
     result = await providers.inspect_provider(candidate(role="audio", kind="sandevistan_audio", base_url="http://localhost:20810", model="", api_key="local-key", config={"auto_select": True, "asr_auto_select": True}))
     assert result["activation_eligible"] is True
-    assert result["recommended"] == {"model": "voice-1.7b", "compute_device": "gpu"}
+    assert result["recommended"] == {"model": "voice-1.7b", "compute_device": "gpu", "reason": "installed_fallback"}
     assert result["capabilities"]["voices"][0]["id"] == "Vivian"
     assert result["capabilities"]["asr"]["recommended"] == {"model": "qwen3-asr-0.6b", "compute_device": "gpu"}
 
@@ -536,6 +647,65 @@ def test_audio_readiness_requires_asr_acceptance_capabilities() -> None:
     ready, message = providers.audio_provider_readiness(profile)
     assert ready is False
     assert "ASR 模型" in message
+
+
+@pytest.mark.asyncio
+async def test_sequence_synthesis_preserves_item_mapping_and_downloads_each_wav(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    submitted: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/api/v1/tts/sequence-jobs":
+            submitted.update(json.loads(request.content))
+            return httpx.Response(202, json={"id": "sequence-job"})
+        if request.method == "GET" and request.url.path == "/api/v1/jobs/sequence-job":
+            return httpx.Response(200, json={
+                "state": "succeeded", "result": {
+                    "sequence": {"items": [
+                        {"id": "turn-0000", "artifact_name": "item-0000.wav"},
+                        {"id": "turn-0001", "artifact_name": "item-0001.wav"},
+                    ]},
+                    "acceleration": {
+                        "active": True,
+                        "stage_batch_sizes": {"generation": 2, "decoder": 1},
+                        "oom_fallbacks": [{"stage": "generation", "from": 4, "to": 2}],
+                    },
+                },
+            })
+        if request.method == "GET" and request.url.path.startswith("/api/v1/jobs/sequence-job/artifacts/"):
+            return httpx.Response(200, content=b"RIFFsequence", headers={"content-type": "audio/wav"})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        raise AssertionError((request.method, request.url.path))
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(
+        role="audio", kind="sandevistan_audio", base_url="http://localhost:20810",
+        model="qwen3-tts-0.6b", config={"compute_device": "gpu", "podcast_sequence_tts": True},
+        capabilities={"sequence_jobs": {"supported": True, "contract_version": 1}},
+    )
+    outputs = {"turn-0000": tmp_path / "0.wav", "turn-0001": tmp_path / "1.wav"}
+    execution: dict = {}
+    result = await providers.synthesize_sequence(
+        [
+            {"id": "turn-0000", "text": "第一句", "speaker": "Vivian"},
+            {"id": "turn-0001", "text": "第二句", "speaker": "Dylan"},
+        ],
+        outputs,
+        provider=profile,
+        model="qwen3-tts-0.6b",
+        compute_device="gpu",
+        voice_mode="preset",
+        idempotency_key="sequence-test-key",
+        execution=execution,
+    )
+    assert submitted["items"][1]["speaker"] == "Dylan"
+    assert "response_format" not in submitted
+    assert list(result) == ["turn-0000", "turn-0001"]
+    assert all(path.read_bytes().startswith(b"RIFF") for path in outputs.values())
+    assert execution["generation_batch_size"] == 2
+    assert execution["oom_fallbacks"] == [{"stage": "generation", "from": 4, "to": 2}]
 
 
 def test_podcast_is_rejected_before_enqueue_when_audio_is_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:

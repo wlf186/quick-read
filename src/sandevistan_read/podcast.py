@@ -21,11 +21,12 @@ from .languages import resolve_output_language, text_matches_language
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
 SENTENCE_PATTERN = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n+")
 PODCAST_ENGINE_VERSION = 4
-PODCAST_DURATION_CALIBRATION_VERSION = 3
+PODCAST_DURATION_CALIBRATION_VERSION = 4
 GENERATION_DURATION_TARGET_RATIO = 0.95
-CJK_CHARS_PER_MINUTE = 270
+CJK_CHARS_PER_MINUTE = 225
 LATIN_WORDS_PER_MINUTE = 150
 TURN_PAUSE_SECONDS = 0.45
+EPISODE_AUDIT_RECOVERY_RESERVE_TOKENS = 8000
 MAX_DURATION_EXPANSION_UNITS = {"en": 1350, "zh-CN": 2400}
 NONFACTUAL_ACTS = {"intro", "bridge", "question", "acknowledgement", "outro"}
 FACTUAL_ACTS = {"frame", "explain", "evidence", "example", "challenge", "synthesis"}
@@ -106,6 +107,7 @@ class EpisodeMemory:
 class EpisodeGenerationState:
     continuation_used: bool = False
     duration_expansion_used: bool = False
+    duration_compression_used: bool = False
     empty_response_retry_used: bool = False
 
     @property
@@ -114,6 +116,8 @@ class EpisodeGenerationState:
             return "length_continuation"
         if self.duration_expansion_used:
             return "duration_expansion"
+        if self.duration_compression_used:
+            return "duration_compression"
         return None
 
 
@@ -129,6 +133,12 @@ def _coerce_scene_draft(value: Any) -> SceneDraftResult:
         return value
     turns, issues = value
     return SceneDraftResult(turns, issues)
+
+
+def _reserve_episode_audit_after_recovery(trace: ContextUsage) -> None:
+    """Keep the mandatory final audit reachable after one bounded recovery call."""
+    if trace.total_token_limit is not None:
+        trace.total_token_limit = min(45_000, trace.total_token_limit + EPISODE_AUDIT_RECOVERY_RESERVE_TOKENS)
 
 
 def _segment_prompt_build(
@@ -944,6 +954,14 @@ def _is_question_turn(turn: dict[str, Any]) -> bool:
     return turn.get("dialogue_act") == "question" or str(turn.get("text") or "").rstrip().endswith(("?", "？"))
 
 
+def _question_count_rule(target: int) -> str:
+    minimum = max(1, math.ceil(target * 0.20))
+    maximum = max(minimum, math.floor(target * 0.35))
+    if maximum == minimum:
+        return f"问句必须恰好有 {minimum} 轮"
+    return f"问句必须有 {minimum}–{maximum} 轮（占本 Act 的 20%–35%）"
+
+
 def _only_question_filter_issues(issues: list[str]) -> bool:
     substantive = [issue for issue in issues if not issue.startswith("有效轮次不足")]
     return bool(substantive) and all("问句" in issue for issue in substantive)
@@ -1174,10 +1192,11 @@ async def _draft_scene(
         )
     else:
         duration_rule = ""
+    question_rule = _question_count_rule(target)
     prompt_prefix = f"""你是严格资料内的双人深度播客编剧。{language_rule}。两位主持人都能解释、质疑和综合；本 Act 由 {chapter.get('lead_host') or 'HOST_A'} 主导，但另一位必须贡献实质判断，禁止机械采访和孤立事实罗列。
 {_scene_instruction(scene_kind, language)}
 {_delivery_instruction(language)}
-生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。问句占本 Act 的 20%–35%，不得连续出现超过两个问句；长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
+生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。{question_rule}，不得连续出现超过两个问句；使用 Q act_code 的轮次必须写成自然问句并以问号结尾。长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
 只输出一个 JSON 对象，键名为 turns；turns 的每一项必须是四元素数组，依次为 speaker、act_code、text、claim_ids。speaker 只能为 A/B；act_code 只能为 I/F/B/Q/A/X/E/M/C/S/O；claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。不要输出示例、统计、解释或额外字段。
 剧集记忆：{memory_json}
 当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；本 Act 的内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。
@@ -1737,6 +1756,189 @@ async def _expand_episode_duration(
     return expanded, report
 
 
+def _duration_compression_plan(
+    turns: list[dict[str, Any]],
+    chapters: list[dict[str, Any]],
+    excess_units: int,
+    language: str,
+) -> list[dict[str, Any]]:
+    base_floor = 18 if language == "en" else 35
+    margin = 12 if language == "en" else 24
+    candidates: dict[int, list[dict[str, Any]]] = {index: [] for index in range(len(chapters))}
+    for turn_index, turn in enumerate(turns):
+        if _is_question_turn(turn) or turn.get("dialogue_act") not in FACTUAL_ACTS or not turn.get("claim_ids"):
+            continue
+        current = round(_spoken_unit_count(str(turn.get("text") or ""), language))
+        minimum = max(base_floor, math.ceil(current * 0.45))
+        capacity = current - minimum
+        if capacity < margin:
+            continue
+        chapter_index = next(
+            (
+                index
+                for index, chapter in enumerate(chapters)
+                if int(chapter["turn_start"]) <= turn_index <= int(chapter["turn_end"])
+            ),
+            0,
+        )
+        candidates.setdefault(chapter_index, []).append(
+            {"index": turn_index, "current_units": current, "floor_units": minimum, "capacity": capacity}
+        )
+    for values in candidates.values():
+        values.sort(key=lambda item: (-item["capacity"], item["index"]))
+    ordered: list[dict[str, Any]] = []
+    while any(candidates.values()):
+        for chapter_index in range(len(chapters)):
+            values = candidates.get(chapter_index) or []
+            if values:
+                ordered.append(values.pop(0))
+    target_reduction = math.ceil(excess_units * 1.05)
+    selected: list[dict[str, Any]] = []
+    capacity = 0
+    for item in ordered:
+        selected.append(item)
+        capacity += item["capacity"]
+        if capacity >= target_reduction:
+            break
+    if capacity < target_reduction:
+        return []
+    remaining = target_reduction
+    for position, item in enumerate(selected):
+        slots_left = len(selected) - position
+        reduction = min(item["capacity"], max(1, math.ceil(remaining / slots_left)))
+        maximum = item["current_units"] - reduction
+        item["maximum_units"] = maximum
+        item["minimum_units"] = max(item["floor_units"], maximum - margin)
+        item["safe_minimum_units"] = max(base_floor, math.floor(maximum * 0.80))
+        remaining -= reduction
+    return selected
+
+
+async def _compress_episode_duration(
+    turns: list[dict[str, Any]],
+    chapters: list[dict[str, Any]],
+    claims_by_id: dict[str, dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    language: str,
+    target_minutes: float,
+    trace: ContextUsage,
+    generation_state: EpisodeGenerationState,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    before_minutes = _content_minutes(turns)
+    target_budget = _scene_duration_budget(language, target_minutes, len(turns), 0)
+    actual_units = round(sum(_spoken_unit_count(turn["text"], language) for turn in turns))
+    excess_units = max(0, actual_units - int(target_budget["maximum_units"]))
+    report: dict[str, Any] = {
+        "used": False,
+        "before_minutes": round(before_minutes, 3),
+        "target_minutes": round(target_minutes, 3),
+        "excess_units": excess_units,
+    }
+    if before_minutes <= target_minutes * 1.20 or excess_units <= 0:
+        return turns, report
+    if generation_state.recovery_kind is not None:
+        raise PodcastQualityError(
+            "整集口播超长且唯一恢复槽已使用",
+            {"passed": False, "stage": "duration_compression", **report, "recovery_kind": generation_state.recovery_kind},
+        )
+    plan = _duration_compression_plan(turns, chapters, excess_units, language)
+    if not plan:
+        raise PodcastQualityError(
+            "没有足够的受支持轮次可用于口播压缩",
+            {"passed": False, "stage": "duration_compression", **report},
+        )
+    generation_state.duration_compression_used = True
+    items = []
+    for item in plan:
+        turn = turns[item["index"]]
+        claim_ids = [value for value in turn["claim_ids"] if value in claims_by_id]
+        items.append({
+            **item,
+            "speaker": turn["speaker"],
+            "dialogue_act": turn["dialogue_act"],
+            "text": turn["text"],
+            "claim_ids": claim_ids,
+            "claims": [claims_by_id[value]["text"] for value in claim_ids],
+        })
+    language_rule = "Use natural spoken English only." if language == "en" else "只使用自然的简体中文口语。"
+    unit = "words" if language == "en" else "中文等价字符"
+    prompt_prefix = f"""你是资料型双人播客的精简编辑。{language_rule} 只压缩列出的实质轮次，不改变说话人、dialogue act、claim_ids、数字、结论方向或相邻轮次关系。删除重复修饰和绕行表达，保留对应 claims 中的前提、机制、限定与关键含义；不得加入资料外事实、类比、审稿术语、开场白或总结。
+每项必须达到自己的 minimum_units 且不超过 maximum_units，单位为{unit}。所有输入轮次都不是问句，replacement_text 也不得变成问句或以问号结尾。只输出 JSON 对象，键名 replacements；每项是 [原始整数 index, replacement_text]。必须恰好返回全部 index，不输出统计或解释。
+待压缩轮次：
+"""
+    generated = await budgeted_chat(
+        lambda budget: _segment_prompt_build(
+            budget,
+            prefix=prompt_prefix,
+            items=items,
+            renderer=lambda item: json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+        ),
+        json_mode=True,
+        timeout=420,
+        # Reasoning-capable MAIN models may consume most of a 6k allowance before
+        # emitting the compact JSON payload. Compression is a single bounded
+        # recovery call, so reserve the full bounded allowance.
+        max_tokens=10_000,
+        minimum_output_tokens=min(3600, max(700, len(items) * 100)),
+        temperature=0.2,
+        trace=trace,
+        stage="duration_compression",
+    )
+    raw = _extract_array(generated.content, "replacements") or []
+    replacements: dict[int, str] = {}
+    for value in raw:
+        if isinstance(value, list) and len(value) == 2 and str(value[0]).isdigit():
+            replacements[int(value[0])] = _normalize_text(str(value[1] or ""))
+        elif isinstance(value, dict) and str(value.get("index", "")).isdigit():
+            replacements[int(value["index"])] = _normalize_text(str(value.get("text") or ""))
+    planned = {item["index"]: item for item in items}
+    issues: list[str] = []
+    if set(replacements) != set(planned):
+        issues.append("压缩结果没有完整返回计划中的 index")
+    compressed = [dict(turn) for turn in turns]
+    accepted_texts: list[dict[str, Any]] = []
+    unit_results: list[dict[str, int]] = []
+    for index, item in planned.items():
+        text = replacements.get(index, "")
+        units = round(_spoken_unit_count(text, language))
+        unit_results.append({
+            "index": index,
+            "minimum_units": int(item["safe_minimum_units"]),
+            "requested_maximum_units": int(item["maximum_units"]),
+            "original_units": int(item["current_units"]),
+            "actual_units": units,
+        })
+        other_turns = [turn for position, turn in enumerate(compressed) if position != index] + accepted_texts
+        evidence = _claim_evidence_text(item["claim_ids"], claims_by_id, cards_by_id)
+        if not text or not text_matches_language(text, language):
+            issues.append(f"第 {index + 1} 轮压缩语言或正文无效")
+        elif not item["safe_minimum_units"] <= units < item["current_units"]:
+            issues.append(f"第 {index + 1} 轮压缩后长度不在安全范围")
+        elif _is_question_turn({"dialogue_act": item["dialogue_act"], "text": text}):
+            issues.append(f"第 {index + 1} 轮压缩改变了问句属性")
+        elif not _numbers_supported(text, evidence):
+            issues.append(f"第 {index + 1} 轮压缩包含资料不支持的数字")
+        elif any(stem in text.lower() for stem in GENERIC_STEMS) or _is_duplicate(text, other_turns):
+            issues.append(f"第 {index + 1} 轮压缩出现模板或重复")
+        else:
+            compressed[index]["text"] = text
+            accepted_texts.append(compressed[index])
+    after_minutes = _content_minutes(compressed)
+    if not target_minutes * 0.85 <= after_minutes <= target_minutes * 1.20:
+        issues.append("单次压缩后整集口播仍不在发布时长范围")
+    report.update({
+        "used": True,
+        "selected_turns": sorted(planned),
+        "after_minutes": round(after_minutes, 3),
+        "unit_results": unit_results,
+        "finish_reason": getattr(generated, "finish_reason", None),
+        "issues": issues,
+    })
+    if getattr(generated, "finish_reason", None) in {"length", "max_tokens"} or issues:
+        raise PodcastQualityError("整集口播压缩未通过本地验证", {"passed": False, "stage": "duration_compression", **report})
+    return compressed, report
+
+
 def _update_memory(memory: EpisodeMemory, turns: list[dict[str, Any]], chapter: dict[str, Any], recent_limit: int) -> None:
     for turn in turns:
         for claim_id in turn["claim_ids"]:
@@ -1834,7 +2036,14 @@ Act 抽样（保留原始轮次索引）：
             "notes": notes,
         }
     except Exception as exc:
-        return {"passed": False, "scores": {}, "invalid_boundaries": [], "issues": [f"整集审校失败：{type(exc).__name__}"]}
+        detail = str(exc).strip()[:160]
+        suffix = f"（{detail}）" if detail else ""
+        return {
+            "passed": False,
+            "scores": {},
+            "invalid_boundaries": [],
+            "issues": [f"整集审校失败：{type(exc).__name__}{suffix}"],
+        }
 
 
 async def _repair_episode_boundaries(
@@ -2050,6 +2259,7 @@ async def build_podcast_script(
     payload: dict[str, Any],
     *,
     progress: Callable[[str, float], None] | None = None,
+    act_ready: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     ids = source_scope(notebook_id, payload.get("source_ids"))
     if not ids:
@@ -2136,6 +2346,13 @@ async def build_podcast_script(
             })
             raise
         turns.extend(scene_turns)
+        if act_ready:
+            act_ready({
+                "chapter_index": chapter_index,
+                "start_index": start_index,
+                "language": language,
+                "turns": [dict(turn) for turn in scene_turns],
+            })
         scene_audits.append(scene_audit)
         duration_calibration["acts"].append({"chapter_id": chapter["id"], **scene_audit.get("duration", duration_budget)})
         _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
@@ -2175,6 +2392,35 @@ async def build_podcast_script(
             "release_minimum_minutes": round(release_minimum_minutes, 3),
         }
     duration_calibration["expansion"] = expansion_report
+    compression_report: dict[str, Any] = {"used": False}
+    current_episode_minutes = _content_minutes(turns)
+    if current_episode_minutes > target_minutes * 1.20:
+        if progress:
+            progress("压缩整集口播密度", 0.57)
+        try:
+            turns, compression_report = await _compress_episode_duration(
+                turns,
+                chapter_payloads,
+                claims_by_id,
+                cards_by_id,
+                language,
+                float(target_minutes),
+                context_usage,
+                generation_state,
+            )
+        except PodcastQualityError as exc:
+            exc.report.update({
+                "completed_acts": list(duration_calibration["acts"]),
+                "recovery_kind": generation_state.recovery_kind,
+                "context_usage": context_usage.as_dict(),
+            })
+            raise
+    duration_calibration["compression"] = compression_report
+    if generation_state.recovery_kind is not None:
+        # Expansion/compression is deliberately bounded to one call, but its
+        # output must not consume the token allowance reserved for the final
+        # publishability audit. The absolute 45k task ceiling still applies.
+        _reserve_episode_audit_after_recovery(context_usage)
     provisional_used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     provisional_citations = [citation for citation in all_citations if citation["id"] in provisional_used_evidence]
     skipped_audit = {
@@ -2212,6 +2458,7 @@ async def build_podcast_script(
     quality["recovery"] = {
         "continuation_used": generation_state.continuation_used,
         "duration_expansion_used": generation_state.duration_expansion_used,
+        "duration_compression_used": generation_state.duration_compression_used,
         "empty_response_retry_used": generation_state.empty_response_retry_used,
         "recovery_kind": generation_state.recovery_kind,
         "boundary_repair_allowed": False,

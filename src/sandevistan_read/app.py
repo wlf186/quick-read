@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     await WORKER.stop()
 
 
-app = FastAPI(title="Sandevistan-Read", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Sandevistan-Read", version="0.4.1", lifespan=lifespan)
 
 
 def request_token(request: Request, authorization: str | None = None) -> str:
@@ -105,7 +105,7 @@ async def status():
         }
         roles = ("main", "vlm", "audio")
         health_results = await asyncio.gather(*(health(role) for role in roles))
-        value = {"name": "Sandevistan-Read", "version": "0.4.0", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
+        value = {"name": "Sandevistan-Read", "version": "0.4.1", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
         _STATUS_CACHE.update({"at": time.monotonic(), "value": value})
         return value
 

@@ -46,6 +46,24 @@ class ContextOverflowError(ProviderError):
 
 MAX_CATALOG_BYTES = 4 * 1024 * 1024
 TEST_IMAGE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII="
+PODCAST_TTS_CANDIDATE_REVISIONS = {
+    "qwen3-tts-0.6b": {
+        "base": "5d83992436eae1d760afd27aff78a71d676296fc",
+        "custom_voice": "85e237c12c027371202489a0ec509ded67b5e4b5",
+    },
+}
+# A candidate moves here only after the repeatable objective and dual-baseline
+# acoustic gates pass. Human blind listening remains available as an optional
+# confirmation, but is not required for an automated release qualification.
+# Qualification is device-scoped because CPU and GPU inference use different
+# precision paths; an untested device must not inherit another device's result.
+PODCAST_TTS_QUALIFIED_TARGETS: dict[str, dict[str, Any]] = {
+    "qwen3-tts-0.6b": {
+        "checkpoints": PODCAST_TTS_CANDIDATE_REVISIONS["qwen3-tts-0.6b"],
+        "devices": ["gpu"],
+        "method": "automated_dual_baseline_v1",
+    },
+}
 
 
 def normalize_provider_base_url(kind: str, value: str) -> str:
@@ -107,6 +125,7 @@ def _normalized_devices(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _normalized_audio_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
     tts = payload.get("tts") or {}
+    default_tts_model = str(tts.get("default_model") or "")
     models: list[dict[str, Any]] = []
     for item in tts.get("model_capabilities") or []:
         if not isinstance(item, dict) or not item.get("id"):
@@ -116,20 +135,78 @@ def _normalized_audio_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
                 "id": item.get("id"),
                 "name": item.get("name") or item.get("id"),
                 "installed": bool(item.get("installed", True)),
+                "default": bool(item.get("default") or item.get("id") == default_tts_model),
                 "devices": _normalized_devices(item),
                 "voice_modes": item.get("voice_modes") or [],
                 "controls": item.get("controls") or {},
+                "checkpoints": item.get("checkpoints") or [],
             }
         )
     installed = [item for item in models if item["installed"]]
-    best = max(installed, key=_quality_score) if installed else None
+    default_candidate = next((item for item in installed if item["id"] == default_tts_model), None)
+    disqualified_default_id = ""
+    qualification = PODCAST_TTS_QUALIFIED_TARGETS.get(str(default_candidate["id"])) if default_candidate else None
+    qualified_default_device = None
+    if default_candidate and qualification:
+        reported = {
+            str(checkpoint.get("variant") or ""): str(checkpoint.get("revision") or "")
+            for checkpoint in default_candidate.get("checkpoints") or [] if isinstance(checkpoint, dict)
+        }
+        expected = qualification.get("checkpoints") or {}
+        qualified_devices = {str(value) for value in qualification.get("devices") or []}
+        available_qualified_devices = [
+            str(device["id"])
+            for device in default_candidate.get("devices") or []
+            if device.get("available") and str(device.get("id") or "") in qualified_devices
+        ]
+        if (
+            any(reported.get(str(variant)) != str(revision) for variant, revision in expected.items())
+            or not available_qualified_devices
+        ):
+            disqualified_default_id = str(default_candidate["id"])
+            default_candidate = None
+        else:
+            qualified_default_device = (
+                "gpu" if "gpu" in available_qualified_devices
+                else "cpu" if "cpu" in available_qualified_devices
+                else available_qualified_devices[0]
+            )
+    else:
+        default_candidate = None
+    best = default_candidate
+    fallback_installed = [item for item in installed if item["id"] != disqualified_default_id]
+    best = best or (max(fallback_installed, key=_quality_score) if fallback_installed else None)
     recommended = None
     if best:
         available = [device["id"] for device in best["devices"] if device["available"]]
-        device = "gpu" if "gpu" in available else "cpu" if "cpu" in available else available[0] if available else None
-        recommended = {"model": best["id"], "compute_device": device}
+        device = qualified_default_device if best is default_candidate else (
+            "gpu" if "gpu" in available else "cpu" if "cpu" in available else available[0] if available else None
+        )
+        recommended = {
+            "model": best["id"], "compute_device": device,
+            "reason": "service_default" if best is default_candidate else "installed_fallback",
+        }
     native = tts.get("preset_speaker_native_languages") or {}
     voices = [{"id": name, "native_language": native.get(name)} for name in tts.get("preset_speakers") or []]
+    raw_sequence = tts.get("sequence_jobs") or {}
+    sequence_jobs = {
+        "supported": bool(raw_sequence.get("supported")),
+        "contract_version": int(raw_sequence.get("contract_version") or 0),
+        "endpoint": str(raw_sequence.get("endpoint") or ""),
+        "voice_modes": [str(value) for value in raw_sequence.get("voice_modes") or []],
+        "artifact_mode": str(raw_sequence.get("artifact_mode") or ""),
+        "format": str(raw_sequence.get("format") or ""),
+        "max_items": max(1, min(100, int(raw_sequence.get("max_items") or 100))),
+        "max_total_chars": max(1, int(raw_sequence.get("max_total_chars") or 1)),
+    }
+    if not (
+        sequence_jobs["supported"]
+        and sequence_jobs["contract_version"] == 1
+        and sequence_jobs["endpoint"] == "/api/v1/tts/sequence-jobs"
+        and sequence_jobs["artifact_mode"] == "per_item"
+        and sequence_jobs["format"] == "wav"
+    ):
+        sequence_jobs["supported"] = False
     asr = payload.get("asr") or {}
     asr_models = []
     for item in asr.get("models") or []:
@@ -160,6 +237,8 @@ def _normalized_audio_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
         "models": models,
         "voices": voices,
         "languages": tts.get("languages") or [],
+        "default_model": default_tts_model or None,
+        "sequence_jobs": sequence_jobs,
         "recommended": recommended,
         "async": True,
         "discovery": True,
@@ -175,6 +254,34 @@ def _normalized_audio_capabilities(payload: dict[str, Any]) -> dict[str, Any]:
             "aligner_languages": asr.get("aligner_languages") or [],
             "single_task_acceleration": asr.get("single_task_acceleration") or {},
         } if asr else {},
+    }
+
+
+def _instruction_safe_tts_recommendation(
+    normalized: dict[str, Any], config: dict[str, Any], recommended: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    defaults = {
+        "host_a_instruct": "自然、沉稳、有叙事感的知识播客主持人口吻，语速适中。",
+        "host_b_instruct": "敏锐、亲切、善于追问和澄清的知识播客主持人口吻，语速适中。",
+    }
+    customized = any(str(config.get(key) or "").strip() not in {"", value} for key, value in defaults.items())
+    selected = next(
+        (item for item in normalized.get("models") or [] if item.get("id") == (recommended or {}).get("model")), {}
+    )
+    if not customized or "preset" in set((selected.get("controls") or {}).get("instruction_voice_modes") or []):
+        return recommended
+    preserving = [
+        item for item in normalized.get("models") or []
+        if item.get("installed") and "preset" in set((item.get("controls") or {}).get("instruction_voice_modes") or [])
+    ]
+    if not preserving:
+        return recommended
+    selected = max(preserving, key=_quality_score)
+    available = [item["id"] for item in selected.get("devices") or [] if item.get("available")]
+    return {
+        "model": selected["id"],
+        "compute_device": "gpu" if "gpu" in available else "cpu" if "cpu" in available else available[0] if available else None,
+        "reason": "preserve_custom_instructions",
     }
 
 
@@ -608,8 +715,11 @@ async def _provider_catalog(provider: dict[str, Any]) -> tuple[bool, list[dict[s
         raise ProviderError("Provider 返回了无法识别的能力清单")
     if provider["kind"] in {"sandevistan_audio", "sandevistan_tts"}:
         normalized = _normalized_audio_capabilities(payload)
+        recommended = _instruction_safe_tts_recommendation(
+            normalized, provider.get("config") or {}, normalized.get("recommended"),
+        )
         models = normalized.pop("models")
-        recommended = normalized.pop("recommended")
+        normalized.pop("recommended")
         return True, models, normalized, recommended
     source = payload.get("models") if provider["kind"] == "ollama" else payload.get("data")
     if not isinstance(source, list):
@@ -1200,7 +1310,10 @@ async def probe_audio_provider(provider_id: str, *, apply_defaults: bool = False
         response = await client.get(f"{provider['base_url'].rstrip('/')}/api/v1/capabilities", headers=headers)
         response.raise_for_status()
     normalized = _normalized_audio_capabilities(response.json())
-    recommended = normalized.get("recommended")
+    recommended = _instruction_safe_tts_recommendation(
+        normalized, provider.get("config") or {}, normalized.get("recommended"),
+    )
+    normalized["recommended"] = recommended
     asr_recommended = (normalized.get("asr") or {}).get("recommended") or {}
     config = dict(provider.get("config") or {})
     legacy_default = (
@@ -1224,6 +1337,7 @@ async def probe_audio_provider(provider_id: str, *, apply_defaults: bool = False
         config.setdefault("asr_auto_select", True)
         config.setdefault("asr_allow_device_fallback", True)
         config.setdefault("cleanup_remote_jobs", True)
+        config.setdefault("podcast_sequence_tts", True)
         config["auto_select"] = auto_select
         model = provider.get("model") or ""
         if auto_select and recommended:
@@ -1351,8 +1465,9 @@ async def synthesize(
     instruct: str | None = None,
     idempotency_key: str | None = None,
     execution: dict[str, Any] | None = None,
+    provider: dict[str, Any] | None = None,
 ) -> Path:
-    provider = active_provider("audio")
+    provider = provider or active_provider("audio")
     if not provider:
         raise ProviderError("AUDIO provider is not configured")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1401,6 +1516,191 @@ async def synthesize(
                 execution.update({"compute_device": "cpu", "fallback_used": True, "fallback_reason": str(exc)[:300]})
             return result
     raise ProviderError(f"Provider {provider['kind']} cannot serve TTS")
+
+
+async def _synthesize_sequence_sandevistan(
+    provider: dict[str, Any],
+    items: list[dict[str, Any]],
+    outputs: dict[str, Path],
+    *,
+    language: str,
+    model: str,
+    compute_device: str,
+    voice_mode: str,
+    idempotency_key: str,
+    cancel_check: Callable[[], bool] | None,
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    headers = _headers(provider)
+    headers["Idempotency-Key"] = idempotency_key
+    request_items: list[dict[str, Any]] = []
+    for item in items:
+        item_id = str(item.get("id") or "")
+        if item_id not in outputs:
+            raise ProviderError("批量 TTS 输出映射不完整", code="sequence_contract_error")
+        request_item = {"id": item_id, "text": str(item.get("text") or "")}
+        if voice_mode == "voiceprint":
+            sample_id = str(item.get("voiceprint_sample_id") or "")
+            if not sample_id:
+                raise ProviderError("声纹克隆缺少可用样本，请刷新 AUDIO Provider 配置")
+            request_item["voiceprint_sample_id"] = sample_id
+        else:
+            speaker = str(item.get("speaker") or "")
+            if not speaker:
+                raise ProviderError("预置音色不能为空")
+            request_item["speaker"] = speaker
+            if item.get("instruct"):
+                request_item["instruct"] = str(item["instruct"])
+        request_items.append(request_item)
+    data = {
+        "model": model,
+        "language": language,
+        "voice_mode": voice_mode,
+        "compute_device": compute_device,
+        "items": request_items,
+    }
+    job_id = ""
+    config = provider.get("config") or {}
+    started = time.perf_counter()
+    async with httpx.AsyncClient(timeout=300) as client:
+        response = await client.post(
+            f"{provider['base_url'].rstrip('/')}/api/v1/tts/sequence-jobs", json=data, headers=headers,
+        )
+        if not response.is_success:
+            error = _provider_response_error(response)
+            if response.status_code in {404, 405, 501}:
+                error.code = "tts_sequence_unsupported"
+            raise error
+        submission = response.json()
+        job_id = str(submission.get("id") or submission.get("job_id") or "")
+        if not job_id:
+            raise ProviderError("批量 TTS Provider 未返回任务 ID", code="sequence_contract_error")
+        status_url = submission.get("status_url") or f"/api/v1/jobs/{job_id}"
+        try:
+            for _ in range(7200):
+                if cancel_check and cancel_check():
+                    try:
+                        await client.post(f"{provider['base_url'].rstrip('/')}/api/v1/jobs/{job_id}/cancel", headers=headers)
+                    finally:
+                        raise ProviderError("任务已取消", code="cancelled")
+                poll_url = status_url if str(status_url).startswith("http") else provider["base_url"].rstrip("/") + str(status_url)
+                poll = await client.get(poll_url, headers=headers)
+                if not poll.is_success:
+                    raise _provider_response_error(poll)
+                state = poll.json()
+                job_state = state.get("state") or state.get("status")
+                if job_state in {"completed", "succeeded", "done"}:
+                    result = state.get("result") or {}
+                    sequence = result.get("sequence") or {}
+                    result_items = sequence.get("items") or []
+                    artifact_names = {
+                        str(item.get("id") or ""): str(item.get("artifact_name") or "")
+                        for item in result_items if isinstance(item, dict)
+                    }
+                    expected_ids = [str(item["id"]) for item in request_items]
+                    if list(artifact_names) != expected_ids or any(not artifact_names[value] for value in expected_ids):
+                        raise ProviderError("批量 TTS 返回的条目顺序或音频映射无效", code="sequence_contract_error")
+                    if execution is not None:
+                        acceleration = result.get("acceleration") or {}
+                        execution.update({
+                            "sequence_item_count": len(result_items),
+                            "provider_acceleration": acceleration,
+                            "generation_batch_size": int(
+                                ((acceleration.get("stage_batch_sizes") or {}).get("generation") or 1)
+                            ),
+                            "oom_fallbacks": list(acceleration.get("oom_fallbacks") or []),
+                        })
+                    for item_id in expected_ids:
+                        name = artifact_names[item_id]
+                        url = f"/api/v1/jobs/{job_id}/artifacts/{quote(name, safe='')}"
+                        audio = await client.get(provider["base_url"].rstrip("/") + url, headers=headers)
+                        if not audio.is_success:
+                            raise _provider_response_error(audio)
+                        if not audio.headers.get("content-type", "").startswith("audio/") or not audio.content.startswith(b"RIFF"):
+                            raise ProviderError("批量 TTS Provider 返回了无效 WAV 音频", code="sequence_contract_error")
+                        destination = outputs[item_id]
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = destination.with_suffix(destination.suffix + ".tmp")
+                        temporary.write_bytes(audio.content)
+                        temporary.replace(destination)
+                    return {item_id: outputs[item_id] for item_id in expected_ids}
+                if job_state in {"failed", "error", "cancelled"}:
+                    raise ProviderError(
+                        str(state.get("error_message") or state.get("error") or "批量 TTS 任务失败"),
+                        code=str(state.get("error_code") or "tts_failed"),
+                    )
+                await asyncio.sleep(max(0.5, min(float(state.get("poll_after_seconds") or 1), 5)))
+        finally:
+            if job_id and config.get("cleanup_remote_jobs", True):
+                try:
+                    await client.delete(
+                        f"{provider['base_url'].rstrip('/')}/api/v1/jobs/{job_id}", params={"purge": "true"}, headers=headers,
+                    )
+                except Exception:
+                    pass
+    raise ProviderError(
+        f"批量 TTS 任务超时（已等待 {round(time.perf_counter() - started)} 秒）", code="timeout",
+    )
+
+
+async def synthesize_sequence(
+    items: list[dict[str, Any]],
+    outputs: dict[str, Path],
+    *,
+    language: str = "Chinese",
+    cancel_check: Callable[[], bool] | None = None,
+    model: str | None = None,
+    compute_device: str | None = None,
+    voice_mode: str = "preset",
+    idempotency_key: str | None = None,
+    execution: dict[str, Any] | None = None,
+    provider: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Synthesize an ordered homogeneous sequence, retaining same-model GPU-to-CPU fallback."""
+    provider = provider or active_provider("audio")
+    if not provider:
+        raise ProviderError("AUDIO provider is not configured")
+    sequence = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
+    if not (
+        provider.get("kind") in {"sandevistan_audio", "sandevistan_tts"}
+        and sequence.get("supported")
+        and int(sequence.get("contract_version") or 0) == 1
+        and provider.get("config", {}).get("podcast_sequence_tts", True)
+    ):
+        raise ProviderError("AUDIO Provider 不支持批量 TTS", code="tts_sequence_unsupported")
+    if not items:
+        return {}
+    config = provider.get("config") or {}
+    selected_model = str(model or provider.get("model") or "")
+    selected_device = str(compute_device or config.get("compute_device") or "gpu")
+    key = idempotency_key or str(uuid.uuid4())
+    started = time.perf_counter()
+    try:
+        result = await _synthesize_sequence_sandevistan(
+            provider, items, outputs, language=language, model=selected_model,
+            compute_device=selected_device, voice_mode=voice_mode, idempotency_key=key,
+            cancel_check=cancel_check, execution=execution,
+        )
+        if execution is not None:
+            execution.update({
+                "compute_device": selected_device, "fallback_used": False,
+                "provider_processing_seconds": round(time.perf_counter() - started, 3),
+            })
+        return result
+    except (ProviderError, httpx.HTTPError) as exc:
+        if selected_device != "gpu" or not config.get("allow_device_fallback", True) or not _device_failure(exc):
+            raise
+        result = await _synthesize_sequence_sandevistan(
+            provider, items, outputs, language=language, model=selected_model,
+            compute_device="cpu", voice_mode=voice_mode, idempotency_key=(key + "-cpu")[:128],
+            cancel_check=cancel_check, execution=execution,
+        )
+        if execution is not None:
+            execution.update({
+                "compute_device": "cpu", "fallback_used": True, "fallback_reason": str(exc)[:300],
+                "provider_processing_seconds": round(time.perf_counter() - started, 3),
+            })
+        return result
 
 
 def _device_failure(error: BaseException) -> bool:
