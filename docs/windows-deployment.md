@@ -56,6 +56,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 下载中断后可以直接再次运行 `bootstrap.ps1`。已验证的缓存和已安装组件会复用。FFmpeg 的摘要来自对应 GitHub Release 资产，LibreOffice 使用仓库锁定的 SHA-256；不要为了绕过报错而关闭摘要校验。
 
+FFmpeg 的 Release tag 与平台资产名由 `scripts/tools.lock.json` 固定。脚本发现已有 `.tools\ffmpeg\bin\ffmpeg.exe` 时会跳过安装，因此更新锁文件后重跑 bootstrap 不会自动替换现有构建。需要替换时，先停止 quick-read，将旧 `.tools\ffmpeg` 目录移到项目内其他位置留作回退，再运行 bootstrap；来源与摘要规则见 [第三方工具说明](../THIRD_PARTY_NOTICES.md)。
+
 如果当前只做后端开发、暂时不需要 Office 文档可视化和播客音频规范化，可降级安装：
 
 ```powershell
@@ -147,6 +149,8 @@ Invoke-RestMethod http://127.0.0.1:20810/api/v1/health
 3. 保持“Podcast 使用批量合成与安全并行加速”可减少模型重复装载；旧版 Audio Intel 未声明能力时选项不会显示并自动使用逐条合成；
 4. 选择“验证并启用”，让系统分别验证两位主持人并完成一次短 TTS→ASR 闭环。
 
+“使用服务推荐的 TTS 模型与设备”会优先采用符合 quick-read checkpoint/device 资格表的服务默认组合，否则按已安装模型排序回退；设置页显示实际解析结果和原因。已有 `auto_select=false` 的人工选择保持不变。自定义表达指令仅在存在支持指令的已安装备选模型时触发保护性推荐。资格评测和报告含义见 [Podcast 评测与 TTS 资格维护](podcast-evaluation.md)。
+
 声纹克隆只允许选择 Audio Intel 声纹库中已有且具备可用样本的人员。需要使用时，先打开 <http://127.0.0.1:20810>，在“声纹库”创建人员并导入或录制样本，再回到 quick-read 刷新能力清单。系统会采用该人员最新的可用样本，样本超过 15 秒时由 Audio Intel 按词边界截断；两位主持人不能使用同一个人。预置音色可填写基础表达风格，quick-read 会追加稳定语速、音高和情绪范围的整集约束；克隆模式不发送上游不支持的风格指令。
 
 Audio Intel 模型对磁盘、内存和 GPU 的要求明显高于主应用；完整能力需要 ASR、TTS 和内部 aligner，安装前请阅读 [audio-intel Windows 手册](https://github.com/wlf186/audio-intel/blob/main/docs/WINDOWS.md)。CPU-only 部署可改用 `.\service.cmd setup all --profile cpu`，启动命令仍为 `.\service.cmd start all`。
@@ -164,6 +168,8 @@ git pull --ff-only
 .\scripts\bootstrap.ps1
 .\scripts\start.ps1
 ```
+
+升级后启动服务时，会自动校正旧版本中“解析任务已取消、资料仍在排队”的记录；有其他活动解析任务或已完成索引的资料保持原状态。该校正可重复执行，不重新解析或删除文件。旧闪卡会话在恢复时过滤已移除卡片并调整进度，历史评分保留。
 
 请根据实际情况替换备份位置。不要将 `runtime/config.toml`、`runtime/data`、API Key、上传资料或生成媒体提交到 Git。
 

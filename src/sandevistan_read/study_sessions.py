@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import io
 import random
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,11 +51,11 @@ def _parse_time(value: str | None) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _load_card_state(artifact_id: str, card_id: str) -> tuple[Card, str | None]:
-    state = DB.fetchone("SELECT * FROM flashcard_states WHERE artifact_id=? AND card_id=?", (artifact_id, card_id))
+def _load_card_state(artifact_id: str, card_id: str, connection: sqlite3.Connection) -> tuple[Card, str | None]:
+    state = connection.execute("SELECT * FROM flashcard_states WHERE artifact_id=? AND card_id=?", (artifact_id, card_id)).fetchone()
     if state:
-        return Card.from_dict(json_load(state["fsrs_json"], {})), state.get("last_rating")
-    reviews = DB.fetchall("SELECT rating,created_at FROM flashcard_reviews WHERE artifact_id=? AND card_id=? ORDER BY created_at", (artifact_id, card_id))
+        return Card.from_dict(json_load(state["fsrs_json"], {})), state["last_rating"]
+    reviews = connection.execute("SELECT rating,created_at FROM flashcard_reviews WHERE artifact_id=? AND card_id=? ORDER BY created_at", (artifact_id, card_id)).fetchall()
     first_review = _parse_time(reviews[0]["created_at"]) if reviews else datetime.now(UTC)
     card = Card(due=first_review)
     last_rating = None
@@ -62,13 +64,13 @@ def _load_card_state(artifact_id: str, card_id: str) -> tuple[Card, str | None]:
         rating = RATINGS.get(review["rating"])
         if rating:
             card, _ = SCHEDULER.review_card(card, rating, review_datetime=_parse_time(review["created_at"]))
-    _save_card_state(artifact_id, card_id, card, last_rating)
+    _save_card_state(artifact_id, card_id, card, last_rating, connection)
     return card, last_rating
 
 
-def _save_card_state(artifact_id: str, card_id: str, card: Card, last_rating: str | None) -> None:
+def _save_card_state(artifact_id: str, card_id: str, card: Card, last_rating: str | None, connection: sqlite3.Connection) -> None:
     now = utc_now()
-    DB.execute(
+    connection.execute(
         """INSERT INTO flashcard_states(artifact_id,card_id,fsrs_json,due_at,last_rating,suspended,created_at,updated_at)
         VALUES(?,?,?,?,?,0,?,?)
         ON CONFLICT(artifact_id,card_id) DO UPDATE SET fsrs_json=excluded.fsrs_json,due_at=excluded.due_at,last_rating=excluded.last_rating,updated_at=excluded.updated_at""",
@@ -83,22 +85,48 @@ def _latest_missed_quiz(artifact_id: str) -> list[str]:
     return [str(item.get("item_id")) for item in values if isinstance(item, dict) and not item.get("correct")]
 
 
+def _effective_flashcard_session(session: dict[str, Any], connection: sqlite3.Connection, *, persist: bool = False) -> dict[str, Any]:
+    """Project every view onto available cards; only repair stored active sessions."""
+    original = session
+    session = dict(session)
+    artifact = connection.execute("SELECT payload_json FROM artifacts WHERE id=?", (session["artifact_id"],)).fetchone()
+    payload = json_load(artifact["payload_json"], {}) if artifact else {}
+    items = payload.get("items") if isinstance(payload, dict) else []
+    items = items if isinstance(items, list) else []
+    available = {str(item.get("id")) for item in items if item.get("id")}
+    suspended = {row["card_id"] for row in connection.execute("SELECT card_id FROM flashcard_states WHERE artifact_id=? AND suspended=1", (session["artifact_id"],))}
+    item_ids = [key for key in json_load(session["item_ids_json"], []) if key in available and key not in suspended]
+    reviews = json_load(session["state_json"], {}).get("reviews", {})
+    session["item_ids_json"] = json_dump(item_ids)
+    session["status"] = "complete" if all(key in reviews for key in item_ids) else "active"
+    if persist and original["status"] == "active" and any(session[key] != original[key] for key in ("item_ids_json", "status")):
+        now = utc_now()
+        session["updated_at"] = now
+        connection.execute("UPDATE study_sessions SET item_ids_json=?,status=?,updated_at=?,completed_at=? WHERE id=?",
+                           (session["item_ids_json"], session["status"], now, now if session["status"] == "complete" else None, session["id"]))
+    return session
+
+
 def _session_items(artifact_id: str, kind: str, mode: str, items: list[dict[str, Any]]) -> list[str]:
     available = [str(item.get("id")) for item in items if item.get("id")]
+    states = {}
+    if kind == "flashcard":
+        states = {row["card_id"]: row for row in DB.fetchall("SELECT card_id,due_at,last_rating,suspended FROM flashcard_states WHERE artifact_id=?", (artifact_id,))}
+        available = [key for key in available if not states.get(key, {}).get("suspended")]
     if mode == "same":
         previous = DB.fetchone("SELECT item_ids_json FROM study_sessions WHERE artifact_id=? AND kind=? ORDER BY updated_at DESC LIMIT 1", (artifact_id, kind))
-        same = [value for value in json_load((previous or {}).get("item_ids_json"), []) if value in available]
-        return same or available
+        if not previous:
+            return available
+        same = [key for key in json_load(previous["item_ids_json"], []) if key in available]
+        return (same or available) if kind == "quiz" else same
     if kind == "quiz":
         return [item_id for item_id in _latest_missed_quiz(artifact_id) if item_id in available] if mode == "missed" else available
-    states = {row["card_id"]: row for row in DB.fetchall("SELECT card_id,due_at,last_rating,suspended FROM flashcard_states WHERE artifact_id=?", (artifact_id,))}
-    unsuspended = [item_id for item_id in available if not states.get(item_id, {}).get("suspended")]
     if mode == "missed":
-        return [item_id for item_id in unsuspended if states.get(item_id, {}).get("last_rating") == "again"]
+        return [item_id for item_id in available if states.get(item_id, {}).get("last_rating") == "again"]
     if mode == "due":
         now = datetime.now(UTC)
-        return [item_id for item_id in unsuspended if item_id not in states or _parse_time(states[item_id].get("due_at")) <= now]
-    return unsuspended
+        return [item_id for item_id in available if item_id not in states or _parse_time(states[item_id].get("due_at")) <= now]
+    return available
 
 
 def create_session(artifact_id: str, mode: str = "all", shuffle: bool = False) -> dict[str, Any]:
@@ -114,6 +142,12 @@ def create_session(artifact_id: str, mode: str = "all", shuffle: bool = False) -
         (artifact_id, kind, mode),
     )
     if active:
+        if kind == "flashcard":
+            with DB.transaction() as connection:
+                current = connection.execute("SELECT * FROM study_sessions WHERE id=?", (active["id"],)).fetchone()
+                if not current:
+                    raise ValueError("学习会话不存在")
+                _effective_flashcard_session(dict(current), connection, persist=True)
         return get_session(active["id"])
     session_id, now = new_id("study"), utc_now()
     item_ids = _session_items(artifact_id, kind, mode, items)
@@ -139,6 +173,9 @@ def get_session(session_id: str) -> dict[str, Any]:
     session = DB.fetchone("SELECT * FROM study_sessions WHERE id=?", (session_id,))
     if not session:
         raise ValueError("学习会话不存在")
+    if session["kind"] == "flashcard":
+        with closing(DB.connect()) as connection:
+            session = _effective_flashcard_session(session, connection)
     row, _, items = _artifact(session["artifact_id"], session["kind"])
     by_id = {str(item.get("id")): item for item in items}
     item_ids = json_load(session["item_ids_json"], [])
@@ -156,7 +193,7 @@ def get_session(session_id: str) -> dict[str, Any]:
             if item_id in state.get("reviews", {}):
                 source["review"] = state["reviews"][item_id]
             rendered.append(source)
-    completed_count = len(state.get("results", {})) if session["kind"] == "quiz" else len(state.get("reviews", {}))
+    completed_count = len(state.get("results", {})) if session["kind"] == "quiz" else sum(key in state.get("reviews", {}) for key in item_ids)
     return {
         "id": session["id"],
         "artifact_id": session["artifact_id"],
@@ -214,34 +251,35 @@ def answer_quiz(session_id: str, item_id: str, option_index: int) -> dict[str, A
 
 
 def review_flashcard(session_id: str, item_id: str, rating: str) -> dict[str, Any]:
-    session = DB.fetchone("SELECT * FROM study_sessions WHERE id=? AND kind='flashcard'", (session_id,))
-    if not session:
-        raise ValueError("Flashcard 学习会话不存在")
-    _, _, items = _artifact(session["artifact_id"], "flashcard")
-    item_ids = json_load(session["item_ids_json"], [])
-    if item_id not in item_ids or item_id not in {item.get("id") for item in items}:
-        raise ValueError("闪卡不属于当前学习会话")
     normalized = "good" if rating == "mastered" else rating
     selected = RATINGS.get(normalized)
     if not selected:
         raise ValueError("不支持的复习评分")
-    card, _ = _load_card_state(session["artifact_id"], item_id)
-    reviewed_at = datetime.now(UTC)
-    card, _ = SCHEDULER.review_card(card, selected, review_datetime=reviewed_at)
-    scheduled_days = round(max(0.0, (card.due - reviewed_at).total_seconds() / 86400), 4)
-    _save_card_state(session["artifact_id"], item_id, card, normalized)
-    DB.execute(
-        "INSERT INTO flashcard_reviews(id,artifact_id,card_id,rating,created_at) VALUES(?,?,?,?,?)",
-        (new_id("review"), session["artifact_id"], item_id, normalized, reviewed_at.isoformat()),
-    )
-    state = json_load(session["state_json"], {})
-    state.setdefault("reviews", {})[item_id] = {"rating": normalized, "due_at": card.due.isoformat(), "scheduled_days": scheduled_days}
-    complete = len(state["reviews"]) == len(item_ids)
-    now = utc_now()
-    DB.execute(
-        "UPDATE study_sessions SET state_json=?,status=?,updated_at=?,completed_at=? WHERE id=?",
-        (json_dump(state), "complete" if complete else "active", now, now if complete else None, session_id),
-    )
+    with DB.transaction() as connection:
+        row = connection.execute("SELECT * FROM study_sessions WHERE id=? AND kind='flashcard'", (session_id,)).fetchone()
+        if not row:
+            raise ValueError("Flashcard 学习会话不存在")
+        session = _effective_flashcard_session(dict(row), connection, persist=True)
+        item_ids = json_load(session["item_ids_json"], [])
+        if item_id not in item_ids:
+            raise ValueError("闪卡已移除或不属于当前学习会话")
+        card, _ = _load_card_state(session["artifact_id"], item_id, connection)
+        reviewed_at = datetime.now(UTC)
+        card, _ = SCHEDULER.review_card(card, selected, review_datetime=reviewed_at)
+        scheduled_days = round(max(0.0, (card.due - reviewed_at).total_seconds() / 86400), 4)
+        _save_card_state(session["artifact_id"], item_id, card, normalized, connection)
+        connection.execute(
+            "INSERT INTO flashcard_reviews(id,artifact_id,card_id,rating,created_at) VALUES(?,?,?,?,?)",
+            (new_id("review"), session["artifact_id"], item_id, normalized, reviewed_at.isoformat()),
+        )
+        state = json_load(session["state_json"], {})
+        state.setdefault("reviews", {})[item_id] = {"rating": normalized, "due_at": card.due.isoformat(), "scheduled_days": scheduled_days}
+        complete = all(key in state["reviews"] for key in item_ids)
+        now = utc_now()
+        connection.execute(
+            "UPDATE study_sessions SET state_json=?,status=?,updated_at=?,completed_at=? WHERE id=?",
+            (json_dump(state), "complete" if complete else "active", now, now if complete else None, session_id),
+        )
     return {"card_id": item_id, "rating": normalized, "due_at": card.due.isoformat(), "scheduled_days": scheduled_days, "session": get_session(session_id)}
 
 
@@ -249,9 +287,12 @@ def suspend_flashcard(artifact_id: str, card_id: str) -> None:
     _, _, items = _artifact(artifact_id, "flashcard")
     if card_id not in {item.get("id") for item in items}:
         raise ValueError("闪卡不存在")
-    card, last_rating = _load_card_state(artifact_id, card_id)
-    _save_card_state(artifact_id, card_id, card, last_rating)
-    DB.execute("UPDATE flashcard_states SET suspended=1,updated_at=? WHERE artifact_id=? AND card_id=?", (utc_now(), artifact_id, card_id))
+    with DB.transaction() as connection:
+        _load_card_state(artifact_id, card_id, connection)
+        connection.execute("UPDATE flashcard_states SET suspended=1,updated_at=? WHERE artifact_id=? AND card_id=?", (utc_now(), artifact_id, card_id))
+        active = connection.execute("SELECT * FROM study_sessions WHERE artifact_id=? AND kind='flashcard' AND status='active'", (artifact_id,)).fetchall()
+        for session in active:
+            _effective_flashcard_session(dict(session), connection, persist=True)
 
 
 def flashcards_csv(artifact_id: str) -> str:

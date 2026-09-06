@@ -26,11 +26,11 @@ Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署�
 
 当前部署可在 `runtime/config.toml` 配置为监听 `0.0.0.0:20830`（需访问密钥）；本机浏览器打开 <http://127.0.0.1:20830>。停止服务运行 `scripts/stop.sh` 或 `scripts\stop.ps1`。
 
-首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://127.0.0.1:11434` 的 `qwen3.5:2b`，AUDIO 服务是 `http://127.0.0.1:20810`。旧配置中的 `development.tts_url` 仍可读取，新配置使用 `development.audio_url`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。完整 API 文档位于 `/api/docs`。
+首次启动会从 `config.example.toml` 创建 `runtime/config.toml`。默认开发 Provider 是 `http://127.0.0.1:11434` 的 `qwen3.5:2b`，AUDIO 服务是 `http://127.0.0.1:20810`。旧配置中的 `development.tts_url` 仍可读取，新配置使用 `development.audio_url`。Kimi、DeepSeek 或其它服务可在网页设置中添加为 OpenAI-compatible Provider。交互式 API 文档位于 `/api/docs`，机器可读定义位于 `/api/openapi.json`；认证接口另见 `/docs`。
 
 ## Provider 配置
 
-设置页按 MAIN、VLM、AUDIO 三种职责分开管理。MAIN 是必需能力；VLM 和 AUDIO 可以临时暂停而不删除当前选择，暂停只影响之后创建的任务。图片处理默认按 `VLM → MAIN → 本地 RapidOCR` 依次兜底，任一步得到结果即停止；可调整参与步骤、全局关闭，或在每次上传确认时临时覆盖。图片策略仅应用于新上传，不会自动重建已有索引。云端 VLM/MAIN 参与视觉处理时，对应原图会发送给所选服务。
+设置页按 MAIN、VLM、AUDIO 三种职责分开管理。MAIN 是必需能力；VLM 和 AUDIO 可以临时暂停而不删除当前选择，暂停只影响之后创建的任务。Podcast 的 TTS、首次 ASR 验收及音频修复后的复验始终使用任务绑定的 AUDIO Provider，不随角色切换改变；绑定配置不存在时任务明确失败。缺少绑定信息的旧任务在开始执行时解析一次 AUDIO，并在本次执行中持续使用。图片处理默认按 `VLM → MAIN → 本地 RapidOCR` 依次兜底，任一步得到结果即停止；可调整参与步骤、全局关闭，或在每次上传确认时临时覆盖。图片策略仅应用于新上传，不会自动重建已有索引。云端 VLM/MAIN 参与视觉处理时，对应原图会发送给所选服务。
 
 设置页按角色限制可选协议：
 
@@ -49,7 +49,7 @@ MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提�
 
 连接检查不保存配置。深度验证只发送内置的极短测试文本或测试图片，不会发送 Notebook 资料；使用云端模型时仍可能产生少量 API 费用。未通过验证的配置可以保存为未启用状态，启用失败不会替换当前同角色的活跃 Provider。
 
-程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；AUDIO catalog 还会返回脱敏的 `voiceprint_library` 和可持久化的 `resolved_audio_config`。角色状态分别通过 `GET /api/provider-roles` 与 `PATCH /api/provider-roles/{role}` 读取和更新，全局图片策略使用 `GET/PUT /api/settings/image-processing`；上传接口可在 multipart `image_policy` 字段中传入单次覆盖。已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求和响应模型以 `/api/docs` 为准。
+程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；AUDIO catalog 还会返回脱敏的 `voiceprint_library` 和可持久化的 `resolved_audio_config`。角色状态分别通过 `GET /api/provider-roles` 与 `PATCH /api/provider-roles/{role}` 读取和更新，全局图片策略使用 `GET/PUT /api/settings/image-processing`；上传接口可在 multipart `image_policy` 字段中传入单次覆盖。已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求字段及关键响应说明见 `/api/docs`。Provider 配置保留扩展字段；新增布尔开关必须传 JSON 布尔值，不能用字符串或数字代替。AUDIO 的 `config.podcast_sequence_tts` 缺省按开启处理，设为 `false` 会关闭批量合成及脚本/TTS 重叠；该设置保存于 Provider 配置，不属于 `config.toml`。能力清单的 `sequence_jobs`、模型的 `default/checkpoints` 和 `recommended.reason` 可用于解释当前选择。
 
 ## 本地数据边界
 
@@ -72,7 +72,7 @@ MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提�
 - `.tools/ffmpeg/bin/ffprobe`
 - `.tools/libreoffice/program/soffice`（Windows 为 `soffice.exe`）
 
-原始安装包保留在 `runtime/cache/downloads/`，可安全清理；需要修复时再次运行 bootstrap 即可。LibreOffice 的无界面用户配置使用 `runtime/tmp/libreoffice-profiles/`，不会写入用户主目录。若只需离线开发，可在引导时设置 `SANDEVISTAN_SKIP_TOOLS=1` 跳过工具下载。
+原始安装包保留在 `runtime/cache/downloads/`，可安全清理。FFmpeg 由 `scripts/tools.lock.json` 固定 Release tag 与资产名，下载时从该 Release 读取并校验 SHA-256；详见 [第三方工具说明](THIRD_PARTY_NOTICES.md)。bootstrap 会复用已存在的媒体工具；需要替换 FFmpeg 构建时，先停止服务并将旧 `.tools/ffmpeg` 目录移到项目内其他位置留作回退，再运行 bootstrap。LibreOffice 的无界面用户配置使用 `runtime/tmp/libreoffice-profiles/`，不会写入用户主目录。若只需离线开发，可在引导时设置 `SANDEVISTAN_SKIP_TOOLS=1` 跳过工具下载。
 
 FFmpeg 使用 LGPL 静态构建，LibreOffice 使用 The Document Foundation 官方二进制包。第三方程序保留其各自许可证；本项目不修改或重新链接它们。
 
@@ -80,32 +80,36 @@ FFmpeg 使用 LGPL 静态构建，LibreOffice 使用 The Document Foundation 官
 
 检索范围固定为当前勾选资料的修订快照；回答要求逐项使用 `[S1]` 引用，服务端只返回真实检索片段对应的引用元数据。模型不可用时返回相关原文摘录，不使用未上传的外部知识。点击 UI 引用可查看文件名、定位与原文证据。
 
+切换 Notebook 或开启新对话会重置当前聊天显示与草稿；目标 Notebook 的资料和历史载入完成后才能发送问题。切换前已提交的问题仍由服务端处理并保存在原会话，其迟到的回答或错误不会覆盖新会话。
+
 ## Quiz 与 Flashcards
 
 学习内容采用“知识蓝图 → 候选生成 → 证据与质量校验 → 去重”的流水线。系统综合模型参数量、有效上下文窗口和最大输出窗口自动选择 `full` 或 `lite` 档，也可在 Provider 配置中覆盖；`lite` 档不生成困难题。题卡只有通过逐项引用、证据一致性和结构质量检查后才会保留，数量不足时会明确返回部分产物，不使用模板填充凑数。
 
 Quiz 按题作答，提交前不会通过产物 API 暴露答案、解释或引用；作答后才返回该题的答案、解释和原文证据，并支持提示、错题重练和整组重练。Flashcards 支持四档反馈（再来、困难、良好、简单），使用 FSRS 持久化安排到期复习，同时支持到期/全部/本轮队列、洗牌、移除和 CSV 导出。旧版 Quiz 尝试与闪卡复习记录会在数据库 v4 升级后保留，并在需要时参与新调度状态的恢复。
 
+闪卡“移除”会停用该卡片，保留原始题卡、FSRS 状态与历史评分，但从所有学习队列（包括本轮队列与洗牌）中隐藏，并同步当前进度。没有待学习卡片时本轮完成；旧活动会话在恢复时自动校正。对已移除卡片提交评分会返回 409，且不会改写复习记录。
+
 ## Podcast V4
 
-双人音频 V4 采用“多样化证据 → 主张表 → editorial acts → 携带前文的长段续写 → 客观门禁 → 整集审校 → 批量 TTS → 本地 ASR 验收”流水线。两位主持人共享解释、质疑、追问与综合职责，每一轮都要回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。口播限定用自然口语表达，审稿术语与密集的防误读提醒不得进入口播；每个 Act 先立题目再展开。长节目使用约 2.8 轮/分钟的充实对话，并以紧凑模型输出减少结构 token；每个 Act 按剩余时长分配口播字数，欠账最多把下一幕提高到名义预算的 120%。只有输出上限截断时才允许全剧一次小型续写，且它与边界修复共享唯一恢复名额。客观门禁覆盖时长、引用、角色平衡、问句密度、重复轮次，以及审计套话与防误读句式的密度上限（整集、单族、单 Act 三档），失败时在整集审校前直接停止，不消耗额外模型调用；整集审校为推理模型预留输出余量，避免隐藏推理挤占答复导致截断。脚本未达到门槛时会在 TTS 前停止，不再用模板问答补足长度。音频完成后会先验证真实时长，再检查字/词错误率、双主持人分离和异常静音；异常静音会归属到具体轮次并并入重合成集合，只有少量坏轮次时最多重合成一次，GPU 因显存或设备问题失败时，TTS/ASR 各自只回退 CPU 一次，不修改 Provider 配置。
+双人音频 V4 采用“多样化证据 → 主张表 → editorial acts → 携带前文的长段续写 → 客观门禁 → 整集审校 → 批量 TTS → 本地 ASR 验收”流水线。两位主持人共享解释、质疑、追问与综合职责，每一轮都要回应真实前文；事实、数字、案例和结论逐轮关联文档引用，纯寒暄或承上启下可以不显示引用。口播限定用自然口语表达，审稿术语与密集的防误读提醒不得进入口播；每个 Act 先立题目再展开。长节目使用约 2.8 轮/分钟的充实对话，并以紧凑模型输出减少结构 token；每个 Act 按剩余时长分配口播字数，欠账最多把下一幕提高到名义预算的 120%。输出上限截断时的小型续写、时长不足时的受引用约束扩写、超过目标时长 120% 时的压缩，共享全剧唯一恢复名额；当前不执行整集边界修复。客观门禁覆盖时长、引用、角色平衡、问句密度、重复轮次，以及审计套话与防误读句式的密度上限（整集、单族、单 Act 三档），失败时跳过整集审校；整集审校为推理模型预留输出余量，避免隐藏推理挤占答复导致截断。脚本未达到门槛时任务失败，不发布成品，也不使用模板问答补足长度。关闭脚本/TTS 重叠时，合成在脚本验收后开始；开启重叠时，已完成 Act 可能已调用 AUDIO 并消耗部分合成资源，即使整集最终未通过。音频完成后会先验证真实时长，再检查字/词错误率、双主持人分离和异常静音；异常静音会归属到具体轮次并并入重合成集合，只有少量坏轮次时最多重合成一次，GPU 因显存或设备问题失败且允许回退时，每次 TTS/ASR 调用最多回退同模型 CPU 一次，不修改 Provider 配置。
 
-支持 Audio Intel v1 批量协议时，Podcast 会在一次模型加载中按输入顺序合成多轮并保留逐轮 WAV。远程 MAIN 与 AUDIO 不争用同一资源时，已完成 Act 的合成会与后续脚本生成重叠；本地 MAIN 或同一服务主机自动关闭重叠。最终脚本按文本、语言、主持人、音色模式、指令、模型、固定 checkpoint revision、设备和协议版本的精确哈希复核，扩写或配置变化只重做受影响片段。旧服务、能力缺失或批量失败时自动回退逐轮合成，最终 FFmpeg 与全片 ASR 门禁不变。
+支持 Audio Intel v1 批量协议时，Podcast 会在一次模型加载中按输入顺序合成多轮并保留逐轮 WAV。首次生成脚本时，若 MAIN 地址不是代码识别的本机/loopback 地址、且 MAIN 与 AUDIO 的 URL hostname 不同，已完成 Act 的合成可与后续脚本生成重叠。这个判定基于地址，不探测实际 GPU 资源；共享算力但使用不同 hostname 的部署可在设置中关闭加速。最终脚本按文本、语言、主持人、音色模式、指令、模型、固定 checkpoint revision、设备和协议版本的精确哈希复核，扩写或配置变化只重做受影响片段。旧服务或能力缺失时使用逐轮合成；可处理的批量 Provider 错误会回退逐轮，取消或未恢复的异常仍会使任务失败。最终 FFmpeg 与全片 ASR 门禁不变。
 
 默认自动生成 12–25 分钟，也可选择 5、10、20 或 30 分钟；首次默认输出简体中文，并在浏览器中记住上次选择。MAIN Provider 的上下文和输出窗口较小时，系统使用更短场景与压缩剧集记忆；大窗口模型会生成更长场景并执行同一质量门槛。已有 V2 产物保持兼容。
 
-可使用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5 --baseline-artifact <旧播客ID>` 生成 V4 文字稿并与旧产物盲评，默认不会调用 TTS。追加 `--reference-audio <样本.m4a>` 时，会通过当前本地 Sandevistan ASR 转写样本并加入匿名盲评；也可用 `--candidate-json <已通过的candidate.json>` 跳过 MAIN，复用同一候选做参考 ASR、盲评或 `--render-candidate` 端到端验收。`--tts-model`/`--tts-device` 可对单次渲染覆盖模型与设备（如 0.6B 快速预览），不写数据库、不修改已保存的 Provider。GPU 资源错误时自动单次转 CPU。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
+评测可用 `.venv/bin/python scripts/evaluate_podcast.py --notebook-id <ID> --minutes 5` 生成文字稿，默认不调用 TTS；复用 `--candidate-json` 并添加 `--render-candidate` 可跳过 MAIN、执行音频验收。评测渲染的 `--tts-mode` 默认为 `single`，显式选择 `sequence` 才使用批量模式；不支持或批量失败时会报告失败，以免将逐轮回退误当作批量评测结果。单次模型/设备覆盖、参考音频盲评和多样本冻结验收见 [Podcast 评测与 TTS 资格维护](docs/podcast-evaluation.md)。评测结果保存在本地 `runtime/evals/`，不会进入 Git。
 
-多样本冻结验收使用 `scripts/evaluate_podcast_suite.py prepare --manifest <runtime-manifest.json> --mode frozen`。它会为每个样本生成新候选、执行 TTS/ASR、按音频 ASR 生成匿名 A/B 包，并按音频 SHA 缓存参考 ASR；开发模式允许在 manifest 中提供已通过门禁的 `candidate_json`，避免因音频或评审问题重复调用 MAIN。`--sample <id>` 可重复指定以只跑 manifest 子集（选样集合参与套件身份哈希），`--tts-model/--tts-device` 同样支持单次覆盖；中断后 resume 会保留已生成的匿名映射，缺失时用不变的 seed 确定性重建。独立评审完成 `scores-template.json` 后，以 `finalize --run-dir <目录> --scores <评分.json>` 解盲并执行六维分数、音频质量及 45k MAIN token 硬门槛。
+Sandevistan Audio Provider 可在设置中分别配置 TTS 合成、两位主持人的预置/声纹音色与 ASR 验收。TTS 自动模式优先采用服务默认且符合固定 checkpoint revision 与设备资格表的组合，否则按已安装模型的质量排序回退；回退排序主要参考模型参数量，不代表所有备选都经过双基线资格评测。已有 `auto_select=false` 的人工选择保持不变。自定义表达指令时，若存在支持指令的已安装备选，会优先保留指令能力；不存在此类备选时仍返回原推荐；ASR 自动模式采用服务推荐的模型与设备，两者分别控制 GPU 失败时是否回退同模型 CPU，不会为了速度静默降低模型质量。脚本提示词限制突发愤怒、高亢和夸张标点，TTS 对支持表达指令的预置音色使用整集固定的稳定约束；声纹模式始终使用配置时解析的固定样本。整集仅因时长超过 120% 时可使用一次受引用约束的压缩恢复，未变化轮次继续复用已经并行生成的音频。双说话人分离、时间对齐及 CER/WER 等验收门槛保持固定。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
 
-Sandevistan Audio Provider 可在设置中分别配置 TTS 合成、两位主持人的预置/声纹音色与 ASR 验收。TTS 自动模式采用服务默认且通过固定 checkpoint revision 资格门槛的模型与设备；已有 `auto_select=false` 的人工选择保持不变，自定义表达指令时也不会自动切到不支持指令的模型；ASR 自动模式采用服务推荐的模型与设备，两者分别控制 GPU 失败时是否回退同模型 CPU，不会为了速度静默降低模型质量。脚本提示词限制突发愤怒、高亢和夸张标点，TTS 对支持表达指令的预置音色使用整集固定的稳定约束；声纹模式始终使用配置时解析的固定样本。整集仅因时长超过 120% 时可使用一次受引用约束的压缩恢复，未变化轮次继续复用已经并行生成的音频。双说话人分离、时间对齐及 CER/WER 等验收门槛保持固定。高质量 CPU 合成通常比音频实时长度慢数倍，任务支持取消和项目内断点续跑。最终音频优先输出为经过响度统一的 AAC/M4A，旧版 WAV 产物保持兼容。
+批量合成默认开启，可在 AUDIO 设置中关闭并保存；开关本身不改变模型、精度或最终文本顺序。通过 `GET /api/artifacts/{id}` 返回的 `payload.performance` 可查看脚本、TTS、总耗时与重叠时长，`payload.provider` 记录批量大小、复用轮次和降级原因。`serial_estimate_seconds` 与 `overlap_gain_ratio` 是本次运行推算值，并非另跑一遍串行流程的实测收益；旧产物可能没有这些字段。
 
-批量合成默认开启并可临时关闭，不改变模型、精度或文本顺序。产物记录脚本、TTS、总耗时、重叠时长、批量大小与降级原因，便于比较优化收益。
-
-新的 TTS 模型/设备组合只有在固定 revision 的客观门禁和双基线声学门禁都通过后，才会进入 Podcast 自动推荐资格表。`scripts/qualify_podcast_tts.py prepare --manifest <manifest.json>` 会用同一冻结文字稿生成批量候选、核对既有逐轮基线，并输出匿名 A/B/C 音频和评分模板；随后用 `auto-finalize --run-dir <目录> --manifest <manifest.json>` 执行可重复的完整性、可懂度、说话人一致性、韵律稳定性、听觉疲劳代理指标及修复率终验。人工复核仍可填写模板并用 `finalize --run-dir <目录> --scores <评分.json>` 解盲，但不再阻塞自动发布资格。资格同时绑定模型 checkpoint 与计算设备，GPU 结论不会授权 CPU，revision 改变时自动失效；未通过时自动模式继续选择已验证的高质量回退，候选仍可手动使用。
+TTS 服务默认组合的资格表绑定 checkpoint revision 与计算设备；GPU 结论不授权 CPU，revision 改变时该组合失去服务默认优先资格。当前 `scripts/qualify_podcast_tts.py` 固定比较 0.6B/GPU 批量候选与 0.6B/GPU、1.7B/CPU 两组逐轮基线；`prepare`、`auto-finalize` 和可选人工 `finalize` 只生成本地评测报告，不修改 Provider 配置或资格表。维护者在核对固定 revision、实际设备和通过的客观/双基线声学报告后，另行更新代码中的资格表。自动声学指标属于代理指标，人工盲听可作为补充。
 
 ## 任务与 Notebook 管理
 
-网页顶部的 `TASKS` 提供全局任务记录、搜索、类型/状态筛选、分页、阶段事件、真实计数、排队位置与本地历史 ETA。执行中的任务可安全终止；终止后删除任务只移除任务记录和任务专属临时文件，不会删除正式资料或已完成的 Studio 产物。ETA 少于 5 个同类本地样本时显示“学习中”，不会使用静态倍速冒充预测。
+网页顶部的 `TASKS` 提供全局任务记录、搜索、类型/状态筛选、分页、阶段事件、真实计数、排队位置与本地历史 ETA。排队中的任务可立即取消，执行中的任务可安全终止；终止后删除任务只移除任务记录和任务专属临时文件，不会删除正式资料或已完成的 Studio 产物。ETA 少于 5 个同类本地样本时显示“学习中”，不会使用静态倍速冒充预测。
+
+解析任务取消后，尚未完成的资料会显示“解析已取消”（API 状态为 `failed`），并取消勾选；已经完成索引的资料保持可用。服务启动时会校正旧版本遗留的排队状态，仅处理最新解析任务已取消且没有其他活动解析任务的资料，不重新解析或删除原文件。
 
 `NOTEBOOKS` 提供统一的资料库管理与空间统计，并支持勾选当前页中的多个 ACTIVE Notebook 批量删除。单项删除前必须输入完整名称，批量删除必须输入固定短语“批量删除”；系统会先取消关联任务，再清理文档、索引、对话、产物和登记的本地资源。清理操作写入 SQLite，可在服务重启后继续，失败时可在界面重试。

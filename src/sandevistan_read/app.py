@@ -12,12 +12,14 @@ from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Q
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
+from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import SUPPORTED_EXTENSIONS, sanitize_filename
-from .jobs import WORKER, enqueue
+from .jobs import WORKER, enqueue, reconcile_cancelled_ingests, request_cancel
 from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete, request_notebook_deletes
-from .observability import Reporter, present_job
+from .observability import present_job
 from .paths import PATHS
 from .providers import ProviderError, active_provider, audio_provider_readiness, health, inspect_provider, normalize_provider_base_url, probe_audio_provider, probe_chat_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
 from .retrieval import EMBEDDINGS
@@ -30,6 +32,7 @@ from .study_sessions import answer_quiz, create_session, flashcards_csv, get_ses
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DB.initialize(); DB.seed(CONFIG.development.ollama_url, CONFIG.development.ollama_model, CONFIG.development.audio_url); DB.reset_running_jobs()
+    reconcile_cancelled_ingests()
     backfill_resources(); reconcile_legacy_podcast_temps(); process_cleanup_operations()
     audio = active_provider("audio")
     if audio:
@@ -46,7 +49,7 @@ async def lifespan(app: FastAPI):
     await WORKER.stop()
 
 
-app = FastAPI(title="Sandevistan-Read", version="0.4.1", lifespan=lifespan)
+app = FastAPI(title="Sandevistan-Read", version=__version__, lifespan=lifespan)
 
 
 def request_token(request: Request, authorization: str | None = None) -> str:
@@ -58,7 +61,7 @@ def require_access(request: Request, authorization: str | None = Header(default=
     if not VAULT.verify_session(request_token(request, authorization), CONFIG.security.access_key): raise HTTPException(401, "需要访问密钥")
 
 
-api = FastAPI(dependencies=[Depends(require_access)])
+api = FastAPI(title="Sandevistan-Read API", version=__version__, dependencies=[Depends(require_access)])
 _STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
 _STATUS_LOCK = asyncio.Lock()
 
@@ -105,7 +108,7 @@ async def status():
         }
         roles = ("main", "vlm", "audio")
         health_results = await asyncio.gather(*(health(role) for role in roles))
-        value = {"name": "Sandevistan-Read", "version": "0.4.1", "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
+        value = {"name": "Sandevistan-Read", "version": __version__, "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
         _STATUS_CACHE.update({"at": time.monotonic(), "value": value})
         return value
 
@@ -333,7 +336,7 @@ def podcast(notebook_id: str, body: PodcastRequest):
     return enqueue("podcast", notebook_id, body.model_dump())
 
 
-@api.get("/notebooks/{notebook_id}/artifacts")
+@api.get("/notebooks/{notebook_id}/artifacts", responses=ARTIFACT_LIST_RESPONSES)
 def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     rows = DB.fetchall("SELECT * FROM artifacts WHERE notebook_id=? AND (? IS NULL OR type=?) ORDER BY created_at DESC", (notebook_id, type, type))
     if view == "summary":
@@ -345,7 +348,7 @@ def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     return [public_artifact(item) for item in output]
 
 
-@api.get("/artifacts/{artifact_id}")
+@api.get("/artifacts/{artifact_id}", responses=ARTIFACT_RESPONSES)
 def artifact(artifact_id: str):
     row = DB.fetchone("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
     if not row:
@@ -415,6 +418,7 @@ def start_study_session(artifact_id: str, body: StudySessionCreate):
 
 @api.get("/study-sessions/{session_id}")
 def study_session(session_id: str):
+    """Return the effective queue and progress, excluding suspended flashcards."""
     try:
         return get_session(session_id)
     except ValueError as exc:
@@ -431,6 +435,7 @@ def study_quiz_answer(session_id: str, body: QuizAnswer):
 
 @api.post("/study-sessions/{session_id}/flashcard-review")
 def study_flashcard_review(session_id: str, body: FlashcardSessionReview):
+    """Review an available card; suspended cards return 409 without changing their schedule."""
     try:
         return review_flashcard(session_id, body.item_id, body.rating)
     except ValueError as exc:
@@ -439,6 +444,7 @@ def study_flashcard_review(session_id: str, body: FlashcardSessionReview):
 
 @api.delete("/artifacts/{artifact_id}/flashcards/{card_id}", status_code=204)
 def hide_flashcard(artifact_id: str, card_id: str):
+    """Suspend a card and reconcile active sessions while preserving review history; returns 204."""
     try:
         suspend_flashcard(artifact_id, card_id)
     except ValueError as exc:
@@ -508,14 +514,9 @@ def job_events(job_id: str):
 
 @api.post("/jobs/{job_id}/cancel")
 def cancel(job_id: str):
-    row = DB.fetchone("SELECT state FROM jobs WHERE id=?", (job_id,))
-    if not row: raise HTTPException(404, "任务不存在")
-    if row["state"] == "queued":
-        Reporter(job_id).update("cancelled", "已取消", 1, state="cancelled")
-        DB.execute("UPDATE jobs SET cancel_requested=1,finished_at=?,updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
-    elif row["state"] == "running":
-        DB.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (utc_now(), job_id))
-        Reporter(job_id).update("cancelling", "正在安全终止", float((DB.fetchone("SELECT progress FROM jobs WHERE id=?", (job_id,)) or {"progress": 0})["progress"]), state="cancelling")
+    """Cancel idempotently; unfinished ingest sources become failed with an explicit cancellation reason."""
+    if not request_cancel(job_id):
+        raise HTTPException(404, "任务不存在")
     return {"ok": True}
 
 
@@ -534,7 +535,7 @@ def batch_purge(job_ids: list[str] = Body(..., embed=True)):
     return {"items": results}
 
 
-@api.get("/providers")
+@api.get("/providers", responses=PROVIDER_LIST_RESPONSES)
 def providers():
     rows = []
     for row in DB.fetchall("SELECT * FROM provider_profiles ORDER BY role,name"):
@@ -644,7 +645,7 @@ def _inspection_conflict(inspection: dict[str, Any]) -> HTTPException:
     return HTTPException(409, {"message": message, "inspection": inspection})
 
 
-@api.post("/providers/inspect")
+@api.post("/providers/inspect", responses=INSPECTION_RESPONSES, description="检查候选配置，不保存。catalog 读取实时能力；deep 使用固定测试内容执行真实调用，AUDIO 包含短 TTS→ASR 闭环，可能产生服务费用。")
 async def inspect_provider_configuration(body: ProviderInspectionRequest):
     key = body.api_key
     if body.provider_id and key is None:
@@ -655,7 +656,7 @@ async def inspect_provider_configuration(body: ProviderInspectionRequest):
     return await inspect_provider(_provider_candidate(body, api_key=key or ""), body.mode)
 
 
-@api.post("/providers")
+@api.post("/providers", responses=PROVIDER_CREATE_RESPONSES)
 async def create_provider(body: ProviderCreate):
     identifier, now = new_id("provider"), utc_now()
     candidate = _provider_candidate(body)
@@ -685,7 +686,7 @@ async def create_provider(body: ProviderCreate):
     return {"id": identifier, "active": body.active, "inspection": inspection}
 
 
-@api.patch("/providers/{provider_id}")
+@api.patch("/providers/{provider_id}", responses=PROVIDER_UPDATE_RESPONSES, description="局部更新 Provider 顶层字段；提供 config 时替换整个配置对象，而非合并内部键。启用状态下的实质修改会重新验证。")
 async def update_provider(provider_id: str, body: ProviderUpdate):
     row = provider_by_id(provider_id)
     if not row:
@@ -733,7 +734,7 @@ async def update_provider(provider_id: str, body: ProviderUpdate):
     return {"ok": True, "active": target_active}
 
 
-@api.post("/providers/{provider_id}/test")
+@api.post("/providers/{provider_id}/test", responses=PROVIDER_TEST_RESPONSES)
 async def test_provider(provider_id: str):
     provider = provider_by_id(provider_id)
     if not provider:
@@ -742,7 +743,7 @@ async def test_provider(provider_id: str):
     return {"ok": inspection.get("activation_eligible", False), **inspection}
 
 
-@api.post("/providers/{provider_id}/probe")
+@api.post("/providers/{provider_id}/probe", responses=PROVIDER_PROBE_RESPONSES)
 async def probe_provider(provider_id: str):
     row = DB.fetchone("SELECT role FROM provider_profiles WHERE id=?", (provider_id,))
     if not row:

@@ -1,6 +1,6 @@
 [project]
 name = "sandevistan-read"
-version = "0.4.1"
+version = "0.4.2"
 description = "Local-first, source-grounded document intelligence workspace"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

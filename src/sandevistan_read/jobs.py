@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
 import time
 import wave
 from pathlib import Path
@@ -62,22 +63,87 @@ def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_
     return DB.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,)) or {}
 
 
-def _update(job_id: str, *, state: str | None = None, stage: str | None = None, progress: float | None = None, result: Any = None, error: str | None = None) -> None:
-    row = DB.fetchone("SELECT state,stage,stage_code,progress,started_at FROM jobs WHERE id=?", (job_id,)) or {}
-    next_state = state or row.get("state", "queued")
-    stage_code = {"queued":"queued","running":"running","cancelling":"cancelling","complete":"complete","failed":"failed","cancelled":"cancelled"}.get(next_state, row.get("stage_code", "running"))
-    Reporter(job_id).update(stage_code, stage or row.get("stage", "处理中"), progress if progress is not None else float(row.get("progress", 0)), state=next_state)
-    fields, values = ["updated_at=?"], [utc_now()]
-    if error is not None:
-        fields.append("error=?"); values.append(error)
-    if result is not None:
-        fields.append("result_json=?"); values.append(json_dump(result))
-    if state == "running" and not row.get("started_at"):
-        fields.extend(["started_at=?", "attempts=attempts+1"]); values.append(utc_now())
-    if state in {"complete", "failed", "cancelled"}:
-        fields.append("finished_at=?"); values.append(utc_now())
-    values.append(job_id)
-    DB.execute(f"UPDATE jobs SET {','.join(fields)} WHERE id=?", tuple(values))
+def _cancel_ingest_source(job: dict[str, Any], connection: sqlite3.Connection) -> None:
+    if job["kind"] != "ingest":
+        return
+    source_id = json_load(job["payload_json"], {}).get("source_id")
+    active = connection.execute("SELECT payload_json FROM jobs WHERE kind='ingest' AND state IN ('queued','running','cancelling') AND id<>?", (job["id"],))
+    if any(json_load(row["payload_json"], {}).get("source_id") == source_id for row in active):
+        return
+    connection.execute("UPDATE sources SET state='failed',selected=0,error='解析已取消',updated_at=? WHERE id=? AND state IN ('queued','processing')", (utc_now(), source_id))
+
+
+def _finish_cancelled(job: dict[str, Any], connection: sqlite3.Connection) -> None:
+    if job["state"] in {"complete", "failed", "cancelled"}:
+        return
+    Reporter(job["id"]).update("cancelled", "已取消", 1, state="cancelled", connection=connection)
+    now = utc_now()
+    connection.execute("UPDATE jobs SET cancel_requested=1,finished_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
+    _cancel_ingest_source(job, connection)
+
+
+def request_cancel(job_id: str) -> bool:
+    """Cancel queued work atomically, or request cooperative cancellation of running work."""
+    with DB.transaction() as connection:
+        row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return False
+        job = dict(row)
+        if job["state"] == "queued":
+            _finish_cancelled(job, connection)
+        elif job["state"] == "running":
+            connection.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
+            Reporter(job_id).update("cancelling", "正在安全终止", job["progress"], state="cancelling", connection=connection)
+    return True
+
+
+def _claim_next_job() -> dict[str, Any] | None:
+    with DB.transaction() as connection:
+        row = connection.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
+        if not row:
+            return None
+        job = dict(row)
+        if job["cancel_requested"]:
+            _finish_cancelled(job, connection)
+            return None
+        Reporter(job["id"]).update("running", "准备执行", 0.01, state="running", connection=connection)
+        connection.execute("UPDATE jobs SET started_at=COALESCE(started_at,?),attempts=attempts+1 WHERE id=?", (utc_now(), job["id"]))
+        return dict(connection.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone())
+
+
+def _finish_job(job_id: str, *, result: Any = None, error: str | None = None) -> None:
+    with DB.transaction() as connection:
+        row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row or row["state"] not in {"running", "cancelling"}:
+            return
+        job = dict(row)
+        if job["cancel_requested"]:
+            _finish_cancelled(job, connection)
+            return
+        failed = error is not None
+        Reporter(job_id).update("failed" if failed else "complete", "失败" if failed else "完成",
+                               job["progress"] if failed else 1, state="failed" if failed else "complete", connection=connection)
+        now = utc_now()
+        connection.execute("UPDATE jobs SET result_json=?,error=?,finished_at=?,updated_at=? WHERE id=?",
+                           (json_dump(result) if result is not None else None, error, now, now, job_id))
+        if failed and job["kind"] == "ingest":
+            source_id = json_load(job["payload_json"], {}).get("source_id")
+            connection.execute("UPDATE sources SET state='failed',selected=0,error=?,updated_at=? WHERE id=? AND state IN ('queued','processing')", (error, now, source_id))
+
+
+def reconcile_cancelled_ingests() -> None:
+    """Repair attributable legacy source states before starting the worker; safe to repeat."""
+    with DB.transaction() as connection:
+        rows = connection.execute("SELECT * FROM jobs WHERE kind='ingest' ORDER BY created_at DESC,rowid DESC").fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            job = dict(row)
+            source_id = json_load(job["payload_json"], {}).get("source_id")
+            if not source_id or source_id in seen:
+                continue
+            seen.add(source_id)
+            if job["state"] == "cancelled":
+                _cancel_ingest_source(job, connection)
 
 
 async def _run_ffmpeg(arguments: list[str], timeout: float, cancel_check: Callable[[], bool]) -> tuple[int, str]:
@@ -124,6 +190,8 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
     provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
+    if snapshot.get("audio") and not provider:
+        raise RuntimeError("任务绑定的 AUDIO Provider 不存在")
     ready, readiness_message = audio_provider_readiness(provider)
     if not ready or not provider:
         raise RuntimeError(readiness_message)
@@ -607,6 +675,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     try:
         asr_result = await transcribe_audio(
             destination,
+            provider=provider,
             language="English" if language == "en" else "Chinese",
             cancel_check=cancel_check,
             idempotency_key=f"sread-asr-{suffix[:36]}",
@@ -630,6 +699,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             raise RuntimeError("修复后的成品音频实际时长未通过质量门槛")
         asr_result = await transcribe_audio(
             destination,
+            provider=provider,
             language="English" if language == "en" else "Chinese",
             cancel_check=cancel_check,
             idempotency_key=f"sread-asr-{suffix[:32]}-verify",
@@ -731,26 +801,16 @@ class JobWorker:
 
     async def run(self) -> None:
         while not self.stopped:
-            job = DB.fetchone("SELECT * FROM jobs WHERE state='queued' ORDER BY created_at LIMIT 1")
+            job = _claim_next_job()
             if not job:
                 process_cleanup_operations()
-                await asyncio.sleep(0.4); continue
-            if job["cancel_requested"]:
-                _update(job["id"], state="cancelled", stage="已取消", progress=1); continue
-            _update(job["id"], state="running", stage="准备执行", progress=0.01)
+                await asyncio.sleep(0.4)
+                continue
             try:
                 result = await execute(job)
-                latest = DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job["id"],)) or {}
-                if latest.get("cancel_requested"):
-                    _update(job["id"], state="cancelled", stage="已取消", progress=1)
-                else:
-                    _update(job["id"], state="complete", stage="完成", progress=1, result=result)
+                _finish_job(job["id"], result=result)
             except Exception as exc:
-                cancelled = bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job["id"],)) or {}).get("cancel_requested"))
-                _update(job["id"], state="cancelled" if cancelled else "failed", stage="已取消" if cancelled else "失败", progress=1 if cancelled else None, error=str(exc))
-                if job["kind"] == "ingest":
-                    payload = json_load(job["payload_json"], {})
-                    DB.execute("UPDATE sources SET state='failed',error=?,updated_at=? WHERE id=?", (str(exc), utc_now(), payload.get("source_id")))
+                _finish_job(job["id"], error=str(exc))
             finally:
                 process_cleanup_operations()
 

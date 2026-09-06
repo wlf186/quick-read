@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -47,26 +48,34 @@ class Reporter:
         self, stage_code: str, stage: str, progress: float, *, state: str | None = None,
         current: float | None = None, total: float | None = None, unit: str | None = None,
         basis: str = "observed", detail: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
-        row = DB.fetchone("SELECT progress,state,started_at FROM jobs WHERE id=?", (self.job_id,))
-        if not row:
+        if connection is None:
+            with DB.transaction() as transaction:
+                self.update(stage_code, stage, progress, state=state, current=current, total=total,
+                            unit=unit, basis=basis, detail=detail, connection=transaction)
+            return
+        row = connection.execute("SELECT progress,state,started_at FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+        if not row or row["state"] in {"complete", "failed", "cancelled"}:
+            return
+        next_state = state or row["state"]
+        # A late progress callback cannot undo a cancellation request.
+        if row["state"] == "cancelling" and next_state != "cancelled":
             return
         progress = min(1.0, max(float(row["progress"]), float(progress)))
         now = utc_now()
-        next_state = state or row["state"]
-        processing = _seconds(row.get("started_at"), now if next_state in {"complete", "failed", "cancelled"} else None)
-        with DB.transaction() as connection:
-            connection.execute(
-                """UPDATE jobs SET state=?,stage_code=?,stage=?,progress=?,stage_progress=?,progress_basis=?,
-                stage_current=?,stage_total=?,stage_unit=?,activity_json=?,processing_seconds=?,updated_at=? WHERE id=?""",
-                (next_state, stage_code, stage, progress, progress, basis, current, total, unit,
-                 json_dump(detail or {}), processing, now, self.job_id),
-            )
-            connection.execute(
-                """INSERT INTO job_events(job_id,state,stage_code,stage,progress,stage_current,stage_total,stage_unit,detail_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (self.job_id, next_state, stage_code, stage, progress, current, total, unit, json_dump(detail or {}), now),
-            )
+        processing = _seconds(row["started_at"], now if next_state in {"complete", "failed", "cancelled"} else None)
+        connection.execute(
+            """UPDATE jobs SET state=?,stage_code=?,stage=?,progress=?,stage_progress=?,progress_basis=?,
+            stage_current=?,stage_total=?,stage_unit=?,activity_json=?,processing_seconds=?,updated_at=? WHERE id=?""",
+            (next_state, stage_code, stage, progress, progress, basis, current, total, unit,
+             json_dump(detail or {}), processing, now, self.job_id),
+        )
+        connection.execute(
+            """INSERT INTO job_events(job_id,state,stage_code,stage,progress,stage_current,stage_total,stage_unit,detail_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (self.job_id, next_state, stage_code, stage, progress, current, total, unit, json_dump(detail or {}), now),
+        )
 
 
 def estimate(job: dict[str, Any], queue_position: int = 0) -> dict[str, Any]:

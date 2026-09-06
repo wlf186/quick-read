@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
+from .api_docs import PROVIDER_CONFIG_DOCS
 from .context_budget import resolve_temperature, validate_token_overrides
 
 
@@ -118,7 +119,7 @@ class ProviderCreate(BaseModel):
     model: str = Field(default="", max_length=240)
     api_key: str = ""
     capabilities: dict[str, Any] = Field(default_factory=dict)
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict, json_schema_extra=PROVIDER_CONFIG_DOCS)
     active: bool = True
     validation_mode: ProviderValidationMode = "catalog"
 
@@ -140,7 +141,7 @@ class ProviderUpdate(BaseModel):
     model: str | None = Field(default=None, max_length=240)
     api_key: str | None = None
     capabilities: dict[str, Any] | None = None
-    config: dict[str, Any] | None = None
+    config: dict[str, Any] | None = Field(default=None, json_schema_extra=PROVIDER_CONFIG_DOCS)
     active: bool | None = None
     validation_mode: ProviderValidationMode = "catalog"
 
@@ -158,7 +159,7 @@ class ProviderInspectionRequest(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
     model: str = Field(default="", max_length=240)
     api_key: str | None = None
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict, json_schema_extra=PROVIDER_CONFIG_DOCS)
     mode: ProviderValidationMode = "catalog"
 
     @model_validator(mode="before")

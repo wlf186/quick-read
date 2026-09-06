@@ -47,6 +47,8 @@ export default function App(){
   const[loginError,setLoginError]=useState('');
   const[bootError,setBootError]=useState('');
   const loadSequence=useRef(0);
+  const chatContext=useRef({notebookId:activeId,generation:0,request:0});
+  const[chatLoading,setChatLoading]=useState(true);
   const workspaceVersions=useRef<Record<string,string>>({});
 
   const notify=useCallback((message:string,tone:ToastState['tone']='info')=>setToast({id:Date.now(),message,tone}),[]);
@@ -56,13 +58,23 @@ export default function App(){
     else notify(message,'error');
   },[notify]);
 
+  const activateNotebook=useCallback((id:string)=>{
+    const context=chatContext.current;
+    if(context.notebookId===id)return;
+    chatContext.current={notebookId:id,generation:context.generation+1,request:context.request+1};
+    loadSequence.current+=1;
+    setActiveId(id);persistNotebook(id);setNotebook(undefined);setArtifacts([]);setJobs([]);
+    setConversationId(undefined);setMessages([]);setQuestion('');setBusy(false);setChatLoading(Boolean(id));
+    workspaceVersions.current={};
+  },[]);
+  const newConversation=useCallback(()=>{
+    chatContext.current.generation+=1;chatContext.current.request+=1;
+    setConversationId(undefined);setMessages([]);setQuestion('');setBusy(false);
+  },[]);
   const reconcileNotebooks=useCallback((list:Notebook[])=>{
     setNotebooks(list);
-    setActiveId(current=>{
-      if(current&&list.some(item=>item.id===current))return current;
-      const next=list[0]?.id||'';persistNotebook(next);return next;
-    });
-  },[]);
+    if(!list.some(item=>item.id===chatContext.current.notebookId))activateNotebook(list[0]?.id||'');
+  },[activateNotebook]);
 
   const initialize=useCallback(async()=>{
     setBootError('');setPhase('loading');
@@ -72,13 +84,13 @@ export default function App(){
       const[list,nextProviders,nextRoles,nextImagePolicy]=await Promise.all([getNotebooks(),getProviders(),getProviderRoles(),getImageProcessingPolicy()]);
       setNotebooks(list);setProviders(nextProviders);setProviderRoles(nextRoles);setImagePolicy(nextImagePolicy);
       const preferred=storedNotebook();const next=list.some(item=>item.id===preferred)?preferred:list[0]?.id||'';
-      setActiveId(next);persistNotebook(next);setPhase('ready');
+      activateNotebook(next);setPhase('ready');
       void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}));
     }catch(error){
       if(error instanceof Error&&error.message==='AUTH_REQUIRED'){setPhase('locked');return}
       const message=error instanceof Error?error.message:'无法启动应用';setBootError(message);setPhase('error');
     }
-  },[]);
+  },[activateNotebook]);
 
   const loadGlobal=useCallback(async()=>{
     const[list,nextProviders,nextRoles,nextImagePolicy]=await Promise.all([getNotebooks(),getProviders(),getProviderRoles(),getImageProcessingPolicy()]);
@@ -89,17 +101,22 @@ export default function App(){
   const refreshNotebooks=useCallback(async()=>reconcileNotebooks(await getNotebooks()),[reconcileNotebooks]);
 
   const loadCurrent=useCallback(async(id:string,loadHistory=false)=>{
-    const sequence=++loadSequence.current;
-    if(!id){setNotebook(undefined);setArtifacts([]);setJobs([]);setConversationId(undefined);setMessages([]);return}
-    const historyPromise=loadHistory?getConversations(id):Promise.resolve<any[]|null>(null);
-    const[current,nextArtifacts,nextJobs,conversations]=await Promise.all([getNotebook(id),getArtifacts(id),getJobs(id),historyPromise]);
-    if(sequence!==loadSequence.current)return;
-    setNotebook(current);setArtifacts(nextArtifacts);setJobs(nextJobs);
-    if(loadHistory&&conversations){
-      const latest=conversations[0];
-      if(latest){const nextMessages=await getMessages(latest.id);if(sequence!==loadSequence.current)return;setConversationId(latest.id);setMessages(nextMessages)}
-      else{setConversationId(undefined);setMessages([])}
-    }
+    if(id!==chatContext.current.notebookId)return;
+    const sequence=++loadSequence.current,generation=chatContext.current.generation,request=chatContext.current.request;
+    const isCurrent=()=>id===chatContext.current.notebookId&&generation===chatContext.current.generation;
+    if(!id){setNotebook(undefined);setArtifacts([]);setJobs([]);setConversationId(undefined);setMessages([]);setChatLoading(false);return}
+    try{
+      const historyPromise=loadHistory?getConversations(id):Promise.resolve<any[]|null>(null);
+      const[current,nextArtifacts,nextJobs,conversations]=await Promise.all([getNotebook(id),getArtifacts(id),getJobs(id),historyPromise]);
+      if(!isCurrent())return;
+      if(sequence===loadSequence.current){setNotebook(current);setArtifacts(nextArtifacts);setJobs(nextJobs)}
+      if(loadHistory&&conversations&&request===chatContext.current.request){
+        const latest=conversations[0];
+        const nextMessages=latest?await getMessages(latest.id):[];
+        if(!isCurrent()||request!==chatContext.current.request)return;
+        setConversationId(latest?.id);setMessages(nextMessages);setChatLoading(false);
+      }
+    }catch(error){if(isCurrent()&&(!loadHistory||request===chatContext.current.request))throw error}
   },[]);
 
   useEffect(()=>{void initialize()},[initialize]);
@@ -110,9 +127,9 @@ export default function App(){
   useEffect(()=>{if(phase==='ready'){persistNotebook(activeId);void loadCurrent(activeId,true).catch(reportError)}},[activeId,loadCurrent,phase,reportError]);
   useEffect(()=>{
     if(phase!=='ready')return;
-    const refresh=()=>{if(document.hidden)return;void loadGlobal().catch(reportError);if(activeId)void loadCurrent(activeId,false).catch(reportError)};
+    const refresh=()=>{if(document.hidden)return;void loadGlobal().catch(reportError);if(activeId)void loadCurrent(activeId,chatLoading).catch(reportError)};
     window.addEventListener('focus',refresh);return()=>window.removeEventListener('focus',refresh);
-  },[activeId,loadCurrent,loadGlobal,phase,reportError]);
+  },[activeId,chatLoading,loadCurrent,loadGlobal,phase,reportError]);
   useEffect(()=>{
     if(phase!=='ready'||!activeId||!jobs.some(job=>['queued','running','cancelling'].includes(job.state)))return;
     let timer:number|undefined,stopped=false,inFlight=false,failures=0;
@@ -121,13 +138,16 @@ export default function App(){
       if(stopped||inFlight||document.hidden||!navigator.onLine)return;
       inFlight=true;
       try{
-        const state=await getWorkspaceState(activeId,controller.signal);failures=0;
-        const prior=workspaceVersions.current;workspaceVersions.current=state.versions;
-        setJobs([...state.active_jobs,...state.failed_jobs]);
+        const state=await getWorkspaceState(activeId,controller.signal);if(stopped)return;failures=0;
+        const prior=workspaceVersions.current;
         const refreshNotebook=prior.notebook!==state.versions.notebook||prior.sources!==state.versions.sources;
         const refreshArtifacts=prior.artifacts!==state.versions.artifacts;
-        if(refreshNotebook)setNotebook(await getNotebook(activeId));
-        if(refreshArtifacts)setArtifacts(await getArtifacts(activeId));
+        const[current,nextArtifacts]=await Promise.all([refreshNotebook?getNotebook(activeId):undefined,refreshArtifacts?getArtifacts(activeId):undefined]);
+        if(stopped)return;
+        workspaceVersions.current=state.versions;
+        if(current)setNotebook(current);
+        if(nextArtifacts)setArtifacts(nextArtifacts);
+        setJobs([...state.active_jobs,...state.failed_jobs]);
         if(state.has_active_jobs&&!stopped)timer=window.setTimeout(poll,3000);
       }catch(error){if(!stopped&&!(error instanceof DOMException&&error.name==='AbortError')){failures+=1;timer=window.setTimeout(poll,Math.min(30000,3000*2**failures))}}
       finally{inFlight=false}
@@ -149,12 +169,15 @@ export default function App(){
   const mainProvider=providers.find(provider=>provider.role==='main'&&provider.active);
   function openAudioSettings(){setTabletStudio(false);setSettings(true)}
   async function onAsk(){
-    if(!notebook||!question.trim()||busy)return;
+    if(!notebook||notebook.id!==chatContext.current.notebookId||chatLoading||!question.trim()||busy)return;
     if(!selected.length){notify('请先选择至少一份已完成索引的资料','error');return}
+    const context=chatContext.current,generation=context.generation,request=++context.request;
+    const isCurrent=()=>chatContext.current===context&&context.generation===generation&&context.request===request;
     const content=question.trim(),optimisticId=`local-${Date.now()}`;setQuestion('');setMessages(value=>[...value,{id:optimisticId,role:'user',content}]);setBusy(true);
-    try{const result=await ask(notebook.id,content,selected,conversationId);setConversationId(result.conversation_id);setMessages(value=>[...value,{role:'assistant',...result}])}
-    catch(error){setMessages(value=>value.filter(message=>message.id!==optimisticId));setQuestion(content);reportError(error)}finally{setBusy(false)}
+    try{const result=await ask(notebook.id,content,selected,conversationId);if(!isCurrent())return;setConversationId(result.conversation_id);setMessages(value=>[...value,{role:'assistant',...result}])}
+    catch(error){if(!isCurrent())return;setMessages(value=>value.filter(message=>message.id!==optimisticId));setQuestion(content);reportError(error)}finally{if(isCurrent())setBusy(false)}
   }
+
   async function onUpload(files:FileList|File[],policy:ImageProcessingPolicy=imagePolicy){
     if(!notebook){notify('请先新建或选择一个 Notebook','error');throw new Error('NO_NOTEBOOK')}
     try{await upload(notebook.id,files,policy);notify('资料已接入，正在本地解析','success');await loadCurrent(notebook.id)}catch(error){reportError(error);throw error}
@@ -180,7 +203,7 @@ export default function App(){
     try{await createArtifact(notebook.id,'podcasts',selected,options);setPodcastOpen(false);notify('PODCAST V2 · 正在构建全篇证据地图','success');await loadCurrent(notebook.id)}catch(error){reportError(error);throw error}
   }
   async function onCreateNotebook(title:string){
-    try{const created=await createNotebook(title);const list=await getNotebooks();setNotebooks(list);setActiveId(created.id);persistNotebook(created.id);location.hash='workspace';notify('Notebook 已创建','success')}catch(error){reportError(error);throw error}
+    try{const created=await createNotebook(title);const list=await getNotebooks();setNotebooks(list);activateNotebook(created.id);location.hash='workspace';notify('Notebook 已创建','success')}catch(error){reportError(error);throw error}
   }
   async function saveProvider(id:string,body:Record<string,any>){
     try{await updateProvider(id,body);setProviders(await getProviders());notify('Provider 配置已保存','success');void getStatus().then(setStatus).catch(()=>setStatus({providers:{}}))}catch(error){reportError(error);throw error}
@@ -202,8 +225,8 @@ export default function App(){
 
   const studio=<StudioRail hasNotebook={Boolean(notebook)} selectedCount={selected.length} podcastUnavailableReason={podcastUnavailableReason} onCreate={onCreate} onOpen={summary=>void openArtifact(summary)} onConfigureAudio={openAudioSettings} artifacts={artifacts} jobs={jobs}/>;
   return <div className={`shell route-${route}`}>
-    <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={setActiveId} onCreate={onCreateNotebook} onSettings={()=>setSettings(true)}/>
-    {route==='jobs'?<JobsPage onError={reportError}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{setActiveId(id);location.hash='workspace'}}/>:<section className="workspace-shell">
+    <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={activateNotebook} onCreate={onCreateNotebook} onSettings={()=>setSettings(true)}/>
+    {route==='jobs'?<JobsPage onError={reportError}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{activateNotebook(id);location.hash='workspace'}}/>:<section className="workspace-shell">
       <nav className="workspace-tabs" aria-label="工作区面板">
         <button className={workspacePanel==='chat'?'active':''} aria-pressed={workspacePanel==='chat'} onClick={()=>setWorkspacePanel('chat')}><MessageSquare/>对话</button>
         <button className={workspacePanel==='sources'?'active':''} aria-pressed={workspacePanel==='sources'} onClick={()=>setWorkspacePanel('sources')}><BookOpen/>资料 <b>{selected.length}</b></button>
@@ -211,11 +234,11 @@ export default function App(){
       </nav>
       <div className={`workspace workspace-panel-${workspacePanel}`}>
         <SourceRail hasNotebook={Boolean(notebook)} sources={notebook?.sources||[]} imagePolicy={imagePolicy} onUpload={onUpload} onToggle={onToggle} onDelete={onDeleteSource} onNotify={notify}/>
-        <ChatPanel hasNotebook={Boolean(notebook)} selectedCount={selected.length} messages={messages} question={question} setQuestion={setQuestion} onAsk={onAsk} busy={busy} onCitation={setCitation} onNewConversation={()=>{setConversationId(undefined);setMessages([])}} onOpenStudio={()=>setTabletStudio(true)}/>
+        <ChatPanel hasNotebook={Boolean(notebook)} selectedCount={selected.length} messages={messages} question={question} setQuestion={setQuestion} onAsk={onAsk} busy={busy} loading={chatLoading} onCitation={setCitation} onNewConversation={newConversation} onOpenStudio={()=>setTabletStudio(true)}/>
         {studio}
       </div>
     </section>}
-    <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.1</span></footer>
+    <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.2</span></footer>
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
     {settings?<SettingsDrawer status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}

@@ -1826,9 +1826,10 @@ async def transcribe_audio(
     language: str,
     cancel_check: Callable[[], bool] | None = None,
     idempotency_key: str | None = None,
+    provider: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Transcribe with the active AUDIO provider and its independent ASR settings."""
-    provider = active_provider("audio")
+    """Use the supplied task provider, or resolve the active AUDIO for standalone calls."""
+    provider = provider if provider is not None else active_provider("audio")
     ready, message = audio_provider_readiness(provider)
     if not ready or not provider:
         raise ProviderError(message, code="asr_unsupported")
