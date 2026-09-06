@@ -3,14 +3,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, Mapping
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -28,18 +29,33 @@ class ResolvedArchive:
 OpenUrl = Callable[[Request, float], BinaryIO]
 
 
+class ToolRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Request, fp: BinaryIO | None, code: int, msg: str,
+        headers: Mapping[str, str], newurl: str,
+    ) -> Request | None:
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and urlparse(req.full_url)[:2] != urlparse(newurl)[:2]:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 def _open(request: Request, timeout: float) -> BinaryIO:
-    return urlopen(request, timeout=timeout)  # noqa: S310 - URLs are repository-controlled.
+    return build_opener(ToolRedirectHandler()).open(request, timeout=timeout)
+
+
+def _github_headers(url: str, accept: str) -> dict[str, str]:
+    headers = {"Accept": accept, "User-Agent": USER_AGENT, "X-GitHub-Api-Version": "2022-11-28"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and urlparse(url)[:2] == ("https", "api.github.com"):
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _request_json(url: str, opener: OpenUrl) -> dict:
     request = Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": USER_AGENT,
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=_github_headers(url, "application/vnd.github+json"),
     )
     with opener(request, 30) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -82,11 +98,7 @@ def resolve_archive(lock: dict, tool: str, platform: str, opener: OpenUrl = _ope
         name=asset_name,
         url=asset_url,
         sha256=digest,
-        headers={
-            "Accept": "application/octet-stream",
-            "User-Agent": USER_AGENT,
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=_github_headers(asset_url, "application/octet-stream"),
     )
 
 

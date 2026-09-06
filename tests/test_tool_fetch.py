@@ -46,7 +46,8 @@ def test_resolve_fixed_archive() -> None:
     assert resolved.headers["User-Agent"]
 
 
-def test_resolve_github_release_asset_uses_api_digest() -> None:
+def test_resolve_github_release_asset_uses_api_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "fixture-token")
     digest = "a" * 64
     lock = {
         "demo": {
@@ -80,6 +81,26 @@ def test_resolve_github_release_asset_uses_api_digest() -> None:
     assert resolved.sha256 == digest
     assert resolved.headers["Accept"] == "application/octet-stream"
     assert seen[0].get_header("Accept") == "application/vnd.github+json"
+    assert seen[0].get_header("Authorization") == "Bearer fixture-token"
+    assert resolved.headers["Authorization"] == "Bearer fixture-token"
+
+
+@pytest.mark.parametrize("url", ["https://downloads.example.test/file", "http://api.github.com/file", "https://api.github.com.example.test/file"])
+def test_tool_token_is_only_attached_to_github_api(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "fixture-token")
+    assert "Authorization" not in fetch_tool._github_headers(url, "application/json")
+    assert "Authorization" not in fetch_tool.resolve_archive(fixed_lock(b"archive"), "demo", "windows-x86_64").headers
+
+
+@pytest.mark.parametrize("target,authorized", [
+    ("https://api.github.com/renamed", True),
+    ("https://release-assets.githubusercontent.com/file", False),
+    ("http://api.github.com/file", False),
+])
+def test_tool_redirect_strips_credentials_on_origin_change(target: str, authorized: bool) -> None:
+    request = Request("https://api.github.com/assets/1", headers={"Authorization": "Bearer fixture-token"})
+    redirected = fetch_tool.ToolRedirectHandler().redirect_request(request, None, 302, "Found", {}, target)
+    assert (redirected.get_header("Authorization") is not None) is authorized
 
 
 @pytest.mark.parametrize(
