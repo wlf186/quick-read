@@ -262,7 +262,8 @@ def test_extract_turns_accepts_compact_and_truncated_tuples() -> None:
         {"speaker": "HOST_A", "dialogue_act": "explain", "text": "完整解释", "claim_ids": ["C1"]},
         {"speaker": "HOST_B", "dialogue_act": "question", "text": "继续追问", "claim_ids": []},
     ]
-    assert podcast._act_output_tokens({"maximum_units": 4000}, 20, "zh-CN") == 10000
+    # 可见输出 10000 + structured_output_tokens 推理余量 4096
+    assert podcast._act_output_tokens({"maximum_units": 4000}, 20, "zh-CN") == 14096
 
 
 @pytest.mark.asyncio
@@ -360,10 +361,12 @@ async def test_editorial_act_retries_only_connection_setup_failure(monkeypatch: 
 @pytest.mark.asyncio
 async def test_editorial_act_retries_one_zero_turn_provider_response(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
+    boosts: list[float] = []
 
     async def fake_draft(**kwargs):
         nonlocal calls
         calls += 1
+        boosts.append(kwargs.get("output_boost", 1.0))
         if calls == 1:
             return podcast.SceneDraftResult([], ["模型没有返回可解析的 turns 数组（结束原因：stop）"], "stop")
         return podcast.SceneDraftResult([
@@ -381,6 +384,8 @@ async def test_editorial_act_retries_one_zero_turn_provider_response(monkeypatch
     assert len(turns) == 2 and audit["passed"] is True
     assert calls == 2
     assert state.empty_response_retry_used is True
+    # 空响应重试必须放大输出预算，而不是同参数空转
+    assert boosts == [1.0, 2.0]
 
 
 @pytest.mark.asyncio

@@ -243,10 +243,13 @@ def main() -> None:
         settings.get_by_label("Temperature 覆盖").fill("1")
         settings.get_by_label("上下文窗口覆盖（tokens）").fill("16384")
         settings.get_by_label("最大输出覆盖（tokens）").fill("2048")
+        settings.get_by_label("思考模式").select_option("disabled")
         settings.get_by_role("button", name="连接并读取模型").click()
         settings.get_by_text(re.compile("2 个模型 · 42 ms")).wait_for()
         assert inspection_requests[-1]["config"]["temperature"] == 1
+        assert inspection_requests[-1]["config"]["thinking"] == "disabled"
         assert settings.get_by_label("Temperature 覆盖").input_value() == "1"
+        assert settings.get_by_label("思考模式").input_value() == "disabled"
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
         assert_no_horizontal_overflow(page)
         page.screenshot(path="/tmp/sandevistan-read-provider-desktop.png")
@@ -570,6 +573,8 @@ def main() -> None:
         mobile_settings.get_by_role("button", name="添加 MAIN Provider").click()
         mobile_temperature = mobile_settings.get_by_label("Temperature 覆盖")
         assert mobile_temperature.is_visible()
+        assert mobile_settings.get_by_label("思考模式").is_visible()
+        assert "TTS→ASR" not in mobile_settings.locator(".provider-cost-note").inner_text()
         mobile_temperature.scroll_into_view_if_needed()
         assert_no_horizontal_overflow(mobile)
         panel_metrics = mobile_settings.evaluate("element => ({scroll: element.scrollWidth, client: element.clientWidth})")

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import re
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -18,7 +19,9 @@ from .context_budget import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_IMAGE_TOKENS,
     MIN_OUTPUT_WINDOW_TOKENS,
+    REASONING_OUTPUT_ESCALATION_CEILING,
     RETRY_SCALES,
+    SAFETY_RATIO,
     ContextUsage,
     PromptBudget,
     TokenLimits,
@@ -45,7 +48,11 @@ class ContextOverflowError(ProviderError):
 
 
 MAX_CATALOG_BYTES = 4 * 1024 * 1024
-TEST_IMAGE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII="
+# 224x224 solid-color PNG (678 bytes). Must stay above the ~3136-pixel min_pixels
+# floor used by vLLM/transformers vision stacks, or deep verification is rejected
+# with HTTP 400. Regenerate with:
+#   python -c "import base64,io;from PIL import Image;b=io.BytesIO();Image.new('RGB',(224,224),(64,128,192)).save(b,'PNG');print(base64.b64encode(b.getvalue()).decode())"
+TEST_IMAGE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAOAAAADgCAIAAACVT/22AAACbUlEQVR4nO3SMQHAIADAsDFlSEMa0nDAS49EQY+OufYHVf/rALgxKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDEqaQUkzKGkGJc2gpBmUNIOSZlDSDi93A0CmUUa3AAAAAElFTkSuQmCC"
 PODCAST_TTS_CANDIDATE_REVISIONS = {
     "qwen3-tts-0.6b": {
         "base": "5d83992436eae1d760afd27aff78a71d676296fc",
@@ -817,7 +824,7 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
             limits = TokenLimits.from_provider(provider)
             response = await client.post(
                 f"{provider['base_url']}/api/chat",
-                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": temperature, "num_predict": 64, "num_ctx": limits.effective_context_tokens}},
+                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": temperature, "num_predict": 128, "num_ctx": limits.effective_context_tokens}},
                 headers=headers,
             )
         else:
@@ -827,11 +834,20 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
                     {"type": "text", "text": "Reply with OK only."},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TEST_IMAGE_BASE64}"}},
                 ]
+            payload: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": content}], "temperature": temperature, "max_tokens": 512}
             response = await client.post(
                 f"{provider['base_url']}/v1/chat/completions",
-                json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": temperature, "max_tokens": 64},
+                json=payload,
                 headers=headers,
             )
+            if response.status_code == 400 and "max_tokens" in response.text:
+                # Newer OpenAI-style servers reject max_tokens in favor of max_completion_tokens.
+                payload["max_completion_tokens"] = payload.pop("max_tokens")
+                response = await client.post(
+                    f"{provider['base_url']}/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
         if not response.is_success:
             raise _provider_response_error(response)
         try:
@@ -840,13 +856,19 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
             raise ProviderError("Provider 返回了无法识别的验证结果") from exc
         if not isinstance(result, dict):
             raise ProviderError("Provider 返回了无法识别的验证结果")
+        first: dict[str, Any] | None = None
         if kind == "ollama":
             message = result.get("message")
         else:
             choices = result.get("choices")
             first = choices[0] if isinstance(choices, list) and choices else None
             message = first.get("message") if isinstance(first, dict) else None
-        if not isinstance(message, dict) or not str(message.get("content") or "").strip():
+        text = str(message.get("content") or "").strip() if isinstance(message, dict) else ""
+        reasoning = str(message.get("reasoning_content") or "").strip() if isinstance(message, dict) else ""
+        finish = first.get("finish_reason") if isinstance(first, dict) else None
+        # Reasoning models may spend the whole budget thinking; an empty reply with
+        # finish_reason "length" still proves the endpoint/model/image path works.
+        if not text and not reasoning and finish != "length":
             raise ProviderError("Provider 未返回验证文本")
 
 
@@ -933,17 +955,23 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
         eligible = False
         warning = f"{warning}；仅提供 TTS，不能用于 Podcast" if warning else "仅提供 TTS，不能用于 Podcast"
     if mode == "deep":
+        if provider["role"] in {"audio", "tts_only"}:
+            failure_hint = "检查模型、音色、设备及 Provider 日志"
+        elif provider["role"] == "vlm":
+            failure_hint = "检查模型与温度，确认模型支持图片输入，并查看 Provider 日志"
+        else:
+            failure_hint = "检查模型、温度及 Provider 日志"
         try:
             await _deep_verify(provider)
         except httpx.TimeoutException:
             return verification_error(code="timeout", message="深度验证超时", hint="模型可能仍在加载，请稍后重试")
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            return verification_error(code="verification_failed", message=f"模型调用失败（HTTP {status}）", hint="检查模型、能力和角色是否匹配", upstream_status=status)
+            return verification_error(code="verification_failed", message=f"模型调用失败（HTTP {status}）", hint=failure_hint, upstream_status=status)
         except ProviderError as exc:
-            return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、温度、音色、设备及 Provider 日志", upstream_status=exc.status)
+            return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint=failure_hint, upstream_status=exc.status)
         except httpx.HTTPError as exc:
-            return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint="检查模型、音色、设备及 Provider 日志")
+            return verification_error(code="verification_failed", message=str(exc) or "深度验证失败", hint=failure_hint)
         if provider["role"] in {"main", "vlm"}:
             eligible = True
             warning = context_warning
@@ -1100,7 +1128,15 @@ async def _chat_once(
             payload = {"model": provider["model"], "messages": messages, "temperature": request_temperature, "max_tokens": max_tokens}
             if json_mode:
                 payload["response_format"] = {"type": "json_object"}
+            thinking = str((provider.get("config") or {}).get("thinking") or "auto")
+            if thinking in {"disabled", "enabled"}:
+                # Zhipu-style thinking switch; reasoning tokens otherwise share the max_tokens budget.
+                payload["thinking"] = {"type": thinking}
             response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
+            if response.status_code == 400 and "thinking" in payload and "thinking" in response.text:
+                # Servers without a thinking switch (or forced-thinking models) reject the parameter.
+                payload.pop("thinking", None)
+                response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
             if not response.is_success:
                 raise _provider_response_error(response)
             result = response.json()
@@ -1108,8 +1144,12 @@ async def _chat_once(
             completion_details = usage.get("completion_tokens_details") or {}
             prompt_details = usage.get("prompt_tokens_details") or {}
             choice = result["choices"][0]
+            content = str(choice["message"]["content"] or "")
+            if "<think>" in content:
+                # Some endpoints inline thinking into content instead of reasoning_content.
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             return ChatCompletion(
-                str(choice["message"]["content"] or ""),
+                content,
                 positive_int(usage.get("prompt_tokens")),
                 positive_int(usage.get("completion_tokens")),
                 str(choice.get("finish_reason") or "") or None,
@@ -1141,6 +1181,29 @@ async def chat(
     return (await _chat_once(provider, messages, json_mode=json_mode, timeout=timeout, max_tokens=budget.output_tokens, temperature=temperature)).content
 
 
+def _needs_output_escalation(completion: ChatCompletion) -> bool:
+    """Reasoning models share max_tokens with visible output; length+empty means the budget was spent thinking."""
+    if completion.finish_reason not in {"length", "max_tokens"}:
+        return False
+    if not completion.content.strip():
+        return True
+    return bool(
+        completion.reasoning_tokens
+        and completion.completion_tokens
+        and completion.reasoning_tokens > 0.5 * completion.completion_tokens
+    )
+
+
+def _escalated_output(limits: TokenLimits, budget: PromptBudget, estimated: int, scale: float) -> int:
+    safe_total = max(1, math.floor(limits.effective_context_tokens * SAFETY_RATIO * scale))
+    headroom = max(0, safe_total - estimated)
+    if limits.output_source in {"manual", "provider_metadata"}:
+        ceiling = limits.max_output_tokens
+    else:
+        ceiling = min(REASONING_OUTPUT_ESCALATION_CEILING, headroom)
+    return min(budget.output_tokens * 2, ceiling, headroom or budget.output_tokens)
+
+
 async def budgeted_chat(
     builder: Callable[[PromptBudget], PromptBuild],
     *,
@@ -1157,6 +1220,7 @@ async def budgeted_chat(
     provider = provider_override or _chat_provider(role)
     limits = TokenLimits.from_provider(provider)
     last_error: ContextOverflowError | None = None
+    escalated = False
     for attempt, scale in enumerate(RETRY_SCALES, start=1):
         budget = prompt_budget(limits, max_tokens, minimum_output_tokens, scale)
         build = builder(budget)
@@ -1189,6 +1253,22 @@ async def budgeted_chat(
                     max_tokens=budget.output_tokens,
                     temperature=temperature,
                 )
+            if not escalated and _needs_output_escalation(completion):
+                # 推理模型把预算烧在隐藏思考上：同一 scale 下翻倍输出预算重试一次，不消耗溢出降档
+                escalated = True
+                escalated_output = _escalated_output(limits, budget, estimated, scale)
+                if escalated_output > budget.output_tokens:
+                    if trace:
+                        trace.begin_request(estimated_tokens=estimated + escalated_output)
+                    completion = await _chat_once(
+                        provider,
+                        build.messages,
+                        json_mode=json_mode,
+                        timeout=timeout,
+                        max_tokens=escalated_output,
+                        temperature=temperature,
+                    )
+                    budget = replace(budget, output_tokens=escalated_output)
         except ContextOverflowError as exc:
             if trace:
                 trace.record_failure()

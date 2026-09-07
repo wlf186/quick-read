@@ -344,7 +344,15 @@ async def _audit_candidates(
         trace=trace,
         stage="aggregate_audit",
     )
-    parsed = _json_object(generated.content)
+    try:
+        parsed: dict[str, Any] | None = _json_object(generated.content)
+    except (ValueError, json.JSONDecodeError):
+        parsed = None
+    if parsed is None:
+        # 推理模型截断响应时挽救已完整的索引，避免一次审校全军覆没
+        salvaged = _json_array_items(generated.content, "accepted_indexes")
+        indexes = [int(value) for value in salvaged if str(value).isdigit() and 0 <= int(value) < len(candidates)]
+        return list(dict.fromkeys(indexes)), []
     indexes = [int(value) for value in parsed.get("accepted_indexes", []) if str(value).isdigit() and 0 <= int(value) < len(candidates)]
     return list(dict.fromkeys(indexes)), [str(value)[:240] for value in parsed.get("issues", [])][:20]
 

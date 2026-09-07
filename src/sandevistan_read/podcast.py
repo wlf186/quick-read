@@ -1152,7 +1152,7 @@ def _delivery_instruction(language: str) -> str:
 def _act_output_tokens(duration_budget: dict[str, Any] | None, target: int, language: str) -> int:
     units = float((duration_budget or {}).get("maximum_units") or target * (55 if language == "en" else 110))
     visible = units * (2.0 if language == "en" else 1.5) + target * 24
-    return min(10_000, max(6_000, round(visible + 4_500)))
+    return structured_output_tokens(min(10_000, max(6_000, round(visible + 4_500))))
 
 
 async def _draft_scene(
@@ -1169,6 +1169,7 @@ async def _draft_scene(
     trace: ContextUsage,
     repair_feedback: list[str] | None = None,
     duration_budget: dict[str, Any] | None = None,
+    output_boost: float = 1.0,
 ) -> SceneDraftResult:
     language_rule = "只输出自然的简体中文口语" if language != "en" else "Use natural spoken English only"
     start_speaker = "HOST_B" if memory.last_speaker == "HOST_A" else "HOST_A"
@@ -1214,7 +1215,7 @@ async def _draft_scene(
         ),
         json_mode=True,
         timeout=420,
-        max_tokens=_act_output_tokens(duration_budget, target, language),
+        max_tokens=round(_act_output_tokens(duration_budget, target, language) * output_boost),
         minimum_output_tokens=min(3600, max(700, target * 130)),
         temperature=0.45,
         trace=trace,
@@ -1432,6 +1433,7 @@ async def create_linked_scene(
     ):
         generation_state.empty_response_retry_used = True
         try:
+            # 空响应多半是推理耗尽输出预算；续写需要非空草稿，这里只能以翻倍预算整体重试
             result = _coerce_scene_draft(await _draft_scene(
                 scene_kind=scene_kind,
                 chapter=chapter,
@@ -1444,6 +1446,7 @@ async def create_linked_scene(
                 profile=profile,
                 trace=trace,
                 duration_budget=duration_budget,
+                output_boost=2.0,
             ))
             draft, deterministic_issues, finish_reason = result.turns, result.issues, result.finish_reason
         except Exception as exc:

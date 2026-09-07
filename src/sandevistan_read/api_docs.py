@@ -17,6 +17,15 @@ PROVIDER_CONFIG_DOCS = {
         "字符串、数字和 null 不可替代。说明中的缺省行为不代表保存时自动补齐所有键。"
     ),
     "properties": {
+        "thinking": {
+            "type": "string",
+            "enum": ["auto", "disabled", "enabled"],
+            "description": (
+                "MAIN/VLM 聊天调用的思考模式；auto（缺省）不发送任何思考参数、按服务默认行为。"
+                "disabled/enabled 在 OpenAI-compatible 调用中发送 Zhipu 风格的 thinking 参数，"
+                "服务以 400 拒绝该参数时自动去掉并重试一次；Ollama 忽略此项（始终按 think=false 调用）。"
+            ),
+        },
         "auto_select": {"type": "boolean", "description": "TTS 自动推荐开关；显式 false 保留人工模型/设备。缺省由已有模型及旧配置迁移规则决定。"},
         "compute_device": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "TTS 请求设备，例如 gpu/cpu；尚未解析出设备时可为 null，执行时仍可能按允许的策略回退。"},
         "allow_device_fallback": {"type": "boolean", "description": "TTS 设备故障时允许同模型 GPU→CPU 回退，缺省按 true 处理。"},

@@ -13,6 +13,9 @@ MIN_CONTEXT_WINDOW_TOKENS = 1024
 MIN_OUTPUT_WINDOW_TOKENS = 128
 SAFETY_RATIO = 0.80
 RETRY_SCALES = (1.0, 0.5, 0.25)
+# Reactive output-budget escalation ceiling when hidden reasoning exhausts max_tokens;
+# only applies to derived output limits (manual/provider-reported caps stay hard).
+REASONING_OUTPUT_ESCALATION_CEILING = 16_384
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 2.0
 

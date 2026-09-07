@@ -242,3 +242,34 @@ def test_v4_migration_preserves_attempts_and_reviews(tmp_path) -> None:
     assert attempt == {"id": "qa", "results_json": "{}"}
     assert database.fetchone("SELECT rating FROM flashcard_reviews WHERE id='fr'")["rating"] == "mastered"
     assert database.fetchone("SELECT MAX(version) AS version FROM schema_versions")["version"] == 4
+
+
+@pytest.mark.asyncio
+async def test_audit_candidates_salvages_truncated_index_array(monkeypatch) -> None:
+    candidates = [{"front": f"要点 {index}", "back": "证据", "citations": []} for index in range(4)]
+
+    async def fake_chat(builder, **kwargs):
+        budget = PromptBudget(32768, 20000, 6000, 2048, 1.0)
+        build = builder(budget)
+        # 推理模型耗尽预算，JSON 在 accepted_indexes 数组中部被截断
+        return BudgetedCompletion('{"accepted_indexes":[0,2,3', build, budget)
+
+    monkeypatch.setattr(study, "budgeted_chat", fake_chat)
+    indexes, issues = await study._audit_candidates("flashcard", candidates, {}, study.ContextUsage())
+    assert indexes == [0, 2, 3]
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_audit_candidates_keeps_issues_from_complete_response(monkeypatch) -> None:
+    candidates = [{"front": "要点", "back": "证据", "citations": []}]
+
+    async def fake_chat(builder, **kwargs):
+        budget = PromptBudget(32768, 20000, 6000, 2048, 1.0)
+        build = builder(budget)
+        return BudgetedCompletion(json.dumps({"accepted_indexes": [0], "issues": ["1: 证据不足"]}), build, budget)
+
+    monkeypatch.setattr(study, "budgeted_chat", fake_chat)
+    indexes, issues = await study._audit_candidates("flashcard", candidates, {}, study.ContextUsage())
+    assert indexes == [0]
+    assert issues == ["1: 证据不足"]

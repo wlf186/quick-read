@@ -1,6 +1,8 @@
+import base64
 import importlib
 import json
 import sqlite3
+import struct
 from urllib.parse import parse_qs
 from pathlib import Path
 from types import SimpleNamespace
@@ -401,8 +403,8 @@ async def test_deep_verification_uses_temperature_override_and_requires_text(mon
             return httpx.Response(404)
         payload = json.loads(request.content)
         assert payload["temperature"] == 1
-        assert payload["max_tokens"] == 64
-        return httpx.Response(200, json={"choices": [{"message": {"content": response_text}}]})
+        assert payload["max_tokens"] == 512
+        return httpx.Response(200, json={"choices": [{"message": {"content": response_text}, "finish_reason": "stop"}]})
 
     mock_client(monkeypatch, handler)
     profile = candidate(
@@ -418,6 +420,79 @@ async def test_deep_verification_uses_temperature_override_and_requires_text(mon
     rejected = await providers.inspect_provider(profile, "deep")
     assert rejected["activation_eligible"] is False
     assert rejected["error"]["message"] == "Provider 未返回验证文本"
+
+
+@pytest.mark.asyncio
+async def test_deep_verification_accepts_reasoning_length_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "", "reasoning_content": ""}, "finish_reason": "length"}],
+        })
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="reasoning-chat")
+    verified = await providers.inspect_provider(profile, "deep")
+    assert verified["activation_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_deep_verification_falls_back_to_max_completion_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        attempts.append(payload)
+        if "max_tokens" in payload:
+            return httpx.Response(400, json={"error": {"message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}})
+        assert payload["max_completion_tokens"] == 512
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="gpt-5-chat")
+    verified = await providers.inspect_provider(profile, "deep")
+    assert verified["activation_eligible"] is True
+    assert len(attempts) == 2
+    assert attempts[0]["max_tokens"] == 512
+    assert "max_tokens" not in attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_deep_verification_vlm_image_meets_min_pixels(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        payload = json.loads(request.content)
+        content = payload["messages"][0]["content"]
+        assert isinstance(content, list) and content[1]["type"] == "image_url"
+        raw = base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1])
+        assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+        width, height = struct.unpack(">II", raw[16:24])
+        assert width * height >= 3136
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(role="vlm", kind="openai", base_url="https://compatible.example.com", model="vision-chat")
+    verified = await providers.inspect_provider(profile, "deep")
+    assert verified["activation_eligible"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["main", "vlm"])
+async def test_deep_verification_hint_matches_chat_role(monkeypatch: pytest.MonkeyPatch, role: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(404)
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(role=role, kind="openai", base_url="https://compatible.example.com", model="chat")
+    result = await providers.inspect_provider(profile, "deep")
+    assert result["activation_eligible"] is False
+    assert "音色" not in result["error"]["hint"]
 
 
 @pytest.mark.asyncio
@@ -818,3 +893,179 @@ async def test_budgeted_chat_gives_up_after_single_transport_retry(monkeypatch: 
     with pytest.raises(httpx.TimeoutException):
         await providers.budgeted_chat(lambda budget: build)
     assert calls["count"] == 2
+
+
+@pytest.mark.parametrize("value", ["auto", "disabled", "enabled"])
+def test_thinking_config_accepts_valid_modes(value) -> None:
+    created = ProviderCreate(
+        name="Thinking",
+        role="main",
+        kind="openai",
+        base_url="https://example.com",
+        model="chat",
+        config={"thinking": value},
+    )
+    assert created.config["thinking"] == value
+
+
+def test_thinking_config_rejects_unknown_mode() -> None:
+    with pytest.raises(ValidationError, match="思考模式必须是 auto、disabled 或 enabled"):
+        ProviderCreate(
+            name="Broken",
+            role="main",
+            kind="openai",
+            base_url="https://example.com",
+            model="chat",
+            config={"thinking": "sometimes"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("config", "expected"), [({"thinking": "disabled"}, "disabled"), ({"thinking": "enabled"}, "enabled"), ({}, None), ({"thinking": "auto"}, None)])
+async def test_chat_sends_thinking_parameter_only_when_configured(monkeypatch: pytest.MonkeyPatch, config: dict, expected: str | None) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if expected is None:
+            assert "thinking" not in payload
+        else:
+            assert payload["thinking"] == {"type": expected}
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="chat", config=config)
+    result = await providers._chat_once(profile, [{"role": "user", "content": "test"}], json_mode=False, timeout=5, max_tokens=128, temperature=0.25)
+    assert result.content == "OK"
+
+
+@pytest.mark.asyncio
+async def test_chat_drops_thinking_parameter_after_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        attempts.append(payload)
+        if "thinking" in payload:
+            return httpx.Response(400, json={"error": {"message": "Unknown parameter: thinking"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="forced-thinking", config={"thinking": "disabled"})
+    result = await providers._chat_once(profile, [{"role": "user", "content": "test"}], json_mode=False, timeout=5, max_tokens=128, temperature=0.25)
+    assert result.content == "OK"
+    assert len(attempts) == 2
+    assert "thinking" not in attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_chat_strips_inline_think_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "<think>hidden\nreasoning</think>answer"}, "finish_reason": "stop"}]})
+
+    mock_client(monkeypatch, handler)
+    profile = candidate(kind="openai", base_url="https://compatible.example.com", model="chat")
+    result = await providers._chat_once(profile, [{"role": "user", "content": "test"}], json_mode=False, timeout=5, max_tokens=128, temperature=0.25)
+    assert result.content == "answer"
+
+
+def _stub_escalation_env(monkeypatch: pytest.MonkeyPatch, output_tokens: int, limits) -> None:
+    from sandevistan_read.context_budget import PromptBudget
+
+    monkeypatch.setattr(providers, "_chat_provider", lambda role: {"model": "m", "role": "main"})
+    monkeypatch.setattr(providers.TokenLimits, "from_provider", staticmethod(lambda provider: limits))
+    monkeypatch.setattr(
+        providers,
+        "prompt_budget",
+        lambda limits_, max_tokens, minimum, scale: PromptBudget(128_000, 100_000, output_tokens, 0, scale),
+    )
+    monkeypatch.setattr(providers, "estimate_messages_tokens", lambda messages, images: 10)
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_escalates_output_when_reasoning_starves_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = SimpleNamespace(effective_context_tokens=128_000, max_output_tokens=4096, output_source="derived")
+    _stub_escalation_env(monkeypatch, 1000, limits)
+    calls: list[int] = []
+
+    async def starved(provider, messages, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            return SimpleNamespace(content="", finish_reason="length", reasoning_tokens=900, completion_tokens=1000)
+        return SimpleNamespace(content="OK", finish_reason="stop", reasoning_tokens=None, completion_tokens=None)
+
+    monkeypatch.setattr(providers, "_chat_once", starved)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == "OK"
+    assert calls == [1000, 2000]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_escalates_when_reasoning_dominates_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = SimpleNamespace(effective_context_tokens=128_000, max_output_tokens=4096, output_source="derived")
+    _stub_escalation_env(monkeypatch, 1000, limits)
+    calls: list[int] = []
+
+    async def dominated(provider, messages, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            return SimpleNamespace(content='{"items": [', finish_reason="length", reasoning_tokens=800, completion_tokens=1000)
+        return SimpleNamespace(content='{"items": [1]}', finish_reason="stop", reasoning_tokens=100, completion_tokens=500)
+
+    monkeypatch.setattr(providers, "_chat_once", dominated)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == '{"items": [1]}'
+    assert calls == [1000, 2000]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_skips_escalation_on_stop_with_empty_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = SimpleNamespace(effective_context_tokens=128_000, max_output_tokens=4096, output_source="derived")
+    _stub_escalation_env(monkeypatch, 1000, limits)
+    calls = {"count": 0}
+
+    async def refused(provider, messages, **kwargs):
+        calls["count"] += 1
+        return SimpleNamespace(content="", finish_reason="stop", reasoning_tokens=900, completion_tokens=1000)
+
+    monkeypatch.setattr(providers, "_chat_once", refused)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == ""
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_escalation_respects_manual_output_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = SimpleNamespace(effective_context_tokens=128_000, max_output_tokens=1000, output_source="manual")
+    _stub_escalation_env(monkeypatch, 1000, limits)
+    calls = {"count": 0}
+
+    async def starved(provider, messages, **kwargs):
+        calls["count"] += 1
+        return SimpleNamespace(content="", finish_reason="length", reasoning_tokens=900, completion_tokens=1000)
+
+    monkeypatch.setattr(providers, "_chat_once", starved)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == ""
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_budgeted_chat_escalation_ceiling_for_derived_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = SimpleNamespace(effective_context_tokens=1_000_000, max_output_tokens=4096, output_source="derived")
+    _stub_escalation_env(monkeypatch, 10_000, limits)
+    calls: list[int] = []
+
+    async def starved(provider, messages, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            return SimpleNamespace(content="", finish_reason="length", reasoning_tokens=9000, completion_tokens=10_000)
+        return SimpleNamespace(content="OK", finish_reason="stop", reasoning_tokens=None, completion_tokens=None)
+
+    monkeypatch.setattr(providers, "_chat_once", starved)
+    build = SimpleNamespace(messages=[{"role": "user", "content": "hi"}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == "OK"
+    assert calls == [10_000, 16_384]

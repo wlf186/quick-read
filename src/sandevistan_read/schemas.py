@@ -77,6 +77,9 @@ def _validate_provider_config(config: dict[str, Any]) -> None:
     tier = config.get("study_generation_tier", "auto")
     if tier not in {"auto", "lite", "full"}:
         raise ValueError("学习生成档位必须是 auto、lite 或 full")
+    thinking = config.get("thinking", "auto")
+    if thinking not in {"auto", "disabled", "enabled"}:
+        raise ValueError("思考模式必须是 auto、disabled 或 enabled")
     for field in ("auto_select", "allow_device_fallback", "podcast_sequence_tts", "asr_auto_select", "asr_allow_device_fallback"):
         if field in config and not isinstance(config[field], bool):
             raise ValueError(f"{field} 必须是布尔值")
