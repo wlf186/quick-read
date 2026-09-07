@@ -363,6 +363,15 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return float(np.dot(a, b) / denominator) if denominator else 0.0
 
 
+def _bigram_jaccard(left: str, right: str) -> float:
+    def grams(value: str) -> set[str]:
+        normalized = _normalize(value)
+        return {normalized[index : index + 2] for index in range(len(normalized) - 1)} or ({normalized} if normalized else set())
+
+    a, b = grams(left), grams(right)
+    return len(a & b) / max(1, len(a | b))
+
+
 def _semantic_unique(candidate: dict[str, Any], accepted: list[dict[str, Any]], kind: str) -> bool:
     field = "question" if kind == "quiz" else "front"
     text = str(candidate[field])
@@ -371,7 +380,11 @@ def _semantic_unique(candidate: dict[str, Any], accepted: list[dict[str, Any]], 
     if not accepted:
         return True
     vectors = EMBEDDINGS.encode([text, *[str(item[field]) for item in accepted]])
-    return all(_cosine(vectors[0], vector) < 0.92 for vector in vectors[1:])
+    for index, item in enumerate(accepted):
+        # 短中文文本在小向量模型上「同主题即高余弦」，必须同时要求字面重合才算重复
+        if _cosine(vectors[0], vectors[index + 1]) >= 0.92 and _bigram_jaccard(text, str(item[field])) >= 0.35:
+            return False
+    return True
 
 
 def _balance_answer(item: dict[str, Any], target: int) -> dict[str, Any]:
@@ -413,9 +426,6 @@ async def generate_study_artifact(
     evidence_by_label = dict(zip(labels, chunks))
     all_citations = {_citation(chunk, label)["id"]: _citation(chunk, label) for label, chunk in zip(labels, chunks)}
     trace, reporter = ContextUsage(), Reporter(job_id) if job_id else None
-    if kind == "flashcard":
-        trace.request_limit = 4
-        trace.total_token_limit = min(45_000, 18_000 + count * 2_700)
     if reporter:
         reporter.update("plan", "构建知识蓝图", 0.08, current=0, total=count, unit="项")
     if kind == "flashcard":
@@ -427,7 +437,15 @@ async def generate_study_artifact(
     rejected: Counter[str] = Counter()
     provisional_target = math.ceil(count * 1.25) if kind == "flashcard" and tier == "full" else count
     batch_size = 1 if tier == "lite" else math.ceil(provisional_target / 2) if kind == "flashcard" else 3
-    max_candidate_rounds = 2 if kind == "flashcard" and tier == "full" else math.ceil(count / batch_size) + 2
+    # lite 闪卡每轮只产 1 张，小资料中后期概念重叠产生合理重复，需要更多轮次预算
+    max_candidate_rounds = (
+        2 if kind == "flashcard" and tier == "full"
+        else math.ceil(count / batch_size) + (6 if kind == "flashcard" else 2)
+    )
+    if kind == "flashcard":
+        # 限额需覆盖全部候选轮 + 审校/补漏，并吸收推理模型触发的输出预算扩容重试
+        trace.request_limit = max_candidate_rounds + 6
+        trace.total_token_limit = min(60_000, 24_000 + count * 3_600)
     cursor = 0
     candidate_rounds = 0
     audit_rounds = 0
@@ -467,6 +485,7 @@ async def generate_study_artifact(
         valid_labels = set(used_labels)
         used_evidence = dict(zip(used_labels, used_chunks))
         yielded = 0
+        viable = 0
         for candidate in candidates:
             item, reason = validator(candidate, valid_labels, used_evidence)
             if not item:
@@ -476,6 +495,7 @@ async def generate_study_artifact(
             if not text_matches_language(text, language):
                 rejected["language_mismatch"] += 1
                 continue
+            viable += 1
             if not _semantic_unique(item, provisional, kind):
                 rejected["semantic_duplicate"] += 1
                 continue
@@ -485,7 +505,9 @@ async def generate_study_artifact(
                 break
         cursor += batch_count
         candidate_rounds += 1
-        consecutive_zero = consecutive_zero + 1 if yielded == 0 else 0
+        # 候选通过校验但被判重复，说明模型仍在正常产出（小资料的概念本就相互重叠），
+        # 只有完全无法产出有效候选的轮次才计入提前停止
+        consecutive_zero = consecutive_zero + 1 if viable == 0 else 0
         if kind != "flashcard" and yielded < batch_count and batch_size > 1:
             batch_size = 1
             remaining_items = max(0, count - len(provisional))

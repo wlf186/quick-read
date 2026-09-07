@@ -273,3 +273,55 @@ async def test_audit_candidates_keeps_issues_from_complete_response(monkeypatch)
     indexes, issues = await study._audit_candidates("flashcard", candidates, {}, study.ContextUsage())
     assert indexes == [0]
     assert issues == ["1: 证据不足"]
+
+
+def test_semantic_unique_tolerates_same_topic_distinct_cards(monkeypatch) -> None:
+    import numpy as np
+
+    class FakeEmbeddings:
+        def encode(self, texts):
+            # 小向量模型在同主题短中文上给出 0.98 余弦
+            return np.array([[19.0, 3.0] if index else [1.0, 0.0] for index, _ in enumerate(texts)])
+
+    monkeypatch.setattr(study, "EMBEDDINGS", FakeEmbeddings())
+    accepted = [{"front": "索引的本质：空间换时间"}]
+    assert study._semantic_unique({"front": "聚簇索引 vs 二级索引"}, accepted, "flashcard") is True
+    assert study._semantic_unique({"front": "索引的本质就是空间换时间"}, accepted, "flashcard") is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_only_rounds_do_not_trip_consecutive_zero_stop(tmp_path, monkeypatch) -> None:
+    database = _study_database(tmp_path)
+    database.execute(
+        """INSERT INTO sources(id,notebook_id,revision_id,filename,media_type,size_bytes,sha256,blob_path,preview_path,state,selected,page_count,parser,error,metadata_json,created_at,updated_at)
+        VALUES('s1','n1','r1','biology.md','text/markdown',100,'hash','runtime/data/blobs/s1/biology.md',NULL,'ready',1,1,'text',NULL,'{}','now','now')"""
+    )
+    for index in range(1, 3):
+        database.execute(
+            "INSERT INTO chunks(id,source_id,source_revision_id,ordinal,content,locator_json,embedding_json,checksum,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (f"ch{index}", "s1", "r1", index, f"光合作用把光能转化为化学能，并由叶绿体产生有机物。过程阶段 {index}。", json_dump({"section": "光合作用"}), "[]", f"h{index}", "now"),
+        )
+    monkeypatch.setattr(study, "DB", database)
+    monkeypatch.setattr(retrieval, "DB", database)
+    monkeypatch.setattr(study, "active_provider", lambda role: {"kind": "ollama", "config": {}, "capabilities": {"model_profile": {"parameter_count": 2_000_000_000}, "token_limits": {"effective_context_tokens": 4096, "max_output_tokens": 1024}}})
+    monkeypatch.setattr(study, "_semantic_unique", lambda *args: False)
+    calls = 0
+
+    async def fake_chat(builder, **kwargs):
+        nonlocal calls
+        calls += 1
+        budget = PromptBudget(4096, 2800, 900, 2048, 1.0)
+        build = builder(budget)
+        label = build.metadata["labels"][0]
+        content = json.dumps({"items": [{
+            "front": "光合作用完成怎样的能量转换？", "back": "把光能转化为化学能。",
+            "explanation": "这一过程发生在叶绿体，并产生有机物。", "citations": [label],
+            "card_type": "concept", "difficulty": "medium",
+        }]}, ensure_ascii=False)
+        return BudgetedCompletion(content, build, budget)
+
+    monkeypatch.setattr(study, "budgeted_chat", fake_chat)
+    with pytest.raises(ValueError, match="通过证据校验"):
+        await generate_study_artifact("n1", "flashcard", 10, ["s1"], "zh-CN", "medium")
+    # 每轮都有通过校验的候选（只是被判重复），不应触发连续零产出提前停止：lite 档 10+6 轮全部跑完
+    assert calls == 16

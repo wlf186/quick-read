@@ -261,25 +261,28 @@ def _turn_slot_plan(
 
 
 def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
+    # 槽位种类用「短/深」而非 S/D 编码：S/D 与 act_code 白名单（S=synthesis）撞车，小模型会把槽位记号抄进 act_code
     encoded = ",".join(
-        f"{item['index']}:{'S' if item['kind'] == 'short' else 'D'}@{item['default_claim_id'] or '-'}"
+        f"{item['index']}:{'short' if item['kind'] == 'short' else 'deep'}@{item['default_claim_id'] or '-'}"
+        if language == "en"
+        else f"{item['index']}:{'短' if item['kind'] == 'short' else '深'}@{item['default_claim_id'] or '-'}"
         for item in plan
     )
     if language == "en":
         return (
-            f"Follow this ordered slot plan: {encoded}. S slots use 1–2 natural sentences for concise questions, "
-            "acknowledgements, or bridges; D slots use 3–5 complete sentences to explain, probe, qualify, or synthesize the @ claim. "
-            "Within the 3–5 sentence range, alternate compact and expansive D turns instead of writing them all at one length, "
+            f"Follow this ordered slot plan: {encoded}. short slots use 1–2 natural sentences for concise questions, "
+            "acknowledgements, or bridges; deep slots use 3–5 complete sentences to explain, probe, qualify, or synthesize the @ claim. "
+            "Within the 3–5 sentence range, alternate compact and expansive deep turns instead of writing them all at one length, "
             "but do not lower the act's overall density below the slot plan. "
-            "The @ claim is also the only default support when an S slot states a fact. "
+            "The @ claim is also the only default support when a short slot states a fact. "
             "Do not strengthen association into causation, or a supporting argument into the only, final, or definitive one unless the claim says so. "
             "Write directly without counting words or reporting statistics; use useful spoken content, not filler or repeated summaries."
         )
     return (
-        f"严格执行按轮次排列的槽位计划：{encoded}。S 槽用 1–2 个自然句完成简洁追问、回应或承接；"
-        "D 槽用 3–5 个完整但紧凑的句子解释、追问、辨析或综合 @ 后的主张；在 3–5 句范围内让紧凑轮与展开轮长短交替，"
-        "不要所有 D 槽写成同一长度，但整 Act 的总篇幅不得低于槽位计划的密度；"
-        "S 槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
+        f"严格执行按轮次排列的槽位计划：{encoded}。短槽用 1–2 个自然句完成简洁追问、回应或承接；"
+        "深槽用 3–5 个完整但紧凑的句子解释、追问、辨析或综合 @ 后的主张；在 3–5 句范围内让紧凑轮与展开轮长短交替，"
+        "不要所有深槽写成同一长度，但整 Act 的总篇幅不得低于槽位计划的密度；"
+        "短槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
         "除非主张本身明说，不得把相关性强化为因果，也不得把支持性论据说成‘唯一、最终、根本、证明’。"
         "直接写正文，不要在思考中逐字计数或输出统计；禁止填充语和重复总结。"
     )
@@ -387,6 +390,24 @@ def _extract_array(raw: str, key: str) -> list[Any] | None:
     return recovered or None
 
 
+def _coerce_dialogue_act(value: Any, text: str, claim_ids: Any) -> str:
+    """Map compact act codes; tolerate small-model drift such as slot-plan tokens (短@C1/deep@C2)."""
+    raw = str(value or "").split("@", 1)[0].strip()
+    mapped = COMPACT_ACT_CODES.get(raw.upper())
+    if mapped:
+        return mapped
+    if raw.lower() in ALLOWED_DIALOGUE_ACTS:
+        return raw.lower()
+    if not raw:
+        return ""
+    # 未知记号（如旧槽位编码 D）按内容形态挽救，后续的确定性门禁仍然照常校验
+    if isinstance(claim_ids, list) and claim_ids:
+        return "explain"
+    if text.rstrip().endswith(("?", "？")):
+        return "question"
+    return "acknowledgement"
+
+
 def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
     values = _extract_array(raw, "turns")
     if values is None:
@@ -394,12 +415,17 @@ def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
     turns: list[dict[str, Any]] = []
     for value in values:
         if isinstance(value, dict):
+            act = _coerce_dialogue_act(
+                value.get("dialogue_act") or value.get("act_code"), str(value.get("text") or ""), value.get("claim_ids")
+            )
+            if act:
+                value = {**value, "dialogue_act": act}
             turns.append(value)
             continue
         if not isinstance(value, list) or len(value) != 4:
             continue
         speaker, act_code, text, claim_ids = value
-        act = COMPACT_ACT_CODES.get(str(act_code).upper())
+        act = _coerce_dialogue_act(act_code, str(text or ""), claim_ids)
         if not act:
             continue
         turns.append({
@@ -1197,7 +1223,7 @@ async def _draft_scene(
     prompt_prefix = f"""你是严格资料内的双人深度播客编剧。{language_rule}。两位主持人都能解释、质疑和综合；本 Act 由 {chapter.get('lead_host') or 'HOST_A'} 主导，但另一位必须贡献实质判断，禁止机械采访和孤立事实罗列。
 {_scene_instruction(scene_kind, language)}
 {_delivery_instruction(language)}
-生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。{question_rule}，不得连续出现超过两个问句；使用 Q act_code 的轮次必须写成自然问句并以问号结尾。长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个 D 槽的 claim_ids 至少填一个允许的 C 编号；S 槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
+生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。{question_rule}，不得连续出现超过两个问句；使用 Q act_code 的轮次必须写成自然问句并以问号结尾。长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个深槽的 claim_ids 至少填一个允许的 C 编号；短槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
 只输出一个 JSON 对象，键名为 turns；turns 的每一项必须是四元素数组，依次为 speaker、act_code、text、claim_ids。speaker 只能为 A/B；act_code 只能为 I/F/B/Q/A/X/E/M/C/S/O；claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。不要输出示例、统计、解释或额外字段。
 剧集记忆：{memory_json}
 当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；本 Act 的内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。

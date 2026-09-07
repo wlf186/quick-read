@@ -1175,3 +1175,27 @@ def test_cliche_metrics_english_turns_no_false_positive() -> None:
     metrics = podcast._cliche_family_metrics(turns)
     assert metrics["cliche_family_density"] == 0
     assert metrics["cliche_worst_family"] is None
+
+
+def test_slot_plan_encoding_does_not_collide_with_act_codes() -> None:
+    plan = podcast._turn_slot_plan(6, 300, "zh-CN", ["C1"])
+    text = podcast._slot_plan_instruction(plan, "zh-CN")
+    assert "短@" in text and "深@" in text
+    assert "D@" not in text
+    en = podcast._slot_plan_instruction(plan, "en")
+    assert "short@" in en and "deep@" in en
+
+
+def test_extract_turns_coerces_slot_plan_token_act_codes() -> None:
+    raw = '{"turns":[["A","D@C1","这是对主张的展开解释。",["C1"]],["B","短@-","这样理解对吗？",[]]]}'
+    turns = podcast._extract_turns(raw)
+    assert turns == [
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "这是对主张的展开解释。", "claim_ids": ["C1"]},
+        {"speaker": "HOST_B", "dialogue_act": "question", "text": "这样理解对吗？", "claim_ids": []},
+    ]
+
+
+def test_extract_turns_maps_dict_act_code_key() -> None:
+    raw = '{"turns":[{"speaker":"A","act_code":"D","text":"聚簇索引叶子存整行数据。","claim_ids":["C2"]}]}'
+    turns = podcast._extract_turns(raw)
+    assert turns[0]["dialogue_act"] == "explain"
