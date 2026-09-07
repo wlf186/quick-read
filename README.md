@@ -30,7 +30,7 @@ Windows 11 x64 支持原生部署；ARM64 当前为实验支持。首次部署�
 
 ## Provider 配置
 
-设置页按 MAIN、VLM、AUDIO 三种职责分开管理。MAIN 是必需能力；VLM 和 AUDIO 可以临时暂停而不删除当前选择，暂停只影响之后创建的任务。Podcast 的 TTS、首次 ASR 验收及音频修复后的复验始终使用任务绑定的 AUDIO Provider，不随角色切换改变；绑定配置不存在时任务明确失败。缺少绑定信息的旧任务在开始执行时解析一次 AUDIO，并在本次执行中持续使用。图片处理默认按 `VLM → MAIN → 本地 RapidOCR` 依次兜底，任一步得到结果即停止；可调整参与步骤、全局关闭，或在每次上传确认时临时覆盖。图片策略仅应用于新上传，不会自动重建已有索引。云端 VLM/MAIN 参与视觉处理时，对应原图会发送给所选服务。
+设置页按 MAIN、VLM、AUDIO 三种职责分开管理。MAIN 是必需能力；VLM 和 AUDIO 可以临时暂停而不删除当前选择，暂停只影响之后创建的任务。暂停与恢复都是轻量操作：恢复启用只校验连接与模型清单，不会重新执行深度验证，AUDIO 也不会因此重跑 TTS→ASR 闭环。Podcast 的 TTS、首次 ASR 验收及音频修复后的复验始终使用任务绑定的 AUDIO Provider，不随角色切换改变；绑定配置不存在时任务明确失败。缺少绑定信息的旧任务在开始执行时解析一次 AUDIO，并在本次执行中持续使用。图片处理默认按 `VLM → MAIN → 本地 RapidOCR` 依次兜底，任一步得到结果即停止；可调整参与步骤、全局关闭，或在每次上传确认时临时覆盖。图片策略仅应用于新上传，不会自动重建已有索引。云端 VLM/MAIN 参与视觉处理时，对应原图会发送给所选服务。
 
 设置页按角色限制可选协议：
 
@@ -49,7 +49,7 @@ MAIN/VLM 会同时管理模型的总上下文窗口、最大输入（服务提�
 
 连接检查不保存配置。深度验证只发送内置的极短测试文本或测试图片，不会发送 Notebook 资料；使用云端模型时仍可能产生少量 API 费用。未通过验证的配置可以保存为未启用状态，启用失败不会替换当前同角色的活跃 Provider。
 
-程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；AUDIO catalog 还会返回脱敏的 `voiceprint_library` 和可持久化的 `resolved_audio_config`。角色状态分别通过 `GET /api/provider-roles` 与 `PATCH /api/provider-roles/{role}` 读取和更新，全局图片策略使用 `GET/PUT /api/settings/image-processing`；上传接口可在 multipart `image_policy` 字段中传入单次覆盖。已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求字段及关键响应说明见 `/api/docs`。Provider 配置保留扩展字段；新增布尔开关必须传 JSON 布尔值，不能用字符串或数字代替。AUDIO 的 `config.podcast_sequence_tts` 缺省按开启处理，设为 `false` 会关闭批量合成及脚本/TTS 重叠；该设置保存于 Provider 配置，不属于 `config.toml`。能力清单的 `sequence_jobs`、模型的 `default/checkpoints` 和 `recommended.reason` 可用于解释当前选择。
+程序化配置可调用 `POST /api/providers/inspect`，`mode="catalog"` 只读取实时清单，`mode="deep"` 会执行对应角色的最小真实调用；AUDIO catalog 还会返回脱敏的 `voiceprint_library` 和可持久化的 `resolved_audio_config`。角色状态分别通过 `GET /api/provider-roles` 与 `PATCH /api/provider-roles/{role}` 读取和更新，重新启用默认按 `catalog` 校验（可用 `validation_mode="deep"` 显式要求深度验证），暂停会保留 `selected_provider_id` 所指的已选配置；全局图片策略使用 `GET/PUT /api/settings/image-processing`；上传接口可在 multipart `image_policy` 字段中传入单次覆盖。已保存的 MAIN/VLM 可调用 `POST /api/providers/{id}/probe` 重新探测并持久化窗口能力。请求字段及关键响应说明见 `/api/docs`。Provider 配置保留扩展字段；新增布尔开关必须传 JSON 布尔值，不能用字符串或数字代替。AUDIO 的 `config.podcast_sequence_tts` 缺省按开启处理，设为 `false` 会关闭批量合成及脚本/TTS 重叠；该设置保存于 Provider 配置，不属于 `config.toml`。能力清单的 `sequence_jobs`、模型的 `default/checkpoints` 和 `recommended.reason` 可用于解释当前选择。
 
 ## 本地数据边界
 

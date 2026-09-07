@@ -170,6 +170,7 @@ def main() -> None:
         settings.get_by_label("服务地址").fill("http://localhost:20810")
         settings.get_by_role("button", name="连接并读取模型").click()
         settings.get_by_text(re.compile("1 个模型 · 42 ms")).wait_for()
+        assert "TTS→ASR 闭环" in settings.locator(".provider-cost-note").inner_text()
         assert settings.get_by_role("heading", name="TTS 合成").is_visible()
         assert settings.get_by_role("heading", name="ASR 验收").is_visible()
         assert "Voice 1.7B" in settings.get_by_role("combobox", name=re.compile("TTS 模型")).inner_text()
@@ -193,12 +194,37 @@ def main() -> None:
         assert discard.is_visible()
         discard.get_by_role("button", name="放弃修改").click()
         settings.get_by_role("button", name="返回角色概览").click()
+
+        role_updates: list[dict] = []
+
+        def role_patch(route) -> None:
+            role_updates.append(json.loads(route.request.post_data or "{}"))
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"role": "vlm", "enabled": False, "selected_provider_id": None}))
+
+        def role_list(route) -> None:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps([
+                {"role": "main", "enabled": True, "required": True, "selected_provider_id": None},
+                {"role": "vlm", "enabled": False, "required": False, "selected_provider_id": None},
+                {"role": "audio", "enabled": True, "required": False, "selected_provider_id": None},
+            ]))
+
+        page.route("**/api/provider-roles/vlm", role_patch)
+        page.route("**/api/provider-roles", role_list)
+        vlm_card = settings.locator(".provider-role-card").filter(has_text="VLM")
+        assert vlm_card.get_by_role("checkbox").is_checked()
+        vlm_card.locator(".role-switch").click()
+        vlm_card.get_by_text("已暂停", exact=True).wait_for()
+        assert role_updates == [{"enabled": False, "validation_mode": "catalog"}]
+        page.unroute("**/api/provider-roles/vlm", role_patch)
+        page.unroute("**/api/provider-roles", role_list)
+
         settings.get_by_role("button", name="管理 MAIN").click()
         settings.get_by_role("button", name="添加 MAIN Provider").click()
         settings.get_by_label("名称").fill("QA Provider")
         settings.get_by_label("服务地址").fill("https://api.example.com/v1")
         settings.get_by_role("button", name="连接并读取模型").click()
         settings.get_by_text("连接成功，请选择或填写模型").wait_for()
+        assert "TTS→ASR" not in settings.locator(".provider-cost-note").inner_text()
         assert settings.get_by_text("连接成功，请选择或填写模型").is_visible()
         model_picker = settings.get_by_role("combobox", name="模型")
         model_picker.click()
@@ -531,6 +557,7 @@ def main() -> None:
         mobile_settings.get_by_label("服务地址").fill("http://localhost:20810")
         mobile_settings.get_by_role("button", name="连接并读取模型").click()
         mobile_settings.get_by_role("heading", name="ASR 验收").wait_for()
+        assert "TTS→ASR 闭环" in mobile_settings.locator(".provider-cost-note").inner_text()
         mobile_settings.get_by_role("heading", name="ASR 验收").scroll_into_view_if_needed()
         assert "Qwen3 ASR 0.6B" in mobile_settings.get_by_role("combobox", name=re.compile("ASR 模型")).inner_text()
         assert_no_horizontal_overflow(mobile)

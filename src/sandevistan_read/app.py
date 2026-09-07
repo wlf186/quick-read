@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
+from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import SUPPORTED_EXTENSIONS, sanitize_filename
@@ -556,7 +556,7 @@ def provider_roles():
     return result
 
 
-@api.patch("/provider-roles/{role}")
+@api.patch("/provider-roles/{role}", responses=PROVIDER_ROLE_UPDATE_RESPONSES, description="暂停仅影响之后创建的任务并保留已选配置；重新启用默认按 catalog 校验连接与模型清单，深度验证请使用表单中的验证按钮。")
 async def update_provider_role(role: str, body: ProviderRoleUpdate):
     if role not in {"main", "vlm", "audio"}:
         raise HTTPException(404, "Provider 角色不存在")
@@ -585,7 +585,11 @@ async def update_provider_role(role: str, body: ProviderRoleUpdate):
             connection.execute("UPDATE provider_profiles SET active=0 WHERE role=?", (role,))
         connection.execute("INSERT INTO provider_role_settings(role,enabled,updated_at) VALUES(?,?,?) ON CONFLICT(role) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at", (role, int(enabled), now))
     invalidate_status_cache()
-    return {"role": role, "enabled": enabled, "selected_provider_id": selected["id"] if selected else None}
+    # Disabling only clears active; the selected row is preserved, so read it back
+    # to keep this response consistent with GET /provider-roles.
+    selected_id = selected["id"] if selected else (DB.fetchone(
+        "SELECT id FROM provider_profiles WHERE role=? AND selected=1 LIMIT 1", (role,)) or {}).get("id")
+    return {"role": role, "enabled": enabled, "selected_provider_id": selected_id}
 
 
 @api.get("/settings/image-processing")

@@ -172,6 +172,10 @@ INSPECTION_RESPONSES = json_response(INSPECTION_SCHEMA, "请检查 status、acti
 PROVIDER_TEST_RESPONSES = json_response(_object({
     **INSPECTION_SCHEMA["properties"], "ok": {"type": "boolean"},
 }), "已保存 Provider 的 catalog 检查结果，不保存配置。")
+PROVIDER_ROLE_UPDATE_RESPONSES = json_response(_object({
+    "role": {"type": "string"}, "enabled": {"type": "boolean"},
+    "selected_provider_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+}), "角色启用状态；暂停保留 selected_provider_id 所指的已选配置，响应与 GET /provider-roles 保持一致。")
 PROVIDER_PROBE_RESPONSES = json_response(_object({
     **CAPABILITIES_SCHEMA["properties"], "ok": {"type": "boolean"}, "auto_select": {"type": "boolean"},
 }), "重新探测并持久化能力；AUDIO 还应用默认配置和自动推荐，MAIN/VLM 返回各自窗口能力。")

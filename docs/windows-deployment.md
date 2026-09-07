@@ -96,7 +96,7 @@ Invoke-RestMethod http://127.0.0.1:20830/api/status
 
 ## 4. 配置模型 Provider
 
-应用本身可以在没有生成式模型的情况下导入、索引和检索文字资料，并在模型不可用时返回相关原文摘录。完整问答、Studio 内容和播客脚本需要 MAIN；图片默认按 VLM、具备视觉能力的 MAIN、本地 RapidOCR 依次尝试；Podcast 音频需要同时提供 TTS 与 ASR 的 AUDIO。MAIN 是必需角色，VLM 与 AUDIO 可以暂停而不删除已选 Provider，暂停只影响之后创建的任务。
+应用本身可以在没有生成式模型的情况下导入、索引和检索文字资料，并在模型不可用时返回相关原文摘录。完整问答、Studio 内容和播客脚本需要 MAIN；图片默认按 VLM、具备视觉能力的 MAIN、本地 RapidOCR 依次尝试；Podcast 音频需要同时提供 TTS 与 ASR 的 AUDIO。MAIN 是必需角色，VLM 与 AUDIO 可以暂停而不删除已选 Provider，暂停只影响之后创建的任务；恢复启用只重新校验连接与模型清单，不会再次执行深度验证。
 
 ### 4.1 本机 Ollama（最便捷的全本地方案）
 
