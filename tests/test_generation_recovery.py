@@ -307,8 +307,9 @@ def test_unreadable_formula_is_not_retained_as_a_grounded_answer():
 
 
 def test_job_detail_and_list_do_not_expose_quiz_answers(evidence_db, monkeypatch):
-    from sandevistan_read import app
+    from sandevistan_read import app, observability
     monkeypatch.setattr(app, 'DB', evidence_db)
+    monkeypatch.setattr(observability, 'DB', evidence_db)
     result = {'id': 'artifact', 'type': 'quiz', 'status': 'ready', 'payload': {'items': [{'id': 'q1', 'question': 'Energy?', 'options': ['Light', 'Water', 'Air', 'Soil'], 'answer_index': 0, 'explanation': 'Source evidence', 'citations': ['S1']}]}, 'citations': [{'id': 'S1'}]}
     evidence_db.execute("INSERT INTO jobs(id,kind,state,stage,progress,payload_json,notebook_id,result_json,created_at,updated_at) VALUES('j','quiz','complete','完成',1,'{}','n',?,'now','now')", (json_dump(result),))
     for response in (app.job('j'), app.jobs(notebook_id='n', page=1, page_size=20)['items'][0]):
