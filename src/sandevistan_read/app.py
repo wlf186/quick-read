@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
+from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, JOB_LIST_RESPONSES, JOB_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import SUPPORTED_EXTENSIONS, sanitize_filename
@@ -288,9 +288,9 @@ async def ask(notebook_id: str, body: ChatRequest):
         VALUES(?,?,?,?,?,?,?,?,?)""",
         (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", "{}", now),
     )
-    result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language)
+    result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language, conversation_id=conversation_id)
     context_usage = result.pop("context_usage", {})
-    metadata = {"context_usage": context_usage}
+    metadata = {"context_usage": context_usage, "degraded": result.get("degraded", False), "warnings": result.get("warnings", [])}
     message_id = new_id("message")
     DB.execute(
         """INSERT INTO messages
@@ -461,7 +461,14 @@ def export_flashcards(artifact_id: str):
     return Response(content=content, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=flashcards.csv"})
 
 
-@api.get("/jobs")
+def _public_job(row: dict[str, Any], queue_position: int = 0) -> dict[str, Any]:
+    item = present_job(row, queue_position)
+    if isinstance(item.get("result"), dict):
+        item["result"] = public_artifact(item["result"])
+    return item
+
+
+@api.get("/jobs", responses=JOB_LIST_RESPONSES)
 def jobs(notebook_id: str | None = None, q: str = "", kind: str = "all", state: str = "all", view: str = "full", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
     filters, values = ["(j.display_name LIKE ? OR j.stage LIKE ? OR j.id LIKE ? OR COALESCE(n.title,'') LIKE ?)", "(? IS NULL OR j.notebook_id=?)"], [f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", notebook_id, notebook_id]
     if kind != "all": filters.append("j.kind=?"); values.append(kind)
@@ -470,7 +477,7 @@ def jobs(notebook_id: str | None = None, q: str = "", kind: str = "all", state: 
     total = (DB.fetchone(f"SELECT COUNT(*) count FROM jobs j LEFT JOIN notebooks n ON n.id=j.notebook_id WHERE {where}", tuple(values)) or {"count": 0})["count"]
     rows = DB.fetchall(f"SELECT j.*,n.title notebook_title FROM jobs j LEFT JOIN notebooks n ON n.id=j.notebook_id WHERE {where} ORDER BY j.created_at DESC LIMIT ? OFFSET ?", tuple(values + [page_size, (page - 1) * page_size]))
     queued = [item["id"] for item in DB.fetchall("SELECT id FROM jobs WHERE state='queued' ORDER BY created_at")]
-    items = [present_job(row, queued.index(row["id"]) + 1 if row["id"] in queued else 0) for row in rows]
+    items = [_public_job(row, queued.index(row["id"]) + 1 if row["id"] in queued else 0) for row in rows]
     if view == "summary":
         keep = {"id", "notebook_id", "notebook_title", "display_name", "kind", "state", "stage", "stage_code", "progress", "stage_current", "stage_total", "stage_unit", "progress_basis", "error", "created_at", "updated_at", "started_at", "finished_at", "eta"}
         items = [{key: value for key, value in item.items() if key in keep} for item in items]
@@ -488,8 +495,8 @@ def workspace_state(notebook_id: str):
     }
     active_rows = DB.fetchall("SELECT * FROM jobs WHERE notebook_id=? AND state IN ('queued','running','cancelling') ORDER BY created_at LIMIT 6", (notebook_id,))
     failed_rows = DB.fetchall("SELECT * FROM jobs WHERE notebook_id=? AND state='failed' ORDER BY updated_at DESC LIMIT 2", (notebook_id,))
-    active = [present_job(row) for row in active_rows]
-    failed = [present_job(row) for row in failed_rows]
+    active = [_public_job(row) for row in active_rows]
+    failed = [_public_job(row) for row in failed_rows]
     keep = {"id", "notebook_id", "display_name", "kind", "state", "stage", "stage_code", "progress", "stage_current", "stage_total", "stage_unit", "error", "created_at", "updated_at", "eta"}
     return {
         "versions": {key: f"{(value or {}).get('count', '')}:{(value or {}).get('updated_at', '')}" for key, value in stamps.items()},
@@ -499,11 +506,11 @@ def workspace_state(notebook_id: str):
     }
 
 
-@api.get("/jobs/{job_id}")
+@api.get("/jobs/{job_id}", responses=JOB_RESPONSES)
 def job(job_id: str):
     row = DB.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,));
     if not row: raise HTTPException(404, "任务不存在")
-    return present_job(row)
+    return _public_job(row)
 
 
 @api.get("/jobs/{job_id}/events")

@@ -288,7 +288,7 @@ async def test_linked_scene_repairs_a_bad_draft_without_per_scene_audit(monkeypa
 
     async def fake_budgeted_chat(builder, **kwargs):
         build = builder(PromptBudget(8192, 6000, 1200, 2048, 1.0))
-        prompt = build.messages[0]["content"]
+        prompt = "\n".join(message["content"] for message in build.messages)
         if "待审场景" in prompt:
             calls["audit"] += 1
             content = json.dumps({"invalid_indexes": [], "scores": {"grounding": 5, "continuity": 5, "roles": 5, "repetition": 5}, "issues": []}, ensure_ascii=False)

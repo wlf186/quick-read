@@ -156,8 +156,16 @@ TTS_EXECUTION_SCHEMA = _object({
 ARTIFACT_SCHEMA = _object({
     "id": {"type": "string"}, "notebook_id": {"type": "string"},
     "type": {"type": "string"}, "title": {"type": "string"},
-    "language": {"type": "string"}, "status": {"type": "string"},
-    "payload": _object({"performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA},
+    "language": {"type": "string"}, "status": {"type": "string", "description": "ready/partial 表示产物交付状态，不保证全部质量通过；ready 也可能伴随 degraded 或 warnings。任务 complete 仅表示处理结束。"},
+    "payload": _object({"performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA,
+                        "degraded": {"type": "boolean", "description": "生成使用了回退或保留部分内容；应与 status、warnings 和质量报告一起查看。"},
+                        "quality": _object({"passed": {"type": "boolean"}}, "Podcast 原始脚本质量结果；部分交付不改写 passed。"),
+                        "quality_report": _object({}, "按产物类型变化；题卡包含请求/实际数量、模型标注难度及审校状态，不等于人工质量认证。"),
+                        "audio_quality": _object({
+                            "passed": {"type": "boolean", "description": "ASR 验收结果，不包含独立的实际时长结论。"},
+                            "duration": _object({"passed": {"type": "boolean"}}, "实际音频时长验收，旧产物可能缺省。"),
+                        }, "包含错误率、说话人对齐等原始指标；ASR 不可用时部分字段缺省，不应视为零错误。"),
+                        "warnings": _array(_object({"code": {"type": "string"}, "stage": {"type": "string"}, "message": {"type": "string"}}), "可用产物的具体偏差；quality/audio_quality 的原始 passed 不因此改写。")},
                        "按产物类型变化的扩展内容；这里列出 Podcast 执行元数据，其他内容原样保留。"),
     "citations": _array(_object({})),
     "media_url": {"type": "string", "description": "存在媒体时返回。"},
@@ -190,3 +198,5 @@ PROVIDER_PROBE_RESPONSES = json_response(_object({
 }), "重新探测并持久化能力；AUDIO 还应用默认配置和自动推荐，MAIN/VLM 返回各自窗口能力。")
 ARTIFACT_RESPONSES = json_response(ARTIFACT_SCHEMA, "产物详情及可选的 Podcast 执行统计。")
 ARTIFACT_LIST_RESPONSES = json_response(_array(ARTIFACT_SCHEMA), "产物列表；view=summary 时 payload 为 {}，citations 为 []，不返回媒体链接。")
+JOB_RESPONSES = json_response(_object({}), "任务详情；Quiz result 与产物接口采用相同公开结构，隐藏答案、解析和作答后证据，作答后通过学习会话接口返回。其他任务字段保留。")
+JOB_LIST_RESPONSES = json_response(_object({}), "分页任务列表；Quiz result 隐藏答案、解析和作答后证据。view=summary 仅返回已有摘要字段。")

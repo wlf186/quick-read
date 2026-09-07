@@ -23,3 +23,5 @@
 .upload-processors small{color:var(--muted)}
 .visual-citation-label{display:block;margin:10px 0;color:var(--yellow);font-size:11px}
 .citation-visual{display:block;width:100%;max-height:45vh;object-fit:contain;border:1px solid #31494a;background:#030708}
+
+.generation-warnings{margin:12px 0;padding:12px 16px;border:1px solid #9b753c;border-radius:8px;background:#30281c;color:#f1d2a0;overflow-wrap:anywhere;font-size:13px;line-height:1.6}.generation-warnings ul{padding-left:20px;margin:6px 0 0}

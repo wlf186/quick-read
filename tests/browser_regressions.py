@@ -24,6 +24,8 @@ class Fixture:
         self.show_job = False
         self.source_state = "ready"
         self.job_state = "queued"
+        self.artifact = None
+        self.messages = None
         page.on("pageerror", lambda error: self.errors.append(str(error)))
         page.on("console", lambda message: self.console_errors.append(message.text) if message.type == "error" else None)
         page.route("**/auth/status", lambda route: route.fulfill(json={"required": False, "authenticated": True}))
@@ -41,7 +43,7 @@ class Fixture:
         body = json.loads(request.post_data or "{}")
         self.requests.append((request.method, path, body))
         notebooks = [{"id": key, "title": f"Audit {key.upper()}", "description": ""} for key in ("a", "b")]
-        artifact = {"id": "cards", "type": "flashcard", "title": "闪卡组", "status": "ready", "payload": {}, "citations": []}
+        artifact = self.artifact or {"id": "cards", "type": "flashcard", "title": "闪卡组", "status": "ready", "payload": {}, "citations": []}
         job = {"id": "ingest", "kind": "ingest", "notebook_id": "a", "notebook_title": "Audit A", "display_name": "文档解析",
                "state": self.job_state, "stage": "已取消" if self.job_state == "cancelled" else "等待执行", "stage_code": self.job_state,
                "progress": 1 if self.job_state == "cancelled" else 0, "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
@@ -76,12 +78,12 @@ class Fixture:
             if self.hold_history:
                 self.pending_history.append(route)
                 return
-            result = [{"id": "history"}] if self.hold_messages else []
+            result = [{"id": "history"}] if self.hold_messages or self.messages is not None else []
         elif path == "/conversations/history/messages":
             if self.hold_messages:
                 self.pending_messages.append(route)
                 return
-            result = []
+            result = self.messages or []
         elif path.endswith("/artifacts"):
             result = [artifact]
         elif path == "/artifacts/cards":
@@ -267,9 +269,39 @@ def run_core_regressions(browser: Browser):
         context.close()
 
 
+def run_generation_regressions(browser: Browser) -> None:
+    for width, height, asr_ok in ((1440, 900, False), (390, 844, False), (1440, 900, True), (390, 844, True)):
+        context = browser.new_context(viewport={"width": width, "height": height}, reduced_motion="reduce")
+        page = context.new_page()
+        fixture = Fixture(page)
+        fixture.messages = [{"id": "answer", "role": "assistant", "content": "保留有依据的中文回答。", "metadata": {"degraded": True, "warnings": [{"code": "source_formula_unreadable", "stage": "answer", "message": "公式提取不完整，请核对原文件。"}]}}]
+        fixture.artifact = {"id": "cards", "type": "podcast", "title": "降级播客", "status": "partial", "media_url": "", "citations": [],
+                            "payload": {"version": 4, "degraded": True, "turns": [], "chapters": [], "duration": {"target_minutes": 5, "actual_seconds": 240},
+                                        "quality": {"passed": False}, "audio_quality": {"passed": asr_ok, "metric": "cer", "error_rate": 0.02 if asr_ok else 0.12, "speaker_alignment": 0.90, "silence_outliers": 1, "duration": {"passed": False}},
+                                        "warnings": [{"code": "audio_duration", "stage": "audio", "message": "目标 5 分钟，实际 4 分钟。"}]}}
+        page.goto(BASE_URL)
+        expect(page.get_by_label("向已选资料提问")).to_be_enabled()
+        expect(page.locator(".messages").get_by_label("生成结果说明")).to_contain_text("公式提取不完整，请核对原文件")
+        if width < 600:
+            page.locator(".workspace-tabs button").filter(has_text="Studio").click()
+        page.locator(".artifact").filter(has_text="降级播客").click()
+        drawer = page.get_by_role("dialog", name="降级播客")
+        expect(drawer.get_by_label("生成结果说明")).to_contain_text("目标 5 分钟，实际 4 分钟")
+        expect(drawer.locator(".podcast-meta")).to_contain_text("UNVERIFIED")
+        expect(drawer.locator(".podcast-meta")).to_contain_text("2.0%" if asr_ok else "12.0%")
+        expect(drawer.locator(".podcast-meta")).not_to_contain_text("PASSED")
+        assert_layout(page)
+        page.screenshot(path=f"/tmp/quick-read-generation-warnings-{width}.png")
+        page.keyboard.press("Escape")
+        expect(drawer).not_to_be_visible()
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+
+
 if __name__ == "__main__":
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
         run_core_regressions(browser)
+        run_generation_regressions(browser)
         browser.close()
     print("Core UI regressions passed")

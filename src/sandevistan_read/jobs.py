@@ -199,6 +199,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     if not main_provider:
         raise RuntimeError("请先配置并启用 MAIN provider")
     config = provider.get("config", {})
+    cancel_check = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
     suffix = job_id.removeprefix("job_")
     work_dir = PATHS.job_work / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +228,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
                     },
                 },
                 "script_engine": PODCAST_ENGINE_VERSION,
+                "delivery_policy": "partial_v1",
                 "duration_calibration": PODCAST_DURATION_CALIBRATION_VERSION,
             }
         ).encode()
@@ -389,6 +391,8 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         try:
             generated = await build_podcast_script(
                 notebook_id, payload, progress=report, act_ready=on_act_ready if overlap_enabled else None,
+                allow_partial=True,
+                cancel_check=cancel_check,
             )
             script_finished = time.perf_counter()
         except PodcastQualityError as exc:
@@ -405,6 +409,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         if speculative_queue is not None:
             speculative_queue.put_nowait(None)
         if speculative_task:
+            Reporter(job_id).update("tts", "脚本已完成，等待已启动的音频合成", 0.62, current=speculative_stats["turns"], total=len(generated["turns"]), unit="轮")
             await speculative_task
         manifest = {
             "version": PODCAST_ENGINE_VERSION, "signature": signature, "generated": generated,
@@ -429,7 +434,6 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     parts_dir = work_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
-    cancel_check = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
     turns = generated["turns"]
     sequence_capability = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
     sequence_enabled = bool(
@@ -666,51 +670,56 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
 
     destination, cursor = await render_audio()
     duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
-    if not duration_check["passed"]:
-        failure = {"stage": "duration", **duration_check}
-        manifest.update({"generated": generated, "media_path": str(destination.relative_to(PATHS.root)), "audio_quality_failure": failure})
-        save_manifest(manifest)
-        raise RuntimeError("成品音频实际时长未通过质量门槛")
-    Reporter(job_id).update("asr", "本地 ASR 验收成品音频", 0.92, current=0, total=1, unit="次")
-    try:
-        asr_result = await transcribe_audio(
-            destination,
-            provider=provider,
-            language="English" if language == "en" else "Chinese",
-            cancel_check=cancel_check,
-            idempotency_key=f"sread-asr-{suffix[:36]}",
-        )
-    except ProviderError as exc:
-        manifest.update({"generated": generated, "media_path": str(destination.relative_to(PATHS.root)), "audio_quality_failure": {"stage": "asr", "error": str(exc), "code": exc.code}})
-        save_manifest(manifest)
-        raise RuntimeError(f"成品音频 ASR 验收失败：{exc}") from exc
-    audio_quality = assess_transcription(turns, asr_result, language)
+    warnings = generated.setdefault("warnings", [])
+
+    async def verify_audio(key: str) -> dict[str, Any]:
+        if cancel_check():
+            raise RuntimeError("任务已取消")
+        Reporter(job_id).update("asr", "本地 ASR 验收成品音频", 0.92, current=0, total=1, unit="次")
+        try:
+            result = await transcribe_audio(destination, provider=provider, language="English" if language == "en" else "Chinese", cancel_check=cancel_check, idempotency_key=key)
+            return assess_transcription(turns, result, language)
+        except ProviderError as exc:
+            if cancel_check():
+                raise RuntimeError("任务已取消") from exc
+            return {"passed": False, "stage": "asr", "error": str(exc), "code": exc.code, "segment_count": 0}
+
+    audio_quality = await verify_audio(f"sread-asr-{suffix[:36]}")
     retry_indexes = repair_turn_indexes(audio_quality)
-    if retry_indexes and len(retry_indexes) <= 6:
+    if audio_quality.get("segment_count") and retry_indexes and len(retry_indexes) <= 6:
         repair_started = time.perf_counter()
-        await synthesize_indexes(retry_indexes, retry=True)
-        tts_seconds += time.perf_counter() - repair_started
-        destination, cursor = await render_audio(set(retry_indexes))
-        duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
-        if not duration_check["passed"]:
-            failure = {"stage": "duration_after_audio_repair", **duration_check}
-            manifest.update({"generated": generated, "media_path": str(destination.relative_to(PATHS.root)), "audio_quality_failure": failure})
-            save_manifest(manifest)
-            raise RuntimeError("修复后的成品音频实际时长未通过质量门槛")
-        asr_result = await transcribe_audio(
-            destination,
-            provider=provider,
-            language="English" if language == "en" else "Chinese",
-            cancel_check=cancel_check,
-            idempotency_key=f"sread-asr-{suffix[:32]}-verify",
-        )
-        audio_quality = assess_transcription(turns, asr_result, language)
-        audio_quality["repaired_turns"] = retry_indexes
+        original_audio = work_dir / f"before-repair{destination.suffix}"
+        shutil.copy2(destination, original_audio)
+        original_cursor = cursor
+        timings = [(item, item.get("start_seconds"), item.get("end_seconds")) for item in turns + generated["chapters"]]
+        try:
+            await synthesize_indexes(retry_indexes, retry=True)
+            destination, cursor = await render_audio(set(retry_indexes))
+            duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
+            audio_quality = await verify_audio(f"sread-asr-{suffix[:32]}-verify")
+            audio_quality["repaired_turns"] = retry_indexes
+        except (ProviderError, RuntimeError, OSError) as exc:
+            if cancel_check():
+                raise RuntimeError("任务已取消") from exc
+            shutil.copy2(original_audio, destination)
+            cursor = original_cursor
+            duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
+            for item, start, end in timings:
+                item.update(start_seconds=start, end_seconds=end)
+            audio_quality["repair_error"] = str(exc)
+            warnings.append({"code": "audio_repair_failed", "stage": "audio", "message": "局部音频修复未完成，保留修复前可播放的音频及其验收结果。"})
+        finally:
+            tts_seconds += time.perf_counter() - repair_started
     audio_quality["duration"] = duration_check
+    if not duration_check["passed"]:
+        warnings.append({"code": "audio_duration", "stage": "audio", "message": f"目标 {duration_check['target_minutes']} 分钟，实际 {duration_check['actual_minutes']} 分钟，未达到时长验收范围。"})
     if not audio_quality.get("passed"):
         manifest.update({"generated": generated, "media_path": str(destination.relative_to(PATHS.root)), "audio_quality_failure": audio_quality})
         save_manifest(manifest)
-        raise RuntimeError("成品音频未通过本地 ASR 质量门槛")
+        warnings.append({"code": "audio_unverified", "stage": "audio", "message": "音频已生成，但 ASR 质量验收未通过；请查看错误率、说话人区分及静音指标。"})
+    if cancel_check():
+        raise RuntimeError("任务已取消")
+    generated["degraded"] = bool(generated.get("degraded") or warnings)
     generated["duration"]["actual_seconds"] = round(cursor, 3)
     generated["voices"] = {
         speaker: {"mode": selection["mode"], "label": selection["label"]}
@@ -757,7 +766,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     save_manifest(manifest)
     shutil.copy2(manifest_path, out_dir / "manifest.json")
     artifact_id, now = f"artifact_{suffix}", utc_now()
-    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "podcast", "双人音频解读", json_dump(generated["source_ids"]), language, "ready", json_dump(generated), json_dump(generated["citations"]), str(destination.relative_to(PATHS.root)), now, now))
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "podcast", "双人音频解读", json_dump(generated["source_ids"]), language, "partial" if generated["degraded"] else "ready", json_dump(generated), json_dump(generated["citations"]), str(destination.relative_to(PATHS.root)), now, now))
     register_resource("notebook", notebook_id, notebook_id, "podcast", out_dir)
     shutil.rmtree(work_dir, ignore_errors=True)
     DB.execute("UPDATE local_resources SET state='transferred',transferred_at=? WHERE owner_type='job' AND owner_id=?", (utc_now(), job_id))

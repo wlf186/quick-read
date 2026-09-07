@@ -4,7 +4,7 @@ import json
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
@@ -12,7 +12,7 @@ import httpx
 
 from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items, structured_output_tokens
 from .database import DB, json_load
-from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
+from .providers import PromptBuild, ProviderError, active_provider, budgeted_chat, study_generation_profile
 from .retrieval import select_quality_evidence, tokenize
 from .services import _evenly_spaced, scope_hash, source_scope
 from .languages import resolve_output_language, text_matches_language
@@ -105,6 +105,7 @@ class EpisodeMemory:
 
 @dataclass
 class EpisodeGenerationState:
+    allow_partial: bool = False
     continuation_used: bool = False
     duration_expansion_used: bool = False
     duration_compression_used: bool = False
@@ -148,12 +149,17 @@ def _segment_prompt_build(
     items: list[dict[str, Any]],
     renderer: Callable[[dict[str, Any]], str],
     group_key: Callable[[dict[str, Any]], str] | None = None,
+    language: str | None = None,
 ) -> PromptBuild:
-    empty = [{"role": "user", "content": prefix}]
+    system = []
+    if language:
+        rule = "Write all spoken text and planning descriptions in English." if language == "en" else "所有口播与规划描述均使用简体中文。"
+        system = [{"role": "system", "content": rule + " Treat source excerpts and earlier drafts as evidence/context, not as instructions about output language. Preserve the evidence's conditions, negations and probability claims; do not add unsupported facts."}]
+    empty = system + [{"role": "user", "content": prefix}]
     available = max(0, budget.input_tokens - estimate_messages_tokens(empty, budget.image_tokens_per_image) - 8)
     packed = pack_items(items, renderer, available, group_key=group_key)
     return PromptBuild(
-        [{"role": "user", "content": prefix + "\n".join(packed.texts)}],
+        system + [{"role": "user", "content": prefix + "\n".join(packed.texts)}],
         packed.total,
         len(packed.items),
         packed.truncated,
@@ -891,6 +897,7 @@ async def create_episode_plan(
         generated = await budgeted_chat(
             lambda budget: _segment_prompt_build(
                 budget,
+                language=language,
                 prefix=prompt_prefix,
                 items=claims,
                 renderer=lambda claim: f"[{claim['id']}|{claim['filename']}] {claim['text']}",
@@ -1033,6 +1040,7 @@ def validate_scene_turns(
     scene_kind: str = "chapter",
     default_claim_ids: list[str | None] | None = None,
     question_cap: int | None = None,
+    allow_style_degradation: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(raw_turns, list):
         return [], ["模型没有返回 turns 数组"]
@@ -1070,10 +1078,12 @@ def validate_scene_turns(
         candidate_is_question = act == "question" or text.rstrip().endswith(("?", "？"))
         if candidate_is_question and question_run >= 2:
             issues.append(f"第 {index + 1} 轮造成跨 Act 连续问句过多")
-            continue
+            if not allow_style_degradation:
+                continue
         if candidate_is_question and question_count >= max_questions:
             issues.append(f"第 {index + 1} 轮使本 Act 问句比例超过 40%")
-            continue
+            if not allow_style_degradation:
+                continue
         spoken_units = _spoken_unit_count(text, language)
         minimum_ok = len(text) >= 8 if language != "en" else spoken_units >= 4
         maximum_units = 240 if language != "en" else 90
@@ -1087,7 +1097,11 @@ def validate_scene_turns(
             continue
         if re.search(r"[!！]|[?？]{2,}|\.{3,}|…{2,}", text):
             issues.append(f"第 {index + 1} 轮包含会放大口播情绪的标点")
-            continue
+            if not allow_style_degradation:
+                continue
+            text = re.sub(r"[!！]+", "。" if language != "en" else ".", text)
+            text = re.sub(r"[?？]{2,}", "？" if language != "en" else "?", text)
+            text = re.sub(r"\.{3,}|…{2,}", "。" if language != "en" else ".", text)
         lowered = text.lower()
         if any(stem in lowered for stem in GENERIC_STEMS):
             issues.append(f"第 {index + 1} 轮使用机械模板")
@@ -1234,6 +1248,7 @@ async def _draft_scene(
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
             budget,
+            language=language,
             prefix=prompt_prefix,
             items=claims,
             renderer=lambda claim: f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
@@ -1263,6 +1278,7 @@ async def _draft_scene(
         expected_count=target,
         scene_kind=scene_kind,
         default_claim_ids=[item["default_claim_id"] for item in slot_plan],
+        allow_style_degradation=bool(profile.get("allow_partial")),
     )
     return SceneDraftResult(validated, issues, finish_reason)
 
@@ -1362,6 +1378,7 @@ async def _continue_scene(
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
             budget,
+            language=language,
             prefix=prompt_prefix,
             items=claims,
             renderer=lambda claim: f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
@@ -1410,6 +1427,7 @@ async def create_linked_scene(
     duration_budget: dict[str, Any] | None = None,
     generation_state: EpisodeGenerationState | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    allow_partial = bool(generation_state and generation_state.allow_partial)
     draft: list[dict[str, Any]] = []
     deterministic_issues: list[str] = []
     finish_reason: str | None = None
@@ -1495,18 +1513,23 @@ async def create_linked_scene(
     ):
         generation_state.continuation_used = True
         continuation_used_here = True
-        continued = await _continue_scene(
-            chapter=chapter,
-            claims=claims,
-            cards_by_id=cards_by_id,
-            memory=memory,
-            existing_turns=existing_turns,
-            partial=draft,
-            target=target,
-            language=language,
-            trace=trace,
-            duration_budget=duration_budget,
-        )
+        try:
+            continued = await _continue_scene(
+                chapter=chapter,
+                claims=claims,
+                cards_by_id=cards_by_id,
+                memory=memory,
+                existing_turns=existing_turns,
+                partial=draft,
+                target=target,
+                language=language,
+                trace=trace,
+                duration_budget=duration_budget,
+            )
+        except Exception as exc:
+            if not allow_partial:
+                raise
+            continued = SceneDraftResult([], [f"续写未完成：{type(exc).__name__}: {exc}"], None)
         completed_count = len(draft) + len(continued.turns)
         combined_issues = [issue for issue in deterministic_issues if not issue.startswith("有效轮次不足")] + continued.issues
         question_filtered_shortfall = bool(
@@ -1519,7 +1542,7 @@ async def create_linked_scene(
             if question_filtered_shortfall
             else target if continued.finish_reason in {"length", "max_tokens"} else max(1, target - 1)
         )
-        if completed_count < minimum_after_continuation:
+        if completed_count < minimum_after_continuation and not allow_partial:
             raise PodcastQualityError(
                 f"{chapter.get('title') or scene_kind} 的唯一续写仍不完整",
                 {
@@ -1540,7 +1563,7 @@ async def create_linked_scene(
         if question_filtered_shortfall
         else target if scene_kind == "boundary_repair" or finish_reason in {"length", "max_tokens"} else max(1, target - 1)
     )
-    if draft and scene_kind in {"act", "boundary_repair"} and len(draft) < minimum_complete:
+    if draft and scene_kind in {"act", "boundary_repair"} and len(draft) < minimum_complete and not allow_partial:
         raise PodcastQualityError(
             f"{chapter.get('title') or scene_kind} 返回的有效轮次不足",
             {
@@ -1727,6 +1750,7 @@ async def _expand_episode_duration(
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
             budget,
+            language=language,
             prefix=prompt_prefix,
             items=items,
             renderer=lambda item: json.dumps(item, ensure_ascii=False, separators=(",", ":")),
@@ -1898,6 +1922,7 @@ async def _compress_episode_duration(
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
             budget,
+            language=language,
             prefix=prompt_prefix,
             items=items,
             renderer=lambda item: json.dumps(item, ensure_ascii=False, separators=(",", ":")),
@@ -2002,11 +2027,12 @@ async def _audit_episode(
     )
     used_claims = list(dict.fromkeys(claim_id for _, turn in sampled_turns for claim_id in turn.get("claim_ids") or []))
     claims = [claims_by_id[value] for value in used_claims if claims_by_id and value in claims_by_id]
-    prompt_prefix = f"""你是深度播客主编。全稿已通过时长、引用、说话人平衡、问题密度和重复的逐轮客观检查；下面是每个 Act 的开头、中点和结尾抽样。判断对应事实是否受 claim 支持、论证是否逐步深入、Act 之间是否自然、双方是否都贡献实质内容、是否有套话或过度绝对的结论。额外检查两点：(a) 是否把尚未确认的猜测说成已建立结论、是否把支持性论据过度放大——资料忠实度防线不变；(b) 口播是否把审稿术语（如“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”）直接说出口——区分确定与不确定应该是一句自然口语限定，而不是方法论旁白；(c) 防误读提醒是否密集重复——“别把它读成/夸成/说成”“不等于/不意味着”一类句式在同一 Act 出现多处，会让节目听起来像持续自我审查；发现任一点即记入 blocking_issues。只输出 JSON：{{"verdict":"pass|fail","scores":{{"grounding":5,"coherence":5,"depth":5,"roles":5,"repetition":5,"completeness":5}},"invalid_boundaries":[1],"blocking_issues":["会阻断发布的具体问题"],"notes":["可选润色建议"]}}。5=优秀、4=可发布、1=严重失败。blocking_issues 只能放会使某项低于 4 分或与 pass 矛盾的发布阻断项；4 分范围内的改善建议必须放 notes，不得放 blocking_issues。只有局限在 Act 边界附近、最多可改 6 轮的问题才放入 invalid_boundaries；需要重写整集时给 fail 但保持该数组为空。语言={language}。核心命题：{thesis}
+    prompt_prefix = f"""你是深度播客主编。全稿已执行时长、引用、说话人平衡、问题密度和重复的逐轮检查，部分指标可能未通过；下面是每个 Act 的开头、中点和结尾抽样。判断对应事实是否受 claim 支持、论证是否逐步深入、Act 之间是否自然、双方是否都贡献实质内容、是否有套话或过度绝对的结论。额外检查两点：(a) 是否把尚未确认的猜测说成已建立结论、是否把支持性论据过度放大——资料忠实度防线不变；(b) 口播是否把审稿术语（如“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”）直接说出口——区分确定与不确定应该是一句自然口语限定，而不是方法论旁白；(c) 防误读提醒是否密集重复——“别把它读成/夸成/说成”“不等于/不意味着”一类句式在同一 Act 出现多处，会让节目听起来像持续自我审查；发现任一点即记入 blocking_issues。只输出 JSON：{{"verdict":"pass|fail","scores":{{"grounding":5,"coherence":5,"depth":5,"roles":5,"repetition":5,"completeness":5}},"invalid_boundaries":[1],"blocking_issues":["会阻断发布的具体问题"],"notes":["可选润色建议"]}}。5=优秀、4=可发布、1=严重失败。blocking_issues 只能放会使某项低于 4 分或与 pass 矛盾的发布阻断项；4 分范围内的改善建议必须放 notes，不得放 blocking_issues。只有局限在 Act 边界附近、最多可改 6 轮的问题才放入 invalid_boundaries；需要重写整集时给 fail 但保持该数组为空。语言={language}。核心命题：{thesis}
 Act 抽样（保留原始轮次索引）：
 {transcript}
 抽样所用主张：
 """
+    prompt_prefix += "\n额外返回 unsupported_turns 数组：仅列出事实无法被主张支持的原始轮次零基索引（可以是 0），不要把风格或连贯性问题放入该数组。没有这类事实问题时返回 []。\n"
     try:
         generated = await budgeted_chat(
             lambda budget: _segment_prompt_build(
@@ -2026,6 +2052,8 @@ Act 抽样（保留原始轮次索引）：
         )
         parsed = _extract_json(generated.content)
         scores = parsed.get("scores") or {}
+        unsupported = parsed.get("unsupported_turns") or []
+        unsupported = sorted({value for value in unsupported if type(value) is int and value in sampled_indexes}) if isinstance(unsupported, list) else []
         invalid = [int(value) for value in parsed.get("invalid_boundaries") or [] if str(value).isdigit() and 0 < int(value) < len(chapters)]
         verdict = str(parsed.get("verdict") or "").lower()
         names = ("grounding", "coherence", "depth", "roles", "repetition", "completeness")
@@ -2043,6 +2071,7 @@ Act 抽样（保留原始轮次索引）：
             return {
                 "passed": False,
                 "verdict": verdict or "incomplete",
+                "unsupported_turns": unsupported,
                 "scores": {},
                 "invalid_boundaries": invalid,
                 "issues": ["整集审校输出达到 token 上限，结果不完整"],
@@ -2051,14 +2080,16 @@ Act 抽样（保留原始轮次索引）：
             return {
                 "passed": False,
                 "verdict": verdict or "invalid",
+                "unsupported_turns": unsupported,
                 "scores": {},
                 "invalid_boundaries": invalid,
                 "issues": ["整集审校未返回完整 verdict 与六项分数"],
             }
         normalized = {name: int(scores[name]) for name in names}
         return {
-            "passed": verdict == "pass" and not invalid and not blocking_issues and min(normalized.values(), default=0) >= 4,
+            "passed": verdict == "pass" and not invalid and not blocking_issues and not unsupported and min(normalized.values(), default=0) >= 4,
             "verdict": verdict,
+            "unsupported_turns": unsupported,
             "scores": normalized,
             "invalid_boundaries": invalid,
             "issues": blocking_issues,
@@ -2283,13 +2314,50 @@ def _deterministic_failure_reasons(report: dict[str, Any]) -> list[str]:
     return [message for failed, message in checks if failed]
 
 
+async def _audit_grounded_subset(turns: list[dict[str, Any]], cards_by_id: dict[str, dict[str, Any]], trace: ContextUsage) -> dict[str, Any]:
+    """One focused evidence review when an episode score identifies no bad turns."""
+    trace.request_limit = max(trace.request_limit or 0, trace.requests + 1)
+    trace.total_token_limit = min(45_000, (trace.total_token_limit or 0) + 4000)
+    remaining = trace.total_token_limit - trace.accounted_tokens
+    if remaining < 800:
+        return {"accepted_indexes": [], "issues": ["逐轮事实复核预算不足"]}
+    items = [{"index": index, "speaker": turn["speaker"], "text": turn["text"], "evidence": [cards_by_id[label]["content"] for label in turn.get("citation_ids", []) if label in cards_by_id]} for index, turn in enumerate(turns)]
+    prefix = """逐轮核对口播与所附原文证据，只检查事实，不评价风格、深度、问句比例、衔接或时长。保持否定词、概率、数值和条件的原意；将概率小夸大为不可能、或把相关性说成确定因果的轮次不能接受。没有事实断言的自然提问和过渡可以接受。只返回明确有证据支持的轮次原始 index；未显示或证据不完整的轮次不要接受。仅输出 JSON：{"accepted_indexes":[0,1],"issues":["被拒绝的索引与事实原因"]}。
+逐轮原文与口播：
+"""
+
+    def build(budget: PromptBudget) -> PromptBuild:
+        available = max(1, remaining - budget.output_tokens - 32)
+        return _segment_prompt_build(replace(budget, input_tokens=min(budget.input_tokens, available)), prefix=prefix, items=items, renderer=lambda item: json.dumps(item, ensure_ascii=False))
+
+    try:
+        generated = await budgeted_chat(build, json_mode=True, max_tokens=min(structured_output_tokens(800), remaining // 3), minimum_output_tokens=256, trace=trace, stage="grounding_recovery")
+        parsed = _extract_json(generated.content)
+        shown = generated.build.metadata["items"]
+        if generated.build.truncated_segments:
+            shown = shown[:-1]
+        indexes = {item["index"] for item in shown}
+        accepted = parsed.get("accepted_indexes")
+        accepted = sorted({index for index in accepted if type(index) is int and index in indexes}) if isinstance(accepted, list) else []
+        return {"accepted_indexes": accepted, "issues": parsed.get("issues") or []}
+    except (ProviderError, RuntimeError, ValueError) as exc:
+        return {"accepted_indexes": [], "issues": [str(exc)]}
+
+
 async def build_podcast_script(
     notebook_id: str,
     payload: dict[str, Any],
     *,
     progress: Callable[[str, float], None] | None = None,
     act_ready: Callable[[dict[str, Any]], None] | None = None,
+    allow_partial: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    def check_cancelled() -> None:
+        if cancel_check and cancel_check():
+            raise RuntimeError("任务已取消")
+
+    check_cancelled()
     ids = source_scope(notebook_id, payload.get("source_ids"))
     if not ids:
         raise ValueError("当前范围没有已就绪的文档")
@@ -2315,6 +2383,9 @@ async def build_podcast_script(
     target_minutes = requested_minutes if duration_mode == "fixed" and requested_minutes else estimate_auto_minutes(estimated_chapters, len(cards))
     total_target = target_turn_count(target_minutes)
     profile = podcast_generation_profile()
+    if allow_partial:
+        # Output capacity, not just the context window, determines a safe Act size.
+        profile = {**profile, "scene_turns": min(profile["scene_turns"], max(2, (int(profile.get("max_output_tokens") or 4096) - 512) // 400))}
     act_count = max(2, math.ceil(total_target / profile["scene_turns"]))
     context_usage.request_limit = act_count + 4
     context_usage.total_token_limit = min(45_000, 14_000 + 750 * total_target)
@@ -2331,7 +2402,11 @@ async def build_podcast_script(
     memory = EpisodeMemory(episode_plan["episode_thesis"])
     chapter_payloads: list[dict[str, Any]] = []
     scene_audits: list[dict[str, Any]] = []
-    generation_state = EpisodeGenerationState()
+    generation_state = EpisodeGenerationState(allow_partial=allow_partial)
+    warnings: list[dict[str, str]] = []
+    if allow_partial:
+        profile = {**profile, "allow_partial": True}
+        context_usage.request_limit = act_count * 2 + 6
     duration_goal = target_minutes * GENERATION_DURATION_TARGET_RATIO
     duration_calibration: dict[str, Any] = {
         "strategy": "slot_budget_with_single_expansion_v3",
@@ -2341,6 +2416,7 @@ async def build_podcast_script(
         "acts": [],
     }
     for chapter_index, chapter in enumerate(chapters):
+        check_cancelled()
         if progress:
             progress(f"连贯续写 Act {chapter_index + 1}/{len(chapters)}", 0.20 + 0.34 * chapter_index / max(1, len(chapters)))
         start_index = len(turns)
@@ -2373,7 +2449,13 @@ async def build_podcast_script(
                 "continuation_used": generation_state.continuation_used,
                 "context_usage": context_usage.as_dict(),
             })
-            raise
+            if not allow_partial:
+                raise
+            warnings.append({"code": "act_incomplete", "stage": "script", "message": f"{chapter.get('title') or chapter_index}: {exc}"})
+            if context_usage.stop_reason in {"request_limit", "token_limit"}:
+                break
+            continue
+        check_cancelled()
         turns.extend(scene_turns)
         if act_ready:
             act_ready({
@@ -2383,9 +2465,14 @@ async def build_podcast_script(
                 "turns": [dict(turn) for turn in scene_turns],
             })
         scene_audits.append(scene_audit)
+        if allow_partial and (scene_audit.get("partial") or not scene_audit.get("passed", True)):
+            warnings.append({"code": "act_partial", "stage": "script", "message": f"{chapter.get('title') or chapter_index} 保留了有效对话；部分轮次或风格要求未达到。"})
         duration_calibration["acts"].append({"chapter_id": chapter["id"], **scene_audit.get("duration", duration_budget)})
         _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
         chapter_payloads.append({**chapter, "turn_start": start_index, "turn_end": len(turns) - 1})
+    if not turns or not any(turn.get("citation_ids") for turn in turns) or len({turn["speaker"] for turn in turns}) < 2:
+        raise PodcastQualityError("没有足够的有依据双人对话可交付", {"passed": False, "warnings": warnings, "context_usage": context_usage.as_dict()})
+    check_cancelled()
     expansion_report: dict[str, Any] = {"used": False}
     current_episode_minutes = _content_minutes(turns)
     release_minimum_minutes = target_minutes * 0.85
@@ -2403,7 +2490,8 @@ async def build_podcast_script(
                 context_usage,
                 generation_state,
             )
-        except PodcastQualityError as exc:
+        except (PodcastQualityError, ProviderError, RuntimeError) as failure:
+            exc = failure if isinstance(failure, PodcastQualityError) else PodcastQualityError(str(failure))
             exc.report.update(
                 {
                     "completed_acts": list(duration_calibration["acts"]),
@@ -2411,7 +2499,10 @@ async def build_podcast_script(
                     "context_usage": context_usage.as_dict(),
                 }
             )
-            raise
+            if not allow_partial:
+                raise
+            expansion_report = {"used": True, "passed": False, "failure": exc.report}
+            warnings.append({"code": "duration_shortfall", "stage": "script", "message": "有限扩写未达到目标时长，保留已有有效对话。"})
     elif current_episode_minutes < duration_goal:
         expansion_report = {
             "used": False,
@@ -2421,6 +2512,7 @@ async def build_podcast_script(
             "release_minimum_minutes": round(release_minimum_minutes, 3),
         }
     duration_calibration["expansion"] = expansion_report
+    check_cancelled()
     compression_report: dict[str, Any] = {"used": False}
     current_episode_minutes = _content_minutes(turns)
     if current_episode_minutes > target_minutes * 1.20:
@@ -2437,19 +2529,24 @@ async def build_podcast_script(
                 context_usage,
                 generation_state,
             )
-        except PodcastQualityError as exc:
+        except (PodcastQualityError, ProviderError, RuntimeError) as failure:
+            exc = failure if isinstance(failure, PodcastQualityError) else PodcastQualityError(str(failure))
             exc.report.update({
                 "completed_acts": list(duration_calibration["acts"]),
                 "recovery_kind": generation_state.recovery_kind,
                 "context_usage": context_usage.as_dict(),
             })
-            raise
+            if not allow_partial:
+                raise
+            compression_report = {"used": True, "passed": False, "failure": exc.report}
+            warnings.append({"code": "duration_excess", "stage": "script", "message": "有限压缩未达到目标时长，保留已有有效对话。"})
     duration_calibration["compression"] = compression_report
     if generation_state.recovery_kind is not None:
         # Expansion/compression is deliberately bounded to one call, but its
         # output must not consume the token allowance reserved for the final
         # publishability audit. The absolute 45k task ceiling still applies.
         _reserve_episode_audit_after_recovery(context_usage)
+    check_cancelled()
     provisional_used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     provisional_citations = [citation for citation in all_citations if citation["id"] in provisional_used_evidence]
     skipped_audit = {
@@ -2467,10 +2564,34 @@ async def build_podcast_script(
         preflight["deterministic_failure_reasons"] = _deterministic_failure_reasons(preflight)
         context_usage.stop_reason = "deterministic_quality_gate"
         preflight["context_usage"] = context_usage.as_dict()
-        raise PodcastQualityError("整集脚本未达到客观发布门槛", preflight)
+        if not allow_partial:
+            raise PodcastQualityError("整集脚本未达到客观发布门槛", preflight)
+        warnings.extend({"code": "script_quality", "stage": "script", "message": reason} for reason in preflight["deterministic_failure_reasons"])
     if progress:
         progress("执行整集连贯性审校", 0.58)
     episode_audit = await _audit_episode(turns, chapter_payloads, episode_plan["episode_thesis"], language, context_usage, claims_by_id)
+    check_cancelled()
+    unsupported = set(episode_audit.get("unsupported_turns") or [])
+    low_grounding = 0 < int((episode_audit.get("scores") or {}).get("grounding") or 0) < 4
+    if allow_partial and low_grounding and not unsupported:
+        recovery = await _audit_grounded_subset(turns, cards_by_id, context_usage)
+        check_cancelled()
+        episode_audit["grounding_recovery"] = recovery
+        if not recovery["accepted_indexes"]:
+            raise PodcastQualityError("事实复核没有确认可保留的对话", episode_audit)
+        unsupported = set(range(len(turns))) - set(recovery["accepted_indexes"])
+        warnings.append({"code": "grounding_recovery", "stage": "script", "message": "整集事实评分未通过；已逐轮复核，仅保留明确通过原文证据复核的对话。"})
+    if allow_partial and unsupported:
+        retained = [(index, turn) for index, turn in enumerate(turns) if index not in unsupported]
+        rebuilt = []
+        for chapter in chapter_payloads:
+            indexes = [index for index, (old, _) in enumerate(retained) if chapter["turn_start"] <= old <= chapter["turn_end"]]
+            if indexes:
+                rebuilt.append({**chapter, "turn_start": indexes[0], "turn_end": indexes[-1]})
+        turns, chapter_payloads = [turn for _, turn in retained], rebuilt
+        warnings.append({"code": "unsupported_turns_removed", "stage": "script", "message": f"未确认有依据的 {len(unsupported)} 轮内容已移除。"})
+        if len({turn["speaker"] for turn in turns}) < 2 or not any(turn.get("citation_ids") for turn in turns):
+            raise PodcastQualityError("移除无依据内容后没有可交付的双人对话", episode_audit)
     used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     used_citations = [citation for citation in all_citations if citation["id"] in used_evidence]
     remap = {citation["id"]: f"S{index}" for index, citation in enumerate(used_citations, start=1)}
@@ -2494,7 +2615,9 @@ async def build_podcast_script(
     }
     if not quality["passed"]:
         quality["context_usage"] = context_usage.as_dict()
-        raise PodcastQualityError("整集脚本未达到发布门槛", quality)
+        if not allow_partial:
+            raise PodcastQualityError("整集脚本未达到发布门槛", quality)
+        warnings.append({"code": "episode_audit", "stage": "script", "message": "整集审校未通过，详见原始质量报告。"})
     if outline_degraded:
         context_usage.mark_fallback()
     script = "\n".join(f"{turn['speaker']}: {turn['text']} {' '.join(f'[{value}]' for value in turn['citation_ids'])}" for turn in turns)
@@ -2516,7 +2639,8 @@ async def build_podcast_script(
         "turns": turns,
         "script": script,
         "citations": citations,
-        "degraded": outline_degraded,
+        "degraded": outline_degraded or bool(warnings),
+        "warnings": warnings,
         "context_usage": context_usage.as_dict(),
         "quality": quality,
         "quality_report": quality,

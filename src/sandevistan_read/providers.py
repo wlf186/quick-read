@@ -600,7 +600,7 @@ def study_generation_profile(provider: dict[str, Any]) -> dict[str, Any]:
         "source": source,
         "reason": reason,
         "parameter_count": parameter_count,
-        "supports_difficulties": ["easy", "medium", "mixed"] if tier == "lite" else ["easy", "medium", "hard", "mixed"],
+        "supports_difficulties": ["easy", "medium", "hard", "mixed"],
     }
 
 
@@ -1241,10 +1241,17 @@ async def budgeted_chat(
                     max_tokens=budget.output_tokens,
                     temperature=temperature,
                 )
-            except (httpx.ConnectError, httpx.TimeoutException):
-                # 传输层错误与提示预算无关，同一预算下只重试一次；不消耗溢出降档
+            except (httpx.ConnectError, httpx.TimeoutException, ProviderError) as exc:
+                if isinstance(exc, ProviderError) and not (
+                    not isinstance(exc, ContextOverflowError)
+                    and provider.get("kind") == "ollama"
+                    and exc.status in {500, 502, 503, 504}
+                ):
+                    raise
+                # Retry transient failures once on the same provider and budget.
                 if trace:
                     trace.record_failure()
+                    trace.begin_request(estimated_tokens=estimated + budget.output_tokens)
                 completion = await _chat_once(
                     provider,
                     build.messages,

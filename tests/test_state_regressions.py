@@ -216,7 +216,8 @@ def test_cancel_other_jobs_and_ready_sources_leave_documents_intact(database):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["queued", "tts", "legacy"])
 @pytest.mark.parametrize("pause", [True, False])
-async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp_path, monkeypatch, phase, pause):
+@pytest.mark.parametrize("asr_ok", [True, False, None])
+async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp_path, monkeypatch, phase, pause, asr_ok):
     original = {"id": "original", "name": "Original AUDIO", "role": "audio", "kind": "sandevistan_audio", "model": "tts",
                 "base_url": "http://audio.invalid", "api_key": "", "config": {"asr_auto_select": False, "asr_model": "asr", "asr_compute_device": "cpu"},
                 "capabilities": {"models": [{"id": "tts", "installed": True}], "asr": {
@@ -248,6 +249,9 @@ async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp
 
     async def synthesize(text, voice, output, **kwargs):
         tts_providers.append(kwargs["provider"])
+        if asr_ok is None and len(tts_providers) > 2:
+            output.write_bytes(b"broken retry")
+            raise RuntimeError("Repair provider unavailable")
         if phase in {"tts", "legacy"}:
             active["audio"] = replacement
         with wave.open(str(output), "wb") as audio:
@@ -263,10 +267,20 @@ async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp
     monkeypatch.setattr(jobs, "build_podcast_script", script)
     monkeypatch.setattr(jobs, "synthesize", synthesize)
     monkeypatch.setattr(providers, "_transcribe_with_provider", transcribe)
-    monkeypatch.setattr(jobs, "assess_transcription", lambda *args: {"passed": len(asr_providers) > 1, "turn_errors": [0] if len(asr_providers) == 1 else []})
+    monkeypatch.setattr(jobs, "assess_transcription", lambda *args: {"passed": bool(asr_ok) and len(asr_providers) > 1, "segment_count": 2, "turn_errors": [0] if len(asr_providers) == 1 else []})
     result = await jobs._podcast("n", payload, job["id"])
+    artifact = database.fetchone("SELECT status,payload_json FROM artifacts WHERE id=?", (result["id"],))
+    assert artifact["status"] == ("ready" if asr_ok else "partial")
+    saved = json_load(artifact["payload_json"], {})
+    assert saved["audio_quality"]["passed"] == bool(asr_ok)
+    assert saved["degraded"] == (not asr_ok)
+    if asr_ok is None:
+        assert saved["audio_quality"]["repair_error"] == "Repair provider unavailable"
+        media = tmp_path / database.fetchone("SELECT media_path FROM artifacts WHERE id=?", (result["id"],))["media_path"]
+        with wave.open(str(media)) as audio:
+            assert audio.getnframes() / audio.getframerate() > 300
     assert len(tts_providers) == 3 and all(value is original for value in tts_providers)
-    assert len(asr_providers) == 2 and all(value is original for value in asr_providers)
+    assert len(asr_providers) == (1 if asr_ok is None else 2) and all(value is original for value in asr_providers)
     assert database.fetchone("SELECT id FROM artifacts WHERE id=?", (result["id"],))
     later = jobs.enqueue("podcast", "n", {})
     assert json_load(later["payload_json"], {})["provider_ids"]["audio"] == (None if pause else "new")

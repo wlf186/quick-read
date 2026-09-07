@@ -179,7 +179,7 @@ class ProviderInspectionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(default=None, description="继续同一 Notebook 的对话；近期同资料修订范围的完整问答用于指代理解与检索，不作为事实证据。")
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
