@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from sandevistan_read import services, study, retrieval
+from sandevistan_read import services, study, retrieval, providers
 from sandevistan_read.context_budget import PromptBudget
 from sandevistan_read.database import Database, json_dump
 from sandevistan_read.providers import BudgetedCompletion
@@ -20,7 +20,7 @@ def evidence_db(tmp_path, monkeypatch):
     db.execute("INSERT INTO sources(id,notebook_id,revision_id,filename,media_type,size_bytes,sha256,blob_path,state,created_at,updated_at) VALUES('s','n','r','fixture.txt','text/plain',100,'hash','unused','ready','now','now')")
     db.execute("INSERT INTO chunks VALUES('c','s','r',0,?,'{}','[]','hash','now')", ("Photosynthesis converts light energy into chemical energy within chloroplasts.",))
     db.execute("INSERT INTO conversations VALUES('conversation','n','Fixture','now','now')")
-    for module in (services, study, retrieval):
+    for module in (services, study, retrieval, podcast, providers):
         monkeypatch.setattr(module, "DB", db)
     return db
 
