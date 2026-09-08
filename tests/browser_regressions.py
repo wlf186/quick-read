@@ -23,9 +23,11 @@ class Fixture:
         self.pending_messages = []
         self.show_job = False
         self.source_state = "ready"
+        self.source_overrides = {}
         self.job_state = "queued"
         self.artifact = None
         self.messages = None
+        self.provider = None
         page.on("pageerror", lambda error: self.errors.append(str(error)))
         page.on("console", lambda message: self.console_errors.append(message.text) if message.type == "error" else None)
         page.route("**/auth/status", lambda route: route.fulfill(json={"required": False, "authenticated": True}))
@@ -53,8 +55,16 @@ class Fixture:
             return
         if path == "/notebooks":
             result = notebooks
-        elif path in ("/providers", "/provider-roles"):
+        elif path == "/providers":
+            result = [self.provider] if self.provider else []
+        elif path == "/provider-roles":
             result = []
+        elif path == "/providers/inspect":
+            result = {"status":"passed","connection_ok":True,"models":[],"capabilities":{},"latency_ms":1,"activation_eligible":True}
+        elif path == "/providers/context-preview":
+            from sandevistan_read.context_budget import TokenLimits, plan_context
+            limits=TokenLimits.from_provider({"config":body["config"]})
+            result={"strategy":"conservative","plans":[plan_context(limits,kind).as_dict() for kind in ('summary','chat','quiz','flashcard','podcast')],"saved_plans":[],"basis":"按每段约 1000 tokens 估算","assumptions":"预算上限不是质量保证。","candidate_segments":None,"material_tokens":None}
         elif path == "/settings/image-processing":
             result = {"mode": "process", "processors": ["ocr"]}
         elif path == "/status":
@@ -73,7 +83,7 @@ class Fixture:
             key = path[-1]
             result = {**next(item for item in notebooks if item["id"] == key), "sources": [
                 {"id": f"{key}-source", "filename": f"Audit {key.upper()}.txt", "state": self.source_state,
-                 "selected": 1 if self.source_state == "ready" else 0, "page_count": 1, "error": "解析已取消" if self.source_state == "failed" else None}]}
+                 "selected": 1 if self.source_state == "ready" else 0, "page_count": 1, "error": "解析已取消" if self.source_state == "failed" else None, **self.source_overrides}]}
         elif path.endswith("/conversations"):
             if self.hold_history:
                 self.pending_history.append(route)
@@ -274,11 +284,13 @@ def run_generation_regressions(browser: Browser) -> None:
         context = browser.new_context(viewport={"width": width, "height": height}, reduced_motion="reduce")
         page = context.new_page()
         fixture = Fixture(page)
+        coverage={"candidate_segments":100,"selected_segments":30,"sent_segments":20,"partially_sent_segments":2,"cited_segments":6,"sources":[{"source_id":"a-source","filename":"Audit A.txt","regions_total":10,"regions_sent":4,"unsent_regions":["页区间：91–100"]}],"plan":{"total_token_limit":100000,"evidence_tokens":20000,"limiting_factor":"有效上下文与输出预算"}}
         fixture.messages = [{"id": "answer", "role": "assistant", "content": "保留有依据的中文回答。", "metadata": {"degraded": True, "warnings": [{"code": "source_formula_unreadable", "stage": "answer", "message": "公式提取不完整，请核对原文件。"}]}}]
         fixture.artifact = {"id": "cards", "type": "podcast", "title": "降级播客", "status": "partial", "media_url": "", "citations": [],
                             "payload": {"version": 4, "degraded": True, "turns": [], "chapters": [], "duration": {"target_minutes": 5, "actual_seconds": 240},
                                         "quality": {"passed": False}, "audio_quality": {"passed": asr_ok, "metric": "cer", "error_rate": 0.02 if asr_ok else 0.12, "speaker_alignment": 0.90, "silence_outliers": 1, "duration": {"passed": False}},
                                         "warnings": [{"code": "audio_duration", "stage": "audio", "message": "目标 5 分钟，实际 4 分钟。"}]}}
+        fixture.artifact['payload']['context_usage']={'coverage':coverage}
         page.goto(BASE_URL)
         expect(page.get_by_label("向已选资料提问")).to_be_enabled()
         expect(page.locator(".messages").get_by_label("生成结果说明")).to_contain_text("公式提取不完整，请核对原文件")
@@ -290,6 +302,10 @@ def run_generation_regressions(browser: Browser) -> None:
         expect(drawer.locator(".podcast-meta")).to_contain_text("UNVERIFIED")
         expect(drawer.locator(".podcast-meta")).to_contain_text("2.0%" if asr_ok else "12.0%")
         expect(drawer.locator(".podcast-meta")).not_to_contain_text("PASSED")
+        drawer.locator('.coverage-details > summary').click()
+        expect(drawer.locator('.coverage-details')).to_contain_text('成功调用完整送入 20 段')
+        drawer.locator('.coverage-details details > summary').click()
+        expect(drawer.locator('.coverage-details')).to_contain_text('页区间：91–100')
         assert_layout(page)
         page.screenshot(path=f"/tmp/quick-read-generation-warnings-{width}.png")
         page.keyboard.press("Escape")
@@ -298,10 +314,68 @@ def run_generation_regressions(browser: Browser) -> None:
         context.close()
 
 
+def run_context_regressions(browser: Browser) -> None:
+    for width in (1440,390):
+        context=browser.new_context(viewport={'width':width,'height':900})
+        page=context.new_page();fixture=Fixture(page)
+        fixture.provider={'id':'main','name':'Fixture Main','role':'main','kind':'openai','base_url':'https://example.invalid','model':'fixture','active':True,'selected':True,'config':{'context_window_tokens':30720,'max_output_tokens':4096},'capabilities':{}}
+        page.goto(BASE_URL)
+        page.get_by_role('button',name='设置',exact=True).click()
+        page.get_by_role('button',name='管理 MAIN',exact=True).click()
+        page.get_by_role('button',name='编辑',exact=True).click()
+        panel=page.get_by_label('上下文容量预估')
+        expect(panel.locator('tbody tr')).to_have_count(5)
+        expect(panel).to_contain_text('当前使用保守策略')
+        original=panel.locator('tbody tr').first.text_content()
+        page.get_by_label('上下文窗口覆盖（tokens）').fill('1000000')
+        page.get_by_label('最大输出覆盖（tokens）').fill('384000')
+        expect(panel.locator('tbody tr').first).not_to_have_text(original)
+        expect(panel).to_contain_text('300,000')
+        page.get_by_label('上下文窗口覆盖（tokens）').fill('30720')
+        page.get_by_label('最大输出覆盖（tokens）').fill('4096')
+        expect(panel.locator('tbody tr').first).to_have_text(original)
+        assert_layout(page)
+        panel.scroll_into_view_if_needed()
+        page.screenshot(path=f'/tmp/quick-read-context-capacity-{width}.png')
+        assert not fixture.errors and not fixture.console_errors
+        assert not any(method=='PATCH' for method,_,_ in fixture.requests)
+        context.close()
+
+
+def run_import_regressions(browser: Browser) -> None:
+    for width, height in ((1440, 900), (390, 844)):
+        context = browser.new_context(viewport={"width": width, "height": height}, reduced_motion="reduce")
+        page = context.new_page()
+        fixture = Fixture(page)
+        fixture.source_overrides = {"filename": "资产.xlsx", "page_count": 10, "metadata": {
+            "locator_unit": "sheet", "warnings": [{"message": "部分公式没有保存计算结果。"}]}}
+        page.goto(BASE_URL, wait_until="domcontentloaded")
+        if width < 600:
+            page.get_by_role('button', name='资料 1', exact=True).click()
+        expect(page.locator('.source').first).to_be_visible()
+        expect(page.locator('.source').first).to_contain_text('10 SHEETS')
+        expect(page.locator('.source .warning').first).to_contain_text('部分公式')
+        upload = page.locator('.upload-zone input')
+        assert '.xlsx' in upload.get_attribute('accept')
+        upload.set_input_files({"name": "fixture.xlsx", "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "buffer": b"fixture"})
+        dialog = page.get_by_role('dialog', name='确认上传')
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text('确认接入 1 份资料')
+        page.keyboard.press('Escape')
+        expect(dialog).not_to_be_visible()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not fixture.errors and not fixture.console_errors
+        assert not any(method == 'POST' and path.endswith('/sources') for method, path, _ in fixture.requests)
+        page.screenshot(path=f'/tmp/quick-read-office-{width}.png', full_page=True)
+        context.close()
+
+
 if __name__ == "__main__":
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
         run_core_regressions(browser)
         run_generation_regressions(browser)
+        run_context_regressions(browser)
+        run_import_regressions(browser)
         browser.close()
     print("Core UI regressions passed")

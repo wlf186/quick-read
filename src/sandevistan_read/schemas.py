@@ -74,6 +74,8 @@ def _validate_provider_pair(role: str, kind: str, *, allow_tts_only: bool = Fals
 def _validate_provider_config(config: dict[str, Any]) -> None:
     validate_token_overrides(config)
     resolve_temperature(config, 0.0)
+    if config.get("context_strategy", "balanced") not in {"balanced", "conservative"}:
+        raise ValueError("上下文策略必须是 balanced 或 conservative")
     tier = config.get("study_generation_tier", "auto")
     if tier not in {"auto", "lite", "full"}:
         raise ValueError("学习生成档位必须是 auto、lite 或 full")
@@ -173,6 +175,20 @@ class ProviderInspectionRequest(BaseModel):
     @model_validator(mode="after")
     def validate_provider_pair(self):
         _validate_provider_pair(self.role, self.kind, allow_tts_only=True)
+        _validate_provider_config(self.config)
+        return self
+
+
+class ContextPreviewRequest(BaseModel):
+    provider_id: str | None = None
+    model: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+    token_limits: dict[str, Any] = Field(default_factory=dict)
+    notebook_id: str | None = None
+    source_ids: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_limits(self):
         _validate_provider_config(self.config)
         return self
 

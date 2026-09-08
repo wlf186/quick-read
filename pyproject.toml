@@ -1,6 +1,6 @@
 [project]
 name = "sandevistan-read"
-version = "0.4.3"
+version = "0.4.4"
 description = "Local-first, source-grounded document intelligence workspace"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -11,6 +11,7 @@ dependencies = [
   "fsrs==6.3.2",
   "httpx==0.28.1",
   "numpy==2.3.2",
+  "openpyxl==3.1.5",
   "pydantic==2.11.7",
   "pymupdf==1.26.3",
   "python-docx==1.2.0",

@@ -241,7 +241,7 @@ export default function App(){
     <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD 0.4.2</span></footer>
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
-    {settings?<SettingsDrawer status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}
+    {settings?<SettingsDrawer status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} notebookId={notebook?.id} sourceIds={selected} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}
     {podcastOpen?<PodcastCreateModal provider={audioProvider} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
     {studyCreate?<StudyCreateModal kind={studyCreate} provider={mainProvider} sourceCount={selected.length} onClose={()=>setStudyCreate(null)} onCreate={onCreateStudy}/>:null}
     {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}><button className="drawer-close" data-autofocus onClick={()=>setTabletStudio(false)}>关闭 ×</button>{studio}</Overlay>:null}

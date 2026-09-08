@@ -1,4 +1,5 @@
-import {useId,useMemo,useState} from 'react';
+import {useEffect,useId,useMemo,useState} from 'react';
+import {previewContext,type ContextPreview} from './api';
 import {ArrowLeft,FlaskConical,Plus,RefreshCw,Wifi} from 'lucide-react';
 import type {ConfigurableProviderRole,HostVoiceMode,ImageProcessingPolicy,Provider,ProviderDraft,ProviderInspection,ProviderKind,ProviderModel,ProviderRoleState,TokenLimits,VoiceprintPersonOption} from './api';
 import {ConfirmDialog,Overlay} from './ui';
@@ -12,6 +13,8 @@ const KINDS_BY_ROLE:Record<ConfigurableProviderRole,Array<{value:ProviderKind;la
 type DrawerView={mode:'list'}|{mode:'role';role:ConfigurableProviderRole}|{mode:'add'}|{mode:'edit';provider:Provider};
 type InspectionMode='catalog'|'deep';
 type SettingsProps={
+  notebookId?:string;
+  sourceIds?:string[];
   status:any;
   providers:Provider[];
   roles:ProviderRoleState[];
@@ -97,7 +100,21 @@ function HostVoiceEditor({host,draft,voices,people,libraryStatus,libraryMessage,
   </section>;
 }
 
-export function SettingsDrawer({status,providers,roles,imagePolicy,onClose,onSave,onCreate,onInspect,onSaveRole,onSaveImagePolicy}:SettingsProps){
+function ContextCapacity({providerId,model,config,limits,notebookId,sourceIds}:{providerId?:string;model:string;config:Record<string,unknown>;limits?:Partial<TokenLimits>;notebookId?:string;sourceIds?:string[]}){
+  const[result,setResult]=useState<ContextPreview>();
+  const[error,setError]=useState('');
+  const body=JSON.stringify({provider_id:providerId,model,config,token_limits:limits,notebook_id:notebookId||undefined,source_ids:sourceIds});
+  useEffect(()=>{
+    const controller=new AbortController();let active=true;
+    setResult(undefined);setError('');
+    const timer=setTimeout(()=>{void previewContext(JSON.parse(body),controller.signal).then(value=>{if(active)setResult(value)}).catch(error=>{if(active)setError(error instanceof Error?`无法估算：${error.message}`:'暂时无法估算。')})},350);
+    return()=>{active=false;clearTimeout(timer);controller.abort()};
+  },[body]);
+  const names:Record<string,string>={summary:'摘要',chat:'问答',quiz:'Quiz',flashcard:'Flashcard',podcast:'Podcast'};
+  return <section className="context-capacity" aria-label="上下文容量预估"><b>上下文容量预估</b><p>{result?.basis||error||'正在估算…'}</p>{result?<>{result.strategy==='conservative'?<p>当前使用保守策略。下表是均衡策略的预估容量，质量验证通过前不会自动启用。</p>:null}<div className="context-capacity-table"><table><thead><tr><th>功能</th><th>实际策略</th><th>预计选材</th><th>提炼批次</th><th>总预算上限</th></tr></thead><tbody>{result.plans.map(plan=>{const saved=result.saved_plans.find(item=>item.kind===plan.kind),delta=saved?plan.estimated_segments-saved.estimated_segments:0;return <tr key={plan.kind}><th>{names[plan.kind]}</th><td>{(result.strategies?.[plan.kind]||result.strategy)==='balanced'?'均衡':'保守'}</td><td>约 {plan.estimated_segments} 段{delta!==0?<small>（{delta>0?'+':''}{delta}）</small>:null}</td><td>{plan.preparation_batches||'直接综合'}</td><td>{plan.total_token_limit.toLocaleString()} tokens<small>{plan.limiting_factor}</small></td></tr>})}</tbody></table></div><small>{result.assumptions} 总预算包含输入、输出、推理及重试；安全余量 20%，长任务最高 30 万 tokens。片段数不是输出段落数。</small></>:null}</section>;
+}
+
+export function SettingsDrawer({status,providers,roles,imagePolicy,notebookId,sourceIds,onClose,onSave,onCreate,onInspect,onSaveRole,onSaveImagePolicy}:SettingsProps){
   const[view,setView]=useState<DrawerView>({mode:'list'});
   const[draft,setDraft]=useState<ProviderDraft>(newDraft);
   const[catalog,setCatalog]=useState<ProviderInspection>();
@@ -228,6 +245,7 @@ export function SettingsDrawer({status,providers,roles,imagePolicy,onClose,onSav
             <div className="provider-form-grid"><label>学习生成档位<select value={draft.config.study_generation_tier||'auto'} onChange={event=>mutate(current=>({...current,config:{...current.config,study_generation_tier:event.target.value as 'auto'|'lite'|'full'}}))}><option value="auto">AUTO · 按模型与窗口判断</option><option value="lite">LITE · 兼容小模型</option><option value="full">FULL · 蓝图与独立审校</option></select><small>自动档会同时考虑参数量、上下文窗口与最大输出；人工覆盖仍受 token 安全预算约束。</small></label><label>Temperature 覆盖<input type="number" min="0" max="2" step="0.01" value={draft.config.temperature??''} placeholder="留空按任务设置" onChange={event=>updateNumericOverride('temperature',event.target.value)}/><small>填写后覆盖该 Provider 的所有任务温度；留空时使用各任务默认值。</small></label><label>思考模式<select value={draft.config.thinking||'auto'} onChange={event=>mutate(current=>({...current,config:{...current.config,thinking:event.target.value as 'auto'|'disabled'|'enabled'}}))}><option value="auto">AUTO · 按服务默认</option><option value="disabled">DISABLED · 请求关闭思考</option><option value="enabled">ENABLED · 请求开启思考</option></select><small>仅对 OpenAI-compatible 服务发送 Zhipu 风格思考参数；服务拒绝时自动回退。GLM-5.x 默认开启思考，关闭后播客与学习内容生成更快更省。</small></label></div>
             <small className="token-limit-summary" role="status">{tokenLimitText(tokenLimits)}</small>
             <div className="provider-form-grid"><label>上下文窗口覆盖（tokens）<input type="number" min="1024" step="1" value={draft.config.context_window_tokens??''} placeholder="留空自动探测" onChange={event=>updateNumericOverride('context_window_tokens',event.target.value)}/><small>控制输入与输出总量；Ollama 不会自动强制使用理论最大值。</small></label><label>最大输出覆盖（tokens）<input type="number" min="128" step="1" value={draft.config.max_output_tokens??''} placeholder="留空自动推导" onChange={event=>updateNumericOverride('max_output_tokens',event.target.value)}/><small>未知时按运行窗口的 25% 推导，最多 4096。</small></label></div>
+            {draft.role==='main'?<ContextCapacity providerId={currentProvider?.id} model={draft.model} config={draft.config} limits={tokenLimits} notebookId={notebookId} sourceIds={sourceIds}/>:null}
             {draft.role==='vlm'?<small className="capability-note">视觉能力：{inspection?.status==='failed'?'验证失败':lastMode==='deep'&&inspection?.activation_eligible?'已深度验证':inspection?.catalog_supported?'清单未声明，建议深度验证':'未知'}</small>:null}
           </>}
         </div>

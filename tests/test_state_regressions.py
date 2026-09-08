@@ -292,3 +292,60 @@ async def test_missing_bound_audio_never_falls_back(database, monkeypatch):
     monkeypatch.setattr(jobs, "active_provider", lambda role: pytest.fail("must not resolve a different AUDIO"))
     with pytest.raises(RuntimeError, match="任务绑定的 AUDIO Provider 不存在"):
         await jobs._podcast("n", {"provider_ids": {"audio": "deleted"}}, "job_missing")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repair_passed', [True, False])
+async def test_measured_duration_recovery_preserves_original_on_failure(database, tmp_path, monkeypatch, repair_passed):
+    from sandevistan_read.context_budget import ContextUsage, TokenLimits, plan_context
+    from sandevistan_read.generation_context import CURRENT, GenerationContext
+    main = {'id': 'main', 'name': 'Main', 'kind': 'ollama', 'model': 'fixture', 'base_url': 'http://localhost',
+            'config': {'context_window_tokens': 30720, 'max_output_tokens': 4096}}
+    audio = {'id': 'audio', 'name': 'Audio', 'kind': 'sandevistan_audio', 'model': 'tts', 'base_url': 'http://audio.invalid',
+             'config': {}, 'capabilities': {}}
+    monkeypatch.setattr(jobs, 'active_provider', lambda role: audio if role == 'audio' else main)
+    monkeypatch.setattr(jobs, 'provider_by_id', lambda key: audio if key == 'audio' else main)
+    monkeypatch.setattr(jobs, 'audio_provider_readiness', lambda value: (True, 'ready'))
+    monkeypatch.setattr(jobs, 'PATHS', SimpleNamespace(root=tmp_path, job_work=tmp_path/'work', artifacts=tmp_path/'artifacts'))
+    monkeypatch.setattr(jobs, 'CONFIG', SimpleNamespace(tools=SimpleNamespace(ffmpeg_path=None), models=jobs.CONFIG.models))
+    monkeypatch.setattr(jobs, 'register_resource', lambda *args: None)
+    job = jobs.enqueue('podcast', 'n', {'minutes': 5})
+    payload = json_load(job['payload_json'], {})
+    rendered = []
+    async def script(*args, **kwargs):
+        return {'language': 'en', 'source_ids': ['s'], 'citations': [], 'quality': {}, 'duration': {'target_minutes': 5},
+                'turns': [{'speaker': speaker, 'text': 'short', 'citation_ids': []} for speaker in ('HOST_A', 'HOST_B')],
+                'chapters': [{'turn_start': 0, 'turn_end': 1}]}
+    async def synthesize(text, voice, output, **kwargs):
+        rendered.append(text)
+        with wave.open(str(output), 'wb') as wav:
+            wav.setparams((1, 2, 1000, 0, 'NONE', 'not compressed'))
+            wav.writeframes(b'\0' * (300000 if text == 'long' else 180000))
+        return output
+    async def repair(generated, seconds, trace):
+        trace.begin_request(estimated_tokens=500)
+        trace.record_failure()  # Retain the conservative charge in this fixture.
+        return [{**turn, 'text': 'long'} for turn in generated['turns']]
+    asr_calls = []
+    async def transcribe(*args, **kwargs):
+        asr_calls.append(1)
+        return {}
+    monkeypatch.setattr(jobs, 'build_podcast_script', script)
+    monkeypatch.setattr(jobs, 'repair_measured_duration', repair)
+    monkeypatch.setattr(jobs, 'synthesize', synthesize)
+    monkeypatch.setattr(jobs, 'transcribe_audio', transcribe)
+    monkeypatch.setattr(jobs, 'assess_transcription', lambda *args: {'passed': len(asr_calls) == 1 or repair_passed, 'segment_count': 0})
+    state = GenerationContext(main, plan_context(TokenLimits.from_provider(main), 'podcast'), [],
+        [{'id': 's', 'revision_id': 'r', 'filename': 'fixture'}], ContextUsage(total_token_limit=300000, request_limit=20))
+    token = CURRENT.set(state)
+    try:
+        result = await jobs._podcast('n', payload, job['id'])
+    finally:
+        CURRENT.reset(token)
+    saved = json_load(database.fetchone('SELECT payload_json FROM artifacts WHERE id=?', (result['id'],))['payload_json'], {})
+    assert saved['audio_quality']['passed']  # Failed new audio must not replace the accepted original.
+    assert saved['audio_quality']['duration']['passed'] == repair_passed
+    assert saved['turns'][0]['text'] == ('long' if repair_passed else 'short')
+    assert saved['duration']['actual_seconds'] == pytest.approx(300.44 if repair_passed else 180.44)
+    assert saved['context_usage']['accounted_total_tokens'] == 500
+    assert rendered == ['short', 'short', 'long', 'long']

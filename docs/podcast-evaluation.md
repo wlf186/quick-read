@@ -189,3 +189,32 @@ GPU 通过不代表 CPU 通过；revision 改变后，原条目不再授予该�
 `results.json` 的状态为 passed/degraded/failed：passed 表示自动流程与相应系统检查通过，degraded 表示返回部分或带警告内容，failed 表示任务或评测检查失败。正常结束时只要没有 failed 就返回退出码 0，**即使全部结果都是 degraded**；启动或输入错误也可能以异常退出。只有单独汇总工具才可能额外标记 recovered，不是此脚本的原生状态。
 
 输出文件留在本地 `runtime/evals/`，但执行过程中资料片段、脚本和音频会发送到指定 MAIN/AUDIO，不能将“隔离目录”理解成不联网。原始日志、数据库、样本及媒体不应提交到 Git 或附到公开 Release。公开结论应区分完成、降级和事实/音频质量，并注明固定模型、样本和覆盖范围。
+
+## 5. 上下文策略对照
+
+`scripts/evaluate_context_strategy.py` 将应用源码冻结到独立实例，复用同一份解析索引，对摘要、六轮问答、Quiz、Flashcard 和 Podcast 脚本进行真实 MAIN 调用，默认重复两次。没有 `--audio` 时 Podcast **只验证脚本**，不能将结果视为 TTS/ASR 或完整任务通过；添加该参数才调用真实 AUDIO。
+
+准备阶段不调用 MAIN/VLM，使用明确指定的 PDF/EPUB。以下三个名字是评测场景标识，可映射到自己的短文、长书和第三份资料。`multi` 同时勾选三份，不能作为五本真实书的验证证据。
+
+```bash
+.venv/bin/python scripts/evaluate_context_strategy.py --prepare --output runtime/evals/context-fixture --sample bitcoin=/path/to/short.pdf --sample geb=/path/to/long.pdf --sample strange-loop=/path/to/third.epub
+.venv/bin/python scripts/evaluate_context_strategy.py --output runtime/evals/context-new --fixture runtime/evals/context-fixture --provider-id <MAIN_PROVIDER_ID>
+.venv/bin/python scripts/evaluate_context_strategy.py --output runtime/evals/context-old --fixture runtime/evals/context-fixture --provider-id <MAIN_PROVIDER_ID> --source-root /path/to/frozen-baseline
+```
+
+`--provider-id` 从本机配置读取指定 MAIN 的模型、窗口、温度及凭据，不修改正式 Provider。凭据仅经子进程环境传递，并在隔离数据库中加密保存，不写入 manifest 或调用日志。省略该参数使用原实验的 Gemma 地址与 30720 上下文；公开复现应指定自己的 Provider。隔离子进程使用直连，不继承主进程的 HTTP 代理；在隔离配置中显式启用 `balanced`，生产默认仍为 `conservative`。旧源码不识别该策略字段时保持旧行为。
+
+`--corpus bitcoin geb multi`、`--kind summary chat quiz flashcard podcast` 可选择子集；`--language` 支持 zh-CN/en/auto。窗口和题卡参数的完整边界测试仍由原综合评测和离线测试覆盖，本工具不能替代全部参数矩阵。`--audio --kind podcast --corpus bitcoin --language zh-CN` 测试 5 分钟音频，选择 `geb` 测试 30 分钟；需要提供 `--audio-url` 或使用默认本机 AUDIO。
+
+输出目录保存源码哈希、输入清单、逐次 MAIN 用量与响应、逐场景结果。`--resume` 复用已有实例，要求相同场景、Provider ID、模型配置及能力指纹、输入清单、AUDIO 地址、语言和重复次数，跳过已经记录的结果（包括失败）。修复代码后重新验收必须使用新目录；不要覆盖正在运行的源码快照。相同服务和模型的 MAIN 调用通过跨进程锁串行化，完整音频任务另有串行锁。因此场景耗时包含排队，不用于独立延迟比较。AUDIO 在隔离库中固定为 Qwen3 TTS/ASR 0.6B，并保存探测能力后执行，实际验收读取持久化音频产物。
+
+新旧版本必须使用同一份索引和模型配置。运行前冻结关键要点与原文定位，对输出做匿名事实和覆盖核验，不能用关键词命中、选材量增加或文件可播放代替质量判断。分别报告执行失败、降级、事实正确性、实际覆盖、时长和资源用量。当前均衡策略的 300000 tokens 是整任务预算，包含重试；严格脚本与 TTS 资格评测继续使用原资格条件。超过真实验证窗口的配置仅能报告预算模拟结果。
+
+
+### 实际音频时长恢复与摘要核验
+
+均衡策略的完整 Podcast 任务共享同一 MAIN 与资料快照，脚本、事实复核及实际音频时长修复共用累计预算。成品时长超出目标的 0.85–1.2 时，可按实测语速进行最多一轮受原文约束的修改，只重合成变化轮次，再执行 ASR 验收；修复失败保留原音频及警告，不改变音频质量门槛。严格脚本资格工具维持原有行为。
+
+摘要预读按输出容量限制笔记数量，随后使用所选片段的完整原文综合，并独立核验每点的陈述者、示例性质及限定。引用编号和连续摘录检查不能替代对照审阅，程序返回 passed 不等同于人工事实质量资格。评测记录分别列出 MAIN 排队和推理耗时；不同源码快照的 pilot 不合并为最终资格样本。
+
+上下文对照工具支持 `--count`、`--difficulty easy|medium|hard|mixed` 和 `--minutes 5|10|20|30`，用于数量、难度和时长边界；这些参数进入续跑身份检查。`--reference` 固定评审参考，`--script-file` 可在 `--audio --kind podcast` 下重放同一脚本，但原脚本的质量警告仍须保留并区分。任务退出后清理隔离数据库中的 MAIN 凭据副本；被外部强制终止的旧实例仍需单独检查。新增降级、事实错误或未完成的音频验收都不能计作资格通过；修复后必须重新冻结源码，不能合并不同修订的结果。

@@ -40,6 +40,13 @@ def public_artifact(item: dict[str, Any]) -> dict[str, Any]:
             question.pop(field, None)
         public_items.append(question)
     payload["items"] = public_items
+    usage = dict(payload.get("context_usage") or {})
+    coverage = dict(usage.get("coverage") or {})
+    if coverage:
+        coverage.pop("sources", None)
+        coverage.pop("cited_segments", None)
+        usage["coverage"] = coverage
+        payload["context_usage"] = usage
     return {**item, "payload": payload, "citations": []}
 
 

@@ -14,6 +14,7 @@ from .observability import Reporter
 from .providers import PromptBuild, active_provider, budgeted_chat, study_generation_profile
 from .retrieval import EMBEDDINGS, select_quality_evidence, tokenize
 from .languages import resolve_output_language, text_matches_language
+from .generation_context import adaptive_generation, current, generation_trace, prepare_evidence, report as coverage_report
 
 
 BANNED_QUIZ_STEMS = ("直接出现在", "资料位置", "引用位置", "第几页", "哪一页")
@@ -23,6 +24,9 @@ CARD_TYPES = {"fact", "concept", "relationship", "comparison", "application"}
 
 
 def _source_scope(notebook_id: str, requested: list[str] | None) -> list[str]:
+    if current():
+        ids = [source["id"] for source in current().sources]
+        return ids if requested is None else [identifier for identifier in ids if identifier in requested]
     if requested is None:
         rows = DB.fetchall("SELECT id FROM sources WHERE notebook_id=? AND selected=1 AND state='ready' ORDER BY created_at", (notebook_id,))
     elif requested:
@@ -412,6 +416,7 @@ def _balance_answer(item: dict[str, Any], target: int) -> dict[str, Any]:
     return {**item, "options": options, "answer_index": target}
 
 
+@adaptive_generation("study")
 async def generate_study_artifact(
     notebook_id: str,
     kind: str,
@@ -439,7 +444,12 @@ async def generate_study_artifact(
     labels = [f"S{index}" for index in range(1, len(chunks) + 1)]
     evidence_by_label = dict(zip(labels, chunks))
     all_citations = {_citation(chunk, label)["id"]: _citation(chunk, label) for label, chunk in zip(labels, chunks)}
-    trace, reporter = ContextUsage(), Reporter(job_id) if job_id else None
+    trace, reporter = generation_trace(), Reporter(job_id) if job_id else None
+    if current() and current().plan.preparation_batches:
+        await prepare_evidence(chunks, language)
+        priorities = {note["chunk_id"]: index for index, note in enumerate(current().notes)}
+        chunks.sort(key=lambda row: priorities.get(row["id"], len(priorities)))
+        labels = [next(label for label, evidence in evidence_by_label.items() if evidence["id"] == row["id"]) for row in chunks]
     if reporter:
         reporter.update("plan", "构建知识蓝图", 0.08, current=0, total=count, unit="项")
     if kind == "flashcard":
@@ -455,6 +465,8 @@ async def generate_study_artifact(
     batch_size = 1 if tier == "lite" else math.ceil(provisional_target / 2) if kind == "flashcard" else 3
     output_limit = TokenLimits.from_provider(provider).max_output_tokens
     batch_size = min(batch_size, max(1, (output_limit - 512) // (900 if kind == "quiz" else 500)))
+    if current() and tier == "full":
+        batch_size = min(6 if kind == "quiz" else 10, current().plan.output_items)
     # lite 闪卡每轮只产 1 张，小资料中后期概念重叠产生合理重复，需要更多轮次预算
     max_candidate_rounds = (
         math.ceil(provisional_target / batch_size) + 2 if kind == "flashcard" and tier == "full"
@@ -462,8 +474,9 @@ async def generate_study_artifact(
     )
     if kind == "flashcard":
         # 限额需覆盖全部候选轮 + 审校/补漏，并吸收推理模型触发的输出预算扩容重试
-        trace.request_limit = max_candidate_rounds * 2 + 6
-        trace.total_token_limit = min(60_000, 24_000 + count * 3_600)
+        trace.request_limit = max_candidate_rounds * 2 + 10
+        if not current():
+            trace.total_token_limit = min(60_000, 24_000 + count * 3_600)
     cursor = 0
     candidate_rounds = 0
     audit_rounds = 0
@@ -640,6 +653,10 @@ async def generate_study_artifact(
         "stop_reason": stop_reason,
     }
     payload = {"version": 2, "items": accepted, "quality_report": quality_report, "degraded": partial or blueprint_fallback, "warnings": warnings, "context_usage": trace.as_dict(), "language_selection": language_selection}
+    if current():
+        payload["context_usage"]["coverage"] = coverage_report(citations)
+        if current().cancel_check and current().cancel_check():
+            raise RuntimeError("任务已取消")
     artifact_id = f"artifact_{job_id.removeprefix('job_')}" if job_id else new_id("artifact")
     now = utc_now()
     status = "partial" if partial else "ready"

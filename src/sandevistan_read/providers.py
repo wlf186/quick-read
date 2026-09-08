@@ -999,6 +999,10 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
 
 
 def active_provider(role: str) -> dict[str, Any] | None:
+    from .generation_context import current
+    state = current()
+    if state and role == "main":
+        return state.provider
     setting = DB.fetchone("SELECT enabled FROM provider_role_settings WHERE role=?", (role,))
     if setting and not setting["enabled"]:
         return None
@@ -1217,7 +1221,11 @@ async def budgeted_chat(
     stage: str = "generation",
     provider_override: dict[str, Any] | None = None,
 ) -> BudgetedCompletion:
-    provider = provider_override or _chat_provider(role)
+    from .generation_context import current, mark_sent
+    state = current() if role == "main" else None
+    if state:
+        trace = state.trace
+    provider = state.provider if state else provider_override or _chat_provider(role)
     limits = TokenLimits.from_provider(provider)
     last_error: ContextOverflowError | None = None
     escalated = False
@@ -1230,17 +1238,35 @@ async def budgeted_chat(
                 f"提示构建结果 {estimated} tokens 超过安全预算 {budget.input_tokens}", code="local_context_budget", status=422
             )
         try:
-            if trace:
-                trace.begin_request(estimated_tokens=estimated + budget.output_tokens)
+            async def invoke(output_tokens: int) -> ChatCompletion:
+                if state and state.cancel_check and state.cancel_check():
+                    raise RuntimeError("任务已取消")
+                if trace:
+                    if state and stage == "context_prepare" and trace.accounted_tokens + estimated + output_tokens > state.plan.total_token_limit - state.plan.final_reserve_tokens:
+                        raise RuntimeError("已为最终综合与审校保留预算")
+                    trace.begin_request(estimated_tokens=estimated + output_tokens)
+                try:
+                    result = await _chat_once(provider, build.messages, json_mode=json_mode,
+                                             timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state else timeout,
+                                             max_tokens=output_tokens, temperature=temperature)
+                except Exception:
+                    if trace:
+                        trace.record_failure()
+                    raise
+                if trace:
+                    trace.record(limits=limits, requested_output=max_tokens, output_tokens=output_tokens,
+                                 estimated_prompt=estimated, actual_prompt=result.prompt_tokens,
+                                 actual_completion=result.completion_tokens, reasoning_tokens=result.reasoning_tokens,
+                                 cached_tokens=result.cached_tokens, temperature=result.temperature,
+                                 temperature_source=result.temperature_source, stage=stage,
+                                 total_segments=build.total_segments, included_segments=build.included_segments,
+                                 truncated_segments=build.truncated_segments)
+                    if result.finish_reason in {"length", "max_tokens"}:
+                        trace.output_limited_calls += 1
+                mark_sent(build)
+                return result
             try:
-                completion = await _chat_once(
-                    provider,
-                    build.messages,
-                    json_mode=json_mode,
-                    timeout=timeout,
-                    max_tokens=budget.output_tokens,
-                    temperature=temperature,
-                )
+                completion = await invoke(budget.output_tokens)
             except (httpx.ConnectError, httpx.TimeoutException, ProviderError) as exc:
                 if isinstance(exc, ProviderError) and not (
                     not isinstance(exc, ContextOverflowError)
@@ -1249,62 +1275,32 @@ async def budgeted_chat(
                 ):
                     raise
                 # Retry transient failures once on the same provider and budget.
-                if trace:
-                    trace.record_failure()
-                    trace.begin_request(estimated_tokens=estimated + budget.output_tokens)
-                completion = await _chat_once(
-                    provider,
-                    build.messages,
-                    json_mode=json_mode,
-                    timeout=timeout,
-                    max_tokens=budget.output_tokens,
-                    temperature=temperature,
-                )
+                completion = await invoke(budget.output_tokens)
             if not escalated and _needs_output_escalation(completion):
                 # 推理模型把预算烧在隐藏思考上：同一 scale 下翻倍输出预算重试一次，不消耗溢出降档
                 escalated = True
                 escalated_output = _escalated_output(limits, budget, estimated, scale)
                 if escalated_output > budget.output_tokens:
-                    if trace:
-                        trace.begin_request(estimated_tokens=estimated + escalated_output)
-                    completion = await _chat_once(
-                        provider,
-                        build.messages,
-                        json_mode=json_mode,
-                        timeout=timeout,
-                        max_tokens=escalated_output,
-                        temperature=temperature,
-                    )
-                    budget = replace(budget, output_tokens=escalated_output)
+                    if not trace or trace.total_token_limit is None or trace.accounted_tokens + estimated + escalated_output <= trace.total_token_limit:
+                        try:
+                            replacement = await invoke(escalated_output)
+                        except (ProviderError, httpx.RequestError, RuntimeError) as exc:
+                            if (not completion.content.strip() or getattr(exc, "code", None) == "cancelled"
+                                    or state and state.cancel_check and state.cancel_check()):
+                                raise
+                            if trace:
+                                trace.mark_fallback()
+                        else:
+                            if replacement.content.strip() or not completion.content.strip():
+                                completion = replacement
+                                budget = replace(budget, output_tokens=escalated_output)
+                            elif trace:
+                                trace.mark_fallback()
         except ContextOverflowError as exc:
             if trace:
-                trace.record_failure()
                 trace.overflow_retries += 1
             last_error = exc
             continue
-        except Exception:
-            if trace:
-                trace.record_failure()
-            raise
-        if trace:
-            trace.record(
-                limits=limits,
-                requested_output=max_tokens,
-                output_tokens=budget.output_tokens,
-                estimated_prompt=estimated,
-                actual_prompt=completion.prompt_tokens,
-                actual_completion=completion.completion_tokens,
-                reasoning_tokens=completion.reasoning_tokens,
-                cached_tokens=completion.cached_tokens,
-                temperature=completion.temperature,
-                temperature_source=completion.temperature_source,
-                stage=stage,
-                total_segments=build.total_segments,
-                included_segments=build.included_segments,
-                truncated_segments=build.truncated_segments,
-            )
-            if completion.finish_reason in {"length", "max_tokens"}:
-                trace.output_limited_calls += 1
         return BudgetedCompletion(completion.content, build, budget, completion.finish_reason)
     raise last_error or ContextOverflowError("Provider 上下文窗口不足", code="context_window_exceeded", status=422)
 

@@ -22,6 +22,10 @@ ffmpeg = ""
 libreoffice = ""
 
 [development]
+# MAIN window/output overrides are stored in Provider settings, not this TOML.
+# Provider config.context_strategy="balanced" opts into experimental adaptive selection.
+# Unset currently defaults to "conservative"; automatic balanced selection
+# requires per-feature quality qualification.
 ollama_url = "http://127.0.0.1:11434"
 ollama_model = "qwen3.5:2b"
 audio_url = "http://127.0.0.1:20810"

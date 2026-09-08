@@ -954,7 +954,7 @@ async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, mo
     monkeypatch.setattr(jobs, "active_provider", lambda role: {"name": "TTS", "model": "tts", "config": {}, "capabilities": {}})
     monkeypatch.setattr(jobs, "audio_provider_readiness", lambda provider: (True, "ready"))
     monkeypatch.setattr(jobs, "register_resource", lambda *args: None)
-    monkeypatch.setattr(jobs, "DB", SimpleNamespace(fetchone=lambda *args: {"cancel_requested": 0}, execute=lambda *args: None))
+    monkeypatch.setattr(jobs, "DB", SimpleNamespace(fetchone=lambda *args: {"cancel_requested": 0}, fetchall=lambda *args: [], execute=lambda *args: None))
 
     async def fail_script(*args, **kwargs):
         raise podcast.PodcastQualityError("跨章不连贯", {"passed": False, "stage": "episode"})

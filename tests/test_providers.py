@@ -1069,3 +1069,24 @@ async def test_budgeted_chat_escalation_ceiling_for_derived_limits(monkeypatch: 
     result = await providers.budgeted_chat(lambda budget: build)
     assert result.content == "OK"
     assert calls == [10_000, 16_384]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('empty_retry', [True, False])
+async def test_output_escalation_preserves_first_partial_on_empty_or_failed_retry(monkeypatch, empty_retry):
+    limits = SimpleNamespace(effective_context_tokens=128000, max_output_tokens=4096, output_source='derived')
+    _stub_escalation_env(monkeypatch, 1000, limits)
+    calls = []
+    partial = '{"items":[{"value":"complete first item"},'
+    async def complete(provider, messages, **kwargs):
+        calls.append(kwargs['max_tokens'])
+        if len(calls) == 1:
+            return SimpleNamespace(content=partial, finish_reason='length', reasoning_tokens=900, completion_tokens=1000)
+        if empty_retry:
+            return SimpleNamespace(content='', finish_reason='length', reasoning_tokens=2000, completion_tokens=2000)
+        raise providers.ProviderError('Retry unavailable', status=503)
+    monkeypatch.setattr(providers, '_chat_once', complete)
+    build = SimpleNamespace(messages=[{'role':'user','content':'source'}], total_segments=1, included_segments=1, truncated_segments=0)
+    result = await providers.budgeted_chat(lambda budget: build)
+    assert result.content == partial and result.finish_reason == 'length'
+    assert calls == [1000, 2000]

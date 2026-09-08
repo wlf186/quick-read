@@ -16,6 +16,7 @@ from .providers import PromptBuild, ProviderError, active_provider, budgeted_cha
 from .retrieval import select_quality_evidence, tokenize
 from .services import _evenly_spaced, scope_hash, source_scope
 from .languages import resolve_output_language, text_matches_language
+from .generation_context import adaptive_generation, current, generation_trace, mark_selected, prepare_evidence
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
@@ -138,7 +139,7 @@ def _coerce_scene_draft(value: Any) -> SceneDraftResult:
 
 def _reserve_episode_audit_after_recovery(trace: ContextUsage) -> None:
     """Keep the mandatory final audit reachable after one bounded recovery call."""
-    if trace.total_token_limit is not None:
+    if trace.total_token_limit is not None and not current():
         trace.total_token_limit = min(45_000, trace.total_token_limit + EPISODE_AUDIT_RECOVERY_RESERVE_TOKENS)
 
 
@@ -643,7 +644,7 @@ async def _critic_invalid_indexes(turns: list[dict[str, Any]], cards: list[dict[
         return set()
 
 
-async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str, trace: ContextUsage | None = None) -> set[int]:
+async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str, trace: ContextUsage | None = None, *, strict: bool = False) -> set[int]:
     answers = "\n".join(f"{index}: {pair['answer']}" for index, pair in enumerate(pairs))
     prompt_prefix = f"""你是严格的翻译忠实度审校器。逐项比较原文摘录与回答。回答必须只是摘录的忠实翻译或压缩改述；若新增因果、绝对化结论、实体、数字或摘录没有的判断，就判为不支持。
 只输出 JSON：{{"invalid_indexes":[0]}}。语言={language}。
@@ -653,7 +654,7 @@ async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str, tra
 """
     indexed_pairs = [{**pair, "index": index} for index, pair in enumerate(pairs)]
     try:
-        raw = (await budgeted_chat(
+        result = await budgeted_chat(
             lambda budget: _segment_prompt_build(
                 budget,
                 prefix=prompt_prefix,
@@ -665,11 +666,17 @@ async def _critic_grounded_pairs(pairs: list[dict[str, Any]], language: str, tra
             minimum_output_tokens=128,
             temperature=0.0,
             trace=trace,
-        )).content
-        values = _extract_json(raw).get("invalid_indexes") or []
+        )
+        parsed = _extract_json(result.content)
+        if strict and (result.build.truncated_segments or result.build.included_segments != len(pairs)
+                       or not isinstance(parsed.get("invalid_indexes"), list)):
+            return set(range(len(pairs)))
+        values = parsed.get("invalid_indexes") or []
+        if strict and any(type(value) is not int or not 0 <= value < len(pairs) for value in values):
+            return set(range(len(pairs)))
         return {int(value) for value in values if isinstance(value, int) or str(value).isdigit()}
     except Exception:
-        return set()
+        return set(range(len(pairs))) if strict else set()
 
 
 async def create_chapter_turns(
@@ -848,7 +855,7 @@ def build_claim_ledger(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "locator": card.get("locator") or {},
                 }
             )
-            if len(claims) >= 64:
+            if not current() and len(claims) >= 64:
                 return claims
     return claims
 
@@ -2317,7 +2324,8 @@ def _deterministic_failure_reasons(report: dict[str, Any]) -> list[str]:
 async def _audit_grounded_subset(turns: list[dict[str, Any]], cards_by_id: dict[str, dict[str, Any]], trace: ContextUsage) -> dict[str, Any]:
     """One focused evidence review when an episode score identifies no bad turns."""
     trace.request_limit = max(trace.request_limit or 0, trace.requests + 1)
-    trace.total_token_limit = min(45_000, (trace.total_token_limit or 0) + 4000)
+    if not current():
+        trace.total_token_limit = min(45_000, (trace.total_token_limit or 0) + 4000)
     remaining = trace.total_token_limit - trace.accounted_tokens
     if remaining < 800:
         return {"accepted_indexes": [], "issues": ["逐轮事实复核预算不足"]}
@@ -2344,6 +2352,96 @@ async def _audit_grounded_subset(turns: list[dict[str, Any]], cards_by_id: dict[
         return {"accepted_indexes": [], "issues": [str(exc)]}
 
 
+async def repair_measured_duration(
+    generated: dict[str, Any], actual_seconds: float, trace: ContextUsage,
+) -> list[dict[str, Any]]:
+    """One evidence-bound edit using measured speech rate; preserve turn identities."""
+    state = current()
+    if not state or actual_seconds <= 0:
+        raise ValueError("实际时长恢复缺少固定资料快照")
+    turns = generated["turns"]
+    language = generated["language"]
+    target_seconds = float(generated["duration"]["target_minutes"]) * 60
+    units = sum(_spoken_unit_count(turn["text"], language) for turn in turns)
+    change = round(units * abs(target_seconds / actual_seconds - 1))
+    planner = _duration_expansion_plan if actual_seconds < target_seconds else _duration_compression_plan
+    # Partial scripts can label a factual answer "intro" or a question "frame".
+    # Plan by actual question form and attached evidence, not those style labels.
+    planning_turns = [{**turn, "dialogue_act": "question" if _is_question_turn(turn) else "explain"}
+                      for turn in turns]
+    plan = planner(planning_turns, generated["chapters"], change, language)
+    if not plan:
+        raise ValueError("实际时长偏差超过本轮可安全调整的范围")
+    rows = {row["id"]: row for row in state.rows}
+    citations = {citation["id"]: citation for citation in generated["citations"]}
+    items = []
+    for item in plan:
+        turn = turns[item["index"]]
+        evidence_rows = [rows[citations[label]["chunk_id"]] for label in turn.get("citation_ids", [])
+                         if label in citations and citations[label]["chunk_id"] in rows]
+        evidence = [row["content"] for row in evidence_rows]
+        if not evidence:
+            raise ValueError("待调整口播缺少原文证据")
+        mark_selected(evidence_rows)
+        items.append({**item, "text": turn["text"], "evidence": evidence})
+    prefix = (
+        ("依据所附原文扩写每段口播，解释原文已有的机制、前提或含义，不要仅替换同义词。" if actual_seconds < target_seconds
+         else "依据所附原文压缩每段口播，删去重复修饰和绕行表达。")
+        + "保留前提、限定、否定、陈述者及结论方向。"
+        "不增加外部事实、数字、类比、重复总结或问句。每项长度在 minimum_units 与 maximum_units 之间，"
+        + ("单位为英文单词。" if language == "en" else "单位为中文等价字符。")
+        + '只输出 JSON {"replacements":[[0,"修改后的完整口播"]]}，返回每项原 index。\n'
+    )
+    result = await budgeted_chat(
+        lambda budget: _segment_prompt_build(budget, language=language, prefix=prefix, items=items,
+            renderer=lambda item: json.dumps(item, ensure_ascii=False)),
+        json_mode=True, max_tokens=structured_output_tokens(sum(item["maximum_units"] for item in items) * 2),
+        minimum_output_tokens=512, trace=trace, stage="measured_duration_repair",
+    )
+    if result.build.truncated_segments or result.build.included_segments != len(items):
+        raise ValueError("本轮预算无法容纳完整时长修复证据")
+    raw = _extract_array(result.content, "replacements") or []
+    replacements: dict[int, str] = {}
+    for value in raw:
+        index, text = (value if isinstance(value, list) and len(value) == 2 else
+                       (value.get("index"), value.get("text")) if isinstance(value, dict) else (None, None))
+        if (type(index) is int or isinstance(index, str) and index.isdigit()) and isinstance(text, str):
+            replacements[int(index)] = _normalize_text(text)
+    if not replacements or not set(replacements) <= {item["index"] for item in items}:
+        raise ValueError("时长修复没有返回可用的计划轮次")
+    revised = [dict(turn) for turn in turns]
+    pairs = []
+    pair_indexes = []
+    for item in items:
+        if item["index"] not in replacements:
+            continue
+        text = replacements[item["index"]]
+        length = _spoken_unit_count(text, language)
+        length_ok = (item["current_units"] < length <= item["maximum_units"] * 1.3 if actual_seconds < target_seconds
+                     else item["safe_minimum_units"] <= length < item["current_units"])
+        if (not text_matches_language(text, language)
+                or not length_ok
+                or not _numbers_supported(text, "\n".join(item["evidence"]))
+                or _is_duplicate(text, [turn for index, turn in enumerate(revised) if index != item["index"]])):
+            continue
+        revised[item["index"]]["text"] = text
+        pairs.append({"answer": text, "support_quote": "\n".join(item["evidence"])})
+        pair_indexes.append(item["index"])
+    predicted_seconds = actual_seconds * sum(_spoken_unit_count(turn["text"], language) for turn in revised) / max(units, 1)
+    if not target_seconds * 0.85 <= predicted_seconds <= target_seconds * 1.2:
+        raise ValueError("本轮修改按实测语速仍无法达到整集时长范围")
+    invalid = await _critic_grounded_pairs(pairs, language, trace, strict=True)
+    for index in invalid:
+        if 0 <= index < len(pair_indexes):
+            original_index = pair_indexes[index]
+            revised[original_index] = dict(turns[original_index])
+    predicted_seconds = actual_seconds * sum(_spoken_unit_count(turn["text"], language) for turn in revised) / max(units, 1)
+    if not target_seconds * 0.85 <= predicted_seconds <= target_seconds * 1.2:
+        raise ValueError("事实核验后可用的修改不足以达到整集时长范围")
+    return revised
+
+
+@adaptive_generation("podcast")
 async def build_podcast_script(
     notebook_id: str,
     payload: dict[str, Any],
@@ -2373,8 +2471,19 @@ async def build_podcast_script(
         raise ValueError("资料内容不足，无法生成深度播客")
     if progress:
         progress("提取可引用主张", 0.12)
-    context_usage = ContextUsage()
+    context_usage = generation_trace()
+    if current() and current().plan.preparation_batches:
+        await prepare_evidence(rows, language)
+        check_cancelled()
     claims = build_claim_ledger(cards)
+    if current() and current().notes:
+        card_by_chunk = {card["chunk_id"]: card for card in cards}
+        claims = [{"id": f"C{index + 1}", "text": note["claim"] + " " + note["qualification"],
+                   "evidence_ids": [card_by_chunk[note["chunk_id"]]["id"]],
+                   "source_id": card_by_chunk[note["chunk_id"]]["source_id"],
+                   "filename": card_by_chunk[note["chunk_id"]]["filename"],
+                   "locator": card_by_chunk[note["chunk_id"]]["locator"]}
+                  for index, note in enumerate(current().notes)]
     if len(claims) < 2:
         raise ValueError("资料中缺少足够的可验证主张")
     duration_mode = payload.get("duration_mode") or ("fixed" if payload.get("minutes") else "auto")
@@ -2388,7 +2497,8 @@ async def build_podcast_script(
         profile = {**profile, "scene_turns": min(profile["scene_turns"], max(2, (int(profile.get("max_output_tokens") or 4096) - 512) // 400))}
     act_count = max(2, math.ceil(total_target / profile["scene_turns"]))
     context_usage.request_limit = act_count + 4
-    context_usage.total_token_limit = min(45_000, 14_000 + 750 * total_target)
+    if not current():
+        context_usage.total_token_limit = min(45_000, 14_000 + 750 * total_target)
     if progress:
         progress("规划递进式剧集结构", 0.16)
     episode_plan, outline_degraded = await create_episode_plan(claims, language, focus, context_usage, act_count)
@@ -2406,7 +2516,7 @@ async def build_podcast_script(
     warnings: list[dict[str, str]] = []
     if allow_partial:
         profile = {**profile, "allow_partial": True}
-        context_usage.request_limit = act_count * 2 + 6
+        context_usage.request_limit = act_count * 2 + 10
     duration_goal = target_minutes * GENERATION_DURATION_TARGET_RATIO
     duration_calibration: dict[str, Any] = {
         "strategy": "slot_budget_with_single_expansion_v3",

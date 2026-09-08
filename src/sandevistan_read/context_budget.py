@@ -8,6 +8,20 @@ from typing import Any, Callable, Iterable, TypeVar
 
 DEFAULT_CONTEXT_WINDOW_TOKENS = 4096
 DEFAULT_IMAGE_TOKENS = 2048
+# Enable broad preparation only after paired quality qualification. Explicit
+# balanced configuration remains available for isolated evaluation and opt-in.
+DEFAULT_CONTEXT_STRATEGY = "conservative"
+QUALIFIED_BALANCED_TASKS: frozenset[str] = frozenset()
+
+
+def context_strategy(provider: dict[str, Any], kind: str) -> str:
+    """Explicit opt-in wins; default enablement requires per-feature evidence."""
+    configured = (provider.get("config") or {}).get("context_strategy")
+    if isinstance(configured, str) and configured in {"balanced", "conservative"}:
+        return configured
+    return "balanced" if kind in QUALIFIED_BALANCED_TASKS else DEFAULT_CONTEXT_STRATEGY
+
+
 MAX_CONTEXT_WINDOW_TOKENS = 4_194_304
 MIN_CONTEXT_WINDOW_TOKENS = 1024
 MIN_OUTPUT_WINDOW_TOKENS = 128
@@ -37,6 +51,8 @@ def positive_int(value: Any) -> int | None:
 
 
 def validate_token_overrides(config: dict[str, Any]) -> None:
+    if "context_strategy" in config and config["context_strategy"] not in ("balanced", "conservative"):
+        raise ValueError("上下文策略必须是 balanced 或 conservative")
     context_value = config.get("context_window_tokens")
     output_value = config.get("max_output_tokens")
     if context_value is not None:
@@ -173,6 +189,73 @@ def prompt_budget(limits: TokenLimits, requested_output: int, minimum_output: in
     return PromptBudget(limits.effective_context_tokens, input_tokens, output, limits.image_tokens_per_image, scale)
 
 
+CONTEXT_STRATEGY_VERSION = "balanced_v3"
+TASK_TOKEN_CEILING = 300_000
+
+
+@dataclass(frozen=True)
+class ContextPlan:
+    version: str
+    kind: str
+    context_tokens: int
+    output_tokens: int
+    evidence_tokens: int
+    batch_evidence_tokens: int
+    estimated_segments: int
+    preparation_batches: int
+    total_token_limit: int
+    final_reserve_tokens: int
+    output_items: int
+    limiting_factor: str
+
+    def as_dict(self) -> dict[str, Any]:
+        from dataclasses import asdict
+        return asdict(self)
+
+
+def plan_context(
+    limits: TokenLimits, kind: str, *, material_tokens: int | None = None,
+    segment_tokens: int = 1000, count: int = 10, minutes: int = 20,
+) -> ContextPlan:
+    """Plan bounded work from capacity and actual demand, never from a model name."""
+    kind = {"flashcards": "flashcard", "podcasts": "podcast"}.get(kind, kind)
+    if kind not in {"chat", "summary", "quiz", "flashcard", "podcast"}:
+        raise ValueError("Unknown generation kind")
+    requested = {"chat": 3600, "summary": 8192, "quiz": 8192,
+                 "flashcard": 8192, "podcast": 16_384}[kind]
+    budget = prompt_budget(limits, requested, 128, 1.0)
+    # Reserve instructions, history, source labels and intermediate reasoning.
+    batch = max(0, min(64_000, budget.input_tokens - 2048))
+    per_item = {"chat": 450, "summary": 500, "quiz": 900, "flashcard": 500, "podcast": 500}[kind]
+    output_items = max(1, min(18 if kind == "podcast" else 12, (budget.output_tokens - 512) // per_item))
+    base = {"chat": 24_000, "summary": 24_000, "quiz": 36_000,
+            "flashcard": 60_000, "podcast": min(45_000, 14_000 + 2100 * minutes)}[kind]
+    # Small documents stay single-pass. Extra preparation is only useful for
+    # broad synthesis; questions retain query-focused retrieval instead.
+    demand = material_tokens if material_tokens is not None else batch * (4 if kind != "chat" else 1)
+    preparation = min(4, math.ceil(demand / max(1, batch))) if demand > batch and kind != "chat" else 0
+    evidence = min(demand, batch * max(1, preparation), 120_000 if kind != "chat" else 32_000)
+    work = (minutes * 4200 if kind == "podcast" else count * 1400 if kind in {"quiz", "flashcard"} else 12_000)
+    total = min(TASK_TOKEN_CEILING, max(base, math.ceil((evidence * 2 + work) / 0.75)))
+    reserve = math.ceil(total * 0.25)
+    # Requested duration/count can exceed the bounded task budget. Keep room
+    # for evidence instead of allowing an aspirational output cost to erase it.
+    work = min(work, (total - reserve) // 2)
+    evidence = min(evidence, max(0, (total - reserve - work) // 2))
+    preparation = min(4, math.ceil(evidence / max(1, batch))) if preparation else 0
+    if material_tokens is not None and evidence >= material_tokens:
+        reason = "资料已可容纳"
+    elif total == TASK_TOKEN_CEILING or evidence == 120_000:
+        reason = "均衡任务总预算"
+    elif batch == 64_000 or (kind == "chat" and evidence == 32_000):
+        reason = "单阶段均衡预算"
+    else:
+        reason = "有效上下文与输出预算"
+    return ContextPlan(CONTEXT_STRATEGY_VERSION, kind, limits.effective_context_tokens,
+                       budget.output_tokens, evidence, batch, evidence // max(1, segment_tokens),
+                       preparation, total, reserve, output_items, reason)
+
+
 T = TypeVar("T")
 
 
@@ -245,6 +328,7 @@ class ContextUsage:
     visible_completion_tokens: int = 0
     cached_tokens: int = 0
     accounted_tokens: int = 0
+    reserved_tokens: int = 0
     temperature_sources: dict[str, int] | None = None
     effective_temperatures: dict[str, int] | None = None
     request_limit: int | None = None
@@ -268,9 +352,13 @@ class ContextUsage:
             self.stop_reason = "token_limit"
             raise RuntimeError(f"MAIN token 达到任务上限（{self.total_token_limit}）")
         self.requests += 1
+        self.reserved_tokens = max(0, estimated_tokens)
+        self.accounted_tokens += self.reserved_tokens
 
     def record_failure(self) -> None:
         self.failed_requests += 1
+        # No reliable usage on a failed request: retain its conservative charge.
+        self.reserved_tokens = 0
 
     def record(
         self,
@@ -303,6 +391,8 @@ class ContextUsage:
         self.reasoning_tokens += reasoning_tokens or 0
         self.visible_completion_tokens += max(0, (actual_completion or 0) - (reasoning_tokens or 0))
         self.cached_tokens += cached_tokens or 0
+        self.accounted_tokens -= self.reserved_tokens
+        self.reserved_tokens = 0
         self.accounted_tokens += (actual_prompt if actual_prompt is not None else estimated_prompt)
         self.accounted_tokens += (actual_completion if actual_completion is not None else output_tokens)
         stage_usage = self.by_stage.setdefault(

@@ -27,6 +27,10 @@ from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSe
 from .security import VAULT
 from .services import grounded_generate, source_scope
 from .study_sessions import answer_quiz, create_session, flashcards_csv, get_session, public_artifact, review_flashcard, suspend_flashcard
+from .schemas import ContextPreviewRequest
+from .context_budget import TokenLimits, estimate_text_tokens, plan_context
+from .retrieval import is_quality_chunk
+from .api_docs import CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
 
 
 @asynccontextmanager
@@ -183,14 +187,15 @@ def retry_notebook_cleanup(notebook_id: str):
     return {"accepted": True, "operation_id": operation_id}
 
 
-@api.get("/notebooks/{notebook_id}")
+@api.get("/notebooks/{notebook_id}", responses=NOTEBOOK_RESPONSES)
 def notebook(notebook_id: str):
     row = DB.fetchone("SELECT * FROM notebooks WHERE id=?", (notebook_id,));
     if not row: raise HTTPException(404, "笔记本不存在")
     result = normalize(row); result["sources"] = [normalize(item) for item in DB.fetchall("SELECT * FROM sources WHERE notebook_id=? ORDER BY created_at DESC", (notebook_id,))]; return result
 
 
-@api.post("/notebooks/{notebook_id}/sources")
+@api.post("/notebooks/{notebook_id}/sources", responses=SOURCE_UPLOAD_RESPONSES,
+          description="支持 PDF、DOCX、PPTX、XLSX、EPUB、文本与图片。批量请求在保存前统一校验格式；不支持的文件会使整批返回 415。")
 async def upload_sources(notebook_id: str, files: list[UploadFile] = File(...), image_policy: str | None = Form(default=None)):
     _require_notebook(notebook_id)
     stored_policy = DB.fetchone("SELECT value_json FROM app_settings WHERE key='image_processing'")
@@ -665,6 +670,47 @@ async def inspect_provider_configuration(body: ProviderInspectionRequest):
             raise HTTPException(404, "Provider 不存在")
         key = stored.get("api_key", "")
     return await inspect_provider(_provider_candidate(body, api_key=key or ""), body.mode)
+
+
+@api.post("/providers/context-preview", responses=CONTEXT_PREVIEW_RESPONSES,
+          description="仅根据本地能力和可选资料统计估算五类任务容量，不保存配置、不调用外部服务。")
+def context_preview(body: ContextPreviewRequest):
+    from .context_budget import DEFAULT_CONTEXT_STRATEGY, context_strategy, positive_int
+    stored = provider_by_id(body.provider_id) if body.provider_id else None
+    if body.provider_id and not stored:
+        raise HTTPException(404, "Provider 不存在")
+    known = stored.get("capabilities", {}).get("token_limits", {}) if stored and stored.get("model") == body.model else body.token_limits
+    candidate = {"config": body.config, "capabilities": {"token_limits": known}}
+    limits = TokenLimits.from_provider(candidate)
+    manual_context = positive_int(body.config.get("context_window_tokens"))
+    manual_output = positive_int(body.config.get("max_output_tokens"))
+    if manual_context and limits.model_context_tokens and manual_context > limits.model_context_tokens:
+        raise HTTPException(422, f"人工上下文窗口 {manual_context} 超过模型报告的最大值 {limits.model_context_tokens}")
+    if manual_output and manual_output >= limits.effective_context_tokens:
+        raise HTTPException(422, "人工最大输出必须小于有效上下文窗口")
+    total, average, segments = None, 1000, None
+    if body.notebook_id:
+        _require_notebook(body.notebook_id)
+        sources = DB.fetchall("SELECT id,selected FROM sources WHERE notebook_id=? AND state='ready'", (body.notebook_id,))
+        ids = [source["id"] for source in sources if source["id"] in body.source_ids] if body.source_ids is not None else [source["id"] for source in sources if source["selected"]]
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            rows = DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks})", tuple(ids))
+            costs = [estimate_text_tokens(row["content"]) + 80 for row in rows if is_quality_chunk(row)]
+        else:
+            costs = []
+        segments, total = len(costs), sum(costs)
+        average = max(1, (total + max(1, segments) - 1) // max(1, segments))
+    def plans(provider_limits):
+        return [plan_context(provider_limits, kind, material_tokens=total, segment_tokens=average,
+                             count=20 if kind == "flashcard" else 10, minutes=20).as_dict()
+                for kind in ("summary", "chat", "quiz", "flashcard", "podcast")]
+    return {"strategy": body.config.get("context_strategy", DEFAULT_CONTEXT_STRATEGY),
+            "strategies": {kind: context_strategy(candidate, kind) for kind in ("summary", "chat", "quiz", "flashcard", "podcast")},
+            "plans": plans(limits), "saved_plans": plans(TokenLimits.from_provider(stored)) if stored and stored.get("model") == body.model else [],
+            "basis": "当前选中资料的实际片段长度（含定位估算）" if total is not None else "按每段约 1000 tokens 估算",
+            "candidate_segments": segments, "material_tokens": total,
+            "assumptions": "Quiz 10 题、Flashcard 20 张、Podcast 20 分钟；容量估算不代表质量保证。"}
 
 
 @api.post("/providers", responses=PROVIDER_CREATE_RESPONSES)

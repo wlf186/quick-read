@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -17,12 +18,13 @@ from .config import CONFIG
 from .paths import PATHS
 from .providers import ProviderError, active_provider, audio_provider_readiness, host_voice_instruction, host_voice_selection, provider_by_id, study_generation_profile, synthesize, synthesize_sequence, transcribe_audio
 from .audio_quality import assess_transcription, repair_turn_indexes
-from .podcast import PODCAST_DURATION_CALIBRATION_VERSION, PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script
+from .podcast import PODCAST_DURATION_CALIBRATION_VERSION, PODCAST_ENGINE_VERSION, PodcastQualityError, build_podcast_script, repair_measured_duration
 from .services import ingest_source, make_summary
 from .study import generate_study_artifact
 from .observability import LABELS, Reporter
 from .cleanup import process_cleanup_operations, register_resource
-from .context_budget import TokenLimits
+from .context_budget import CONTEXT_STRATEGY_VERSION, DEFAULT_CONTEXT_STRATEGY, TokenLimits
+from .generation_context import adaptive_generation, current, report as context_coverage, restore_trace
 
 
 def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_id: str | None = None) -> dict[str, Any]:
@@ -186,6 +188,7 @@ def _podcast_overlap_safe(main_provider: dict[str, Any], audio_provider: dict[st
     return main_host != audio_host
 
 
+@adaptive_generation("podcast")
 async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
     podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
@@ -195,7 +198,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     ready, readiness_message = audio_provider_readiness(provider)
     if not ready or not provider:
         raise RuntimeError(readiness_message)
-    main_provider = provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main")
+    main_provider = copy.deepcopy(current().provider if current() else provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main"))
     if not main_provider:
         raise RuntimeError("请先配置并启用 MAIN provider")
     config = provider.get("config", {})
@@ -206,6 +209,13 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     register_resource("job", job_id, notebook_id, "podcast-work", work_dir)
     out_dir = PATHS.artifacts / f"podcast_{suffix}"
     manifest_path = work_dir / "manifest.json"
+    source_revisions = DB.fetchall("SELECT id,revision_id,selected FROM sources WHERE notebook_id=? AND state='ready' ORDER BY id", (notebook_id,))
+    requested_ids = payload.get("source_ids")
+    source_revisions = [{"id": row["id"], "revision_id": row["revision_id"]} for row in source_revisions
+                        if row["id"] in requested_ids] if requested_ids is not None else [
+                            {"id": row["id"], "revision_id": row["revision_id"]} for row in source_revisions if row["selected"]]
+    if current():
+        source_revisions = [{"id": row["id"], "revision_id": row["revision_id"]} for row in current().sources]
     signature = hashlib.sha256(
         json_dump(
             {
@@ -228,6 +238,10 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
                     },
                 },
                 "script_engine": PODCAST_ENGINE_VERSION,
+                "context_strategy": {"version": CONTEXT_STRATEGY_VERSION,
+                                     "mode": (main_provider.get("config") or {}).get("context_strategy", DEFAULT_CONTEXT_STRATEGY),
+                                     "limits": vars(TokenLimits.from_provider(main_provider))},
+                "source_revisions": source_revisions,
                 "delivery_policy": "partial_v1",
                 "duration_calibration": PODCAST_DURATION_CALIBRATION_VERSION,
             }
@@ -240,6 +254,13 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         temporary.replace(manifest_path)
 
     manifest = json_load(manifest_path.read_text(encoding="utf-8"), {}) if manifest_path.exists() else {}
+    if current() and manifest.get("generated"):
+        restore_trace(current().trace, manifest["generated"].get("context_usage") or {})
+        if manifest.get("signature") == signature:
+            checkpoint = manifest.get("context_selection") or {}
+            allowed = {row["id"] for row in current().rows}
+            for name in ("selected", "sent", "partial"):
+                getattr(current(), name).update(set(checkpoint.get(name) or []) & allowed)
     selected_model_early = str(provider.get("model") or "")
     selected_device_early = str(config.get("compute_device") or "gpu")
     model_caps_early = next(
@@ -415,6 +436,8 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             "version": PODCAST_ENGINE_VERSION, "signature": signature, "generated": generated,
             "tts_parts": manifest.get("tts_parts") or {},
         }
+        if current():
+            manifest["context_selection"] = {name: sorted(getattr(current(), name)) for name in ("selected", "sent", "partial")}
         save_manifest(manifest)
     script_seconds = script_finished - script_started
 
@@ -685,6 +708,59 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             return {"passed": False, "stage": "asr", "error": str(exc), "code": exc.code, "segment_count": 0}
 
     audio_quality = await verify_audio(f"sread-asr-{suffix[:36]}")
+    if current() and not duration_check["passed"] and not manifest.get("measured_duration_attempted"):
+        manifest["measured_duration_attempted"] = True
+        save_manifest(manifest)
+        repair_started = time.perf_counter()
+        original_generated = copy.deepcopy(generated)
+        original_audio = work_dir / f"before-duration-repair{destination.suffix}"
+        shutil.copy2(destination, original_audio)
+        original_cursor = cursor
+        original_hashes = dict(part_hashes)
+        backup_dir = work_dir / "before-duration-parts"
+        shutil.copytree(parts_dir, backup_dir, dirs_exist_ok=True)
+        try:
+            trace = current().trace
+            trace.request_limit = min(80, max(trace.request_limit or 0, trace.requests + 2))
+            revised = await repair_measured_duration(generated, cursor, trace)
+            changed = [index for index, turn in enumerate(revised) if turn["text"] != turns[index]["text"]]
+            turns[:] = revised
+            await synthesize_indexes(changed, retry=True)
+            destination, cursor = await render_audio(set(changed))
+            revised_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
+            if not revised_check["passed"]:
+                raise ValueError("单次修复后的实际音频仍未达到时长范围")
+            repaired_quality = await verify_audio(f"sread-asr-{suffix[:24]}-duration")
+            if not repaired_quality.get("passed"):
+                raise ValueError("时长修复后的音频未通过 ASR 验收")
+            audio_quality = repaired_quality
+            duration_check = revised_check
+            generated["script"] = "\n".join(f"{turn['speaker']}: {turn['text']} " + " ".join(f"[{label}]" for label in turn["citation_ids"]) for turn in turns)
+            generated["quality"]["measured_duration_repair"] = {"passed": True, "changed_turns": changed,
+                "before_seconds": original_cursor, "after_seconds": cursor}
+        except (ProviderError, RuntimeError, ValueError, OSError) as exc:
+            if cancel_check():
+                raise RuntimeError("任务已取消") from exc
+            turns[:] = original_generated["turns"]
+            generated.clear()
+            generated.update(original_generated)
+            generated["turns"] = turns
+            warnings = generated.setdefault("warnings", [])
+            shutil.copy2(original_audio, destination)
+            shutil.copytree(backup_dir, parts_dir, dirs_exist_ok=True)
+            shutil.rmtree(work_dir / "normalized", ignore_errors=True)
+            part_hashes.clear()
+            part_hashes.update(original_hashes)
+            cursor = original_cursor
+            warnings.append({"code": "measured_duration_repair", "stage": "audio",
+                             "message": "实际时长修复未完成，保留原音频。", "reason": str(exc)[:240]})
+        finally:
+            tts_seconds += time.perf_counter() - repair_started
+            generated["context_usage"] = current().trace.as_dict()
+            generated["context_usage"]["coverage"] = context_coverage(generated.get("citations"))
+            manifest["generated"] = generated
+            save_manifest(manifest)
+
     retry_indexes = repair_turn_indexes(audio_quality)
     if audio_quality.get("segment_count") and retry_indexes and len(retry_indexes) <= 6:
         repair_started = time.perf_counter()

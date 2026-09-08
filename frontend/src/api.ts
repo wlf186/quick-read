@@ -70,6 +70,9 @@ export const reviewStudyCard=(id:string,item_id:string,rating:'again'|'hard'|'go
 export const suspendFlashcard=(artifactId:string,cardId:string)=>api<void>(`/artifacts/${artifactId}/flashcards/${cardId}`,{method:'DELETE'});
 export const flashcardsCsvUrl=(artifactId:string)=>`/api/artifacts/${artifactId}/flashcards.csv`;
 export const getProviders=()=>api<Provider[]>('/providers');
+export type ContextPlan={version:string;kind:string;context_tokens:number;output_tokens:number;evidence_tokens:number;batch_evidence_tokens:number;estimated_segments:number;preparation_batches:number;total_token_limit:number;final_reserve_tokens:number;output_items:number;limiting_factor:string};
+export type ContextPreview={strategy?:'balanced'|'conservative';strategies?:Record<string,'balanced'|'conservative'>;plans:ContextPlan[];saved_plans:ContextPlan[];basis:string;candidate_segments:number|null;material_tokens:number|null;assumptions:string};
+export const previewContext=(body:Record<string,unknown>,signal?:AbortSignal)=>api<ContextPreview>('/providers/context-preview',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body),signal});
 export const getProviderRoles=()=>api<ProviderRoleState[]>('/provider-roles');
 export const updateProviderRole=(role:ConfigurableProviderRole,body:Record<string,any>)=>api<ProviderRoleState>(`/provider-roles/${role}`,{method:'PATCH',headers:jsonHeaders,body:JSON.stringify(body)});
 export const getImageProcessingPolicy=()=>api<ImageProcessingPolicy>('/settings/image-processing');

@@ -17,6 +17,10 @@ PROVIDER_CONFIG_DOCS = {
         "字符串、数字和 null 不可替代。说明中的缺省行为不代表保存时自动补齐所有键。"
     ),
     "properties": {
+        "context_strategy": {
+            "type": "string", "enum": ["balanced", "conservative"],
+            "description": "MAIN 上下文策略，缺省 conservative；均衡策略尚待质量资格。balanced 按有效窗口、输出预算和资料量动态规划；conservative 保留原有选材策略，供对照和回退。",
+        },
         "thinking": {
             "type": "string",
             "enum": ["auto", "disabled", "enabled"],
@@ -200,3 +204,23 @@ ARTIFACT_RESPONSES = json_response(ARTIFACT_SCHEMA, "产物详情及可选的 Po
 ARTIFACT_LIST_RESPONSES = json_response(_array(ARTIFACT_SCHEMA), "产物列表；view=summary 时 payload 为 {}，citations 为 []，不返回媒体链接。")
 JOB_RESPONSES = json_response(_object({}), "任务详情；Quiz result 与产物接口采用相同公开结构，隐藏答案、解析和作答后证据，作答后通过学习会话接口返回。其他任务字段保留。")
 JOB_LIST_RESPONSES = json_response(_object({}), "分页任务列表；Quiz result 隐藏答案、解析和作答后证据。view=summary 仅返回已有摘要字段。")
+CONTEXT_PREVIEW_RESPONSES = json_response(_object({
+    "strategy": {"type": "string", "enum": ["balanced", "conservative"]},
+    "strategies": _object({}, "各功能实际生效策略；与执行使用同一资格清单及显式配置优先级。"),
+    "plans": _array(_object({})), "saved_plans": _array(_object({})),
+    "basis": {"type": "string"}, "assumptions": {"type": "string"},
+}), "仅在本地估算选材、分批和任务预算；不承诺质量。实际 context_usage.coverage 分别记录选材、成功调用原文及最终引用，旧产物可缺省。Quiz 作答前不公开逐来源覆盖明细。")
+
+SOURCE_UPLOAD_RESPONSES = json_response(_array(_object({
+    "source_id": {"type": "string"}, "job": _object({}),
+})), "上传结果包含每份资料的导入任务；正文、所选视觉处理与索引结束后才就绪。")
+NOTEBOOK_RESPONSES = json_response(_object({
+    "sources": _array(_object({
+        "metadata": _object({
+            "locator_unit": {"type": "string", "description": "XLSX 为 sheet，page_count 表示工作表数量。"},
+            "native_charts": {"type": "integer"},
+            "warnings": _array(_object({}), "预览缺失、公式缓存缺失或未识别视觉内容。"),
+            "ingest_timings": _object({}, "本地解析、预览转换、视觉处理、索引及落库耗时，单位秒；不包含队列等待。"),
+        }),
+    })),
+}), "笔记本及资料。工作表引用 locator 包含 sheet、cell_range，可另含 header_range；原生图表包含 chart、data_ranges。")

@@ -8,6 +8,10 @@ Podcast script generation and recovery belong in `podcast.py`, audio acceptance 
 
 ## Build, Test, and Development Commands
 
+Dynamic generation planning lives in `context_budget.py`; task-local provider/evidence snapshots and measured coverage live in `generation_context.py`. Preview capacity must use the execution planner without provider calls. `scripts/evaluate_context_strategy.py` compares frozen application snapshots with isolated sample indexes; distinguish script-only Podcast results from complete TTS/ASR runs, and freeze references before comparative runs.
+
+`scripts/evaluate_imports.py` checks isolated single and batch DOCX/PPTX/XLSX/PDF uploads with explicit samples and MAIN/VLM addresses. Compare full ready-state timings, verify extracted values and image content, and keep raw reports under `runtime/evals/`.
+
 - `./scripts/bootstrap.sh` installs the project environment, frontend dependencies, and local media tools.
 - `./scripts/start.sh` starts the built application; `./scripts/stop.sh` stops it.
 - `.venv/bin/pytest -q` runs the Python test suite.

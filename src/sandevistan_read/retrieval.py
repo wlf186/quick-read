@@ -11,6 +11,8 @@ import numpy as np
 from .config import CONFIG
 from .database import DB, json_load
 from .paths import PATHS
+from .context_budget import estimate_text_tokens
+from .generation_context import current, mark_selected, region
 
 
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9_]+|[\u3400-\u9fff]+", re.UNICODE)
@@ -102,13 +104,18 @@ def _cosine(left: list[float], right: list[float]) -> float:
 def is_quality_chunk(row: dict[str, Any], *, minimum_chars: int = 120) -> bool:
     """Reject front/back matter and fragments before they reach a paid model."""
     content = re.sub(r"\s+", " ", str(row.get("content") or "")).strip()
+    locator = row.get("locator") if isinstance(row.get("locator"), dict) else json_load(row.get("locator_json"), {})
+    if locator.get("structured") or locator.get("kind") in {"sheet", "table"}:
+        return len(content) >= 24 and bool(re.search(r"[A-Za-z\u3400-\u9fff]", content)) and "|" in content
     if len(content) < minimum_chars or LOW_VALUE_PATTERN.search(content[:500]):
         return False
     lowered = content.lower()
     if lowered.count("http://") + lowered.count("https://") >= 2:
         return False
-    words = re.findall(r"[A-Za-z\u3400-\u9fff]+", content)
-    if len(words) < 18:
+    # Chinese phrases have no spaces; counting each phrase as one word rejects
+    # substantive paragraphs that have many words but little punctuation.
+    word_count = len(re.findall(r"[A-Za-z]+", content)) + len(re.findall(r"[\u3400-\u9fff]", content)) // 2
+    if word_count < 18:
         return False
     locator = row.get("locator") if isinstance(row.get("locator"), dict) else json_load(row.get("locator_json"), {})
     section = str(locator.get("section") or "")
@@ -127,7 +134,10 @@ def select_quality_evidence(
     if not source_ids or limit <= 0:
         return []
     marks = ",".join("?" for _ in source_ids)
-    rows = DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks}) ORDER BY source_id,ordinal", tuple(source_ids))
+    state = current()
+    rows = [row for row in state.rows if row["source_id"] in source_ids] if state else DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks}) ORDER BY source_id,ordinal", tuple(source_ids))
+    if state:
+        limit = max(1, state.plan.estimated_segments)
     candidates = [row for row in rows if is_quality_chunk(row, minimum_chars=minimum_chars)]
     if not candidates:
         candidates = [
@@ -160,24 +170,46 @@ def select_quality_evidence(
     selected_indexes: list[int] = []
     source_counts: dict[str, int] = defaultdict(int)
     section_counts: dict[tuple[str, str], int] = defaultdict(int)
+    similarities = np.zeros(len(candidates), dtype=np.float32)
+    remaining_tokens = state.plan.evidence_tokens if state else None
+    costs = [estimate_text_tokens(str(row["content"])) + 80 for row in candidates]
+    source_costs: dict[str, int] = defaultdict(int)
+    source_spend: dict[str, int] = defaultdict(int)
+    for row, cost in zip(candidates, costs):
+        source_costs[row["source_id"]] += cost
+    fair_share = (remaining_tokens or 0) / max(1, len(source_costs))
+    selected_set: set[int] = set()
     while len(selected_indexes) < min(limit, len(candidates)):
         best_index, best_score = None, -float("inf")
+        best_fill = float("inf")
         for index, row in enumerate(candidates):
-            if index in selected_indexes or source_counts[row["source_id"]] >= per_source_limit:
+            if index in selected_set or (not state and source_counts[row["source_id"]] >= per_source_limit):
+                continue
+            if remaining_tokens is not None and costs[index] > remaining_tokens:
                 continue
             locator = json_load(row.get("locator_json"), {})
-            section = str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
-            similarity = max((float(np.dot(matrix[index], matrix[value])) for value in selected_indexes), default=0.0)
+            section = region(row) if state else str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
+            similarity = float(similarities[index])
             section_penalty = min(0.18, section_counts[(row["source_id"], section)] * 0.06)
             score = base_scores[index] - 0.35 * max(0.0, similarity) - section_penalty
-            if score > best_score:
+            if state:
+                score += 1.0 if not source_counts[row["source_id"]] else 0.0
+                score += 0.35 if not section_counts[(row["source_id"], section)] else 0.0
+            fill = min(1.0, source_spend[row["source_id"]] / max(1, min(fair_share, source_costs[row["source_id"]]))) if state else 0.0
+            if fill < best_fill or (fill == best_fill and score > best_score):
                 best_index, best_score = index, score
+                best_fill = fill
         if best_index is None:
             break
         selected_indexes.append(best_index)
+        selected_set.add(best_index)
+        similarities = np.maximum(similarities, matrix @ matrix[best_index])
+        if remaining_tokens is not None:
+            remaining_tokens -= costs[best_index]
         row = candidates[best_index]
+        source_spend[row["source_id"]] += costs[best_index]
         locator = json_load(row.get("locator_json"), {})
-        section = str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
+        section = region(row) if state else str(locator.get("section") or locator.get("spine") or locator.get("page") or "")
         source_counts[row["source_id"]] += 1
         section_counts[(row["source_id"], section)] += 1
     selected: list[dict[str, Any]] = []
@@ -188,6 +220,7 @@ def select_quality_evidence(
         row["quality_rank"] = rank
         row["quality_score"] = round(base_scores[index], 6)
         selected.append(row)
+    mark_selected(selected)
     return selected
 
 
@@ -207,7 +240,8 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
         return []
     placeholders = ",".join("?" for _ in source_ids)
     params: tuple[Any, ...] = tuple(source_ids)
-    all_chunks = DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({placeholders})", params)
+    state = current()
+    all_chunks = [row for row in state.rows if row["source_id"] in source_ids] if state else DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({placeholders})", params)
     query_vector = EMBEDDINGS.encode([query], query=True)[0]
     dense_all = sorted(
         all_chunks,
@@ -217,9 +251,14 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
     dense = dense_all[: max(limit * 4, 30)]
     query_tokens = tokenize(query)
     cjk_query = bool(CJK_PATTERN.search(query))
-    terms = [term for term in query_tokens if len(term) > 1][:16]
+    # Keep technical names even when a long Chinese question precedes them.
+    # Otherwise the first few CJK bigrams consume the entire lexical budget.
+    unique_terms = list(dict.fromkeys(term for term in query_tokens if len(term) > 1))
+    terms = [term for term in unique_terms if not CJK_PATTERN.search(term)][:16]
+    terms.extend(term for term in unique_terms if CJK_PATTERN.search(term))
+    terms = terms[:32]
     lexical: list[dict[str, Any]] = []
-    if terms and not cjk_query:
+    if terms and not cjk_query and not state:
         match_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
         try:
             lexical = DB.fetchall(
@@ -252,7 +291,7 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
         ordered = covered + [chunk_id for chunk_id in ordered if chunk_id not in set(covered)]
     for chunk_id in ordered:
         row = dict(by_id[chunk_id])
-        if per_source[row["source_id"]] >= 4:
+        if not current() and per_source[row["source_id"]] >= 4:
             continue
         row["locator"] = json_load(row.pop("locator_json"), {})
         row.pop("embedding_json", None)
@@ -261,4 +300,5 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
         per_source[row["source_id"]] += 1
         if len(results) >= limit:
             break
+    mark_selected(results)
     return results

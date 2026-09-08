@@ -320,3 +320,32 @@ def test_job_detail_and_list_do_not_expose_quiz_answers(evidence_db, monkeypatch
         assert public['citations'] == []
     stored = json.loads(evidence_db.fetchone("SELECT result_json FROM jobs WHERE id='j'")['result_json'])
     assert stored['payload']['items'][0]['answer_index'] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('verdict', ['supported', 'unsupported', 'missing', 'invented_quote'])
+async def test_summary_audit_requires_original_evidence(evidence_db, monkeypatch, verdict):
+    quote = 'The dialogue is a fictional example, not a historical account of a discovery.'
+    chunk = {'id': 'c', 'source_id': 's', 'content': quote, 'locator': {}}
+    point = {'claim': 'The dialogue illustrates a fictional discovery.', 'why_it_matters': 'It explains the thought experiment.',
+             'qualification': 'This is a fictional example.', 'citations': ['S1']}
+    async def chat(build, **kwargs):
+        budget = PromptBudget(30720, 12000, 2000, 2048, 1)
+        built = build(budget)
+        assert quote in built.messages[-1]['content']
+        assert kwargs['stage'] == 'summary_grounding_audit'
+        result = {} if verdict == 'missing' else {'verdicts': [{'index': 0, 'supported': verdict != 'unsupported',
+            'evidence': [{'id': 'S1', 'quote': 'A fabricated quotation with enough characters.' if verdict == 'invented_quote' else quote}]}]}
+        return BudgetedCompletion(json_dump(result), built, budget)
+    monkeypatch.setattr(services, 'budgeted_chat', chat)
+    accepted = await services._audit_summary_points([point], [chunk], ['S1'], services.ContextUsage())
+    assert accepted == ([point] if verdict == 'supported' else [])
+
+
+@pytest.mark.asyncio
+async def test_measured_duration_audit_fails_closed(monkeypatch):
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError('budget exhausted')
+    monkeypatch.setattr(podcast, 'budgeted_chat', unavailable)
+    invalid = await podcast._critic_grounded_pairs([{'answer': 'Unsupported claim', 'support_quote': 'Actual source'}], 'en', strict=True)
+    assert invalid == {0}

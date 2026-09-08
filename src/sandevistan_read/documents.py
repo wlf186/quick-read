@@ -11,6 +11,10 @@ import shutil
 import subprocess
 import uuid
 import zipfile
+from datetime import date, datetime, time as datetime_time
+from contextvars import ContextVar
+from itertools import zip_longest
+from time import perf_counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
@@ -20,6 +24,10 @@ from xml.etree import ElementTree
 import fitz
 from bs4 import BeautifulSoup
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from pptx import Presentation
 from PIL import Image
 
@@ -27,10 +35,11 @@ from .config import CONFIG
 from .paths import PATHS
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".epub", ".txt", ".md", ".markdown", ".html", ".htm", ".png", ".jpg", ".jpeg", ".webp"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".epub", ".txt", ".md", ".markdown", ".html", ".htm", ".png", ".jpg", ".jpeg", ".webp"}
 EPUB_MAX_ENTRIES = 10_000
 EPUB_MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 EPUB_MAX_TEXT_MEMBER_BYTES = 32 * 1024 * 1024
+_PARSE_TIMINGS: ContextVar[dict[str, float] | None] = ContextVar("document_parse_timings", default=None)
 
 
 @dataclass
@@ -72,9 +81,12 @@ def _clean_text(value: str) -> str:
 
 
 def _render_pdf_page(page: fitz.Page, destination: Path) -> str:
+    started = perf_counter()
     destination.parent.mkdir(parents=True, exist_ok=True)
     pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
     pixmap.save(destination)
+    if (timings := _PARSE_TIMINGS.get()) is not None:
+        timings["render_seconds"] = timings.get("render_seconds", 0.0) + perf_counter() - started
     return str(destination.relative_to(PATHS.root))
 
 
@@ -103,6 +115,35 @@ def _store_svg(data: bytes, destination: Path) -> str:
     return str(destination.relative_to(PATHS.root))
 
 
+def _page_needs_vision(page: fitz.Page, text: str) -> bool:
+    """Ignore only unmistakable backgrounds/rules; uncertain graphics stay visual."""
+    # get_images() includes shared resources that are never painted on this page.
+    if len(text) < 80 or page.get_image_info():
+        return True
+    bounds = page.rect
+    uncertain = []
+    for drawing in page.get_drawings():
+        rect = drawing["rect"]
+        simple = len(drawing["items"]) == 1 and drawing["items"][0][0] in {"re", "l"}
+        background = simple and rect.contains(bounds + (2, 2, -2, -2))
+        horizontal_rule = simple and rect.height <= 3 and rect.width >= bounds.width * 0.7
+        margin_rule = simple and min(rect.width, rect.height) <= 6 and (
+            rect.y1 <= bounds.height * 0.04 or rect.y0 >= bounds.height * 0.96)
+        if not (background or horizontal_rule or margin_rule):
+            uncertain.append(drawing)
+    if len(uncertain) == 1:
+        drawing = uncertain[0]
+        rect = drawing["rect"]
+        # A lone short horizontal accent beneath text, without chart axes or
+        # other shapes, is a heading underline. Bars in plots remain uncertain.
+        if (len(drawing["items"]) == 1 and drawing["items"][0][0] == "re"
+                and 0 < rect.height <= 3 and 0 < rect.width < bounds.width * 0.2
+                and any(abs(block[0] - rect.x0) <= 3 and 0 <= rect.y0 - block[3] <= 24
+                        for block in page.get_text("blocks") if len(block) > 4)):
+            return False
+    return bool(uncertain)
+
+
 def parse_pdf(path: Path, source_id: str) -> ParsedDocument:
     document = fitz.open(path)
     result = ParsedDocument(page_count=len(document), parser="pymupdf", preview_path=str(path.relative_to(PATHS.root)), metadata={"locator_unit": "page"})
@@ -110,11 +151,7 @@ def parse_pdf(path: Path, source_id: str) -> ParsedDocument:
     for index, page in enumerate(document):
         blocks = page.get_text("blocks", sort=True)
         text = _clean_text("\n".join(str(block[4]) for block in blocks if len(block) > 4))
-        image_count = len(page.get_images(full=True))
-        drawing_count = len(page.get_drawings())
-        page_area = max(page.rect.width * page.rect.height, 1)
-        text_density = len(text) / page_area
-        visual_needed = len(text) < 80 or image_count > 0 or drawing_count > 0 or text_density < 0.00018
+        visual_needed = _page_needs_vision(page, text)
         image_path = None
         if visual_needed:
             image_path = _render_pdf_page(page, render_dir / f"page-{index + 1:04d}.png")
@@ -158,11 +195,30 @@ def _convert_office_to_pdf(path: Path, source_id: str) -> Path | None:
     environment = os.environ.copy()
     environment["SAL_USE_VCLPLUGIN"] = "svp"
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False, env=environment)
+        completed = subprocess.run(command, capture_output=True, timeout=180, check=False, env=environment)
         converted = output_dir / f"{path.stem}.pdf"
         return converted if completed.returncode == 0 and converted.exists() else None
     finally:
         shutil.rmtree(profile, ignore_errors=True)
+
+
+def _office_preview(path: Path, source_id: str, metadata: dict[str, Any]) -> Path | None:
+    started = perf_counter()
+    try:
+        preview = _convert_office_to_pdf(path, source_id)
+        if preview:
+            with fitz.open(preview) as pdf:
+                if not len(pdf):
+                    raise ValueError("预览 PDF 没有页面")
+            return preview
+        reason = "converter_unavailable_or_failed"
+    except (OSError, subprocess.SubprocessError, UnicodeError, RuntimeError, ValueError) as exc:
+        reason = type(exc).__name__
+    finally:
+        metadata.setdefault("ingest_timings", {})["office_conversion_seconds"] = round(perf_counter() - started, 4)
+    metadata.setdefault("warnings", []).append({"code": "office_preview_unavailable", "reason": reason,
+        "message": "正文已提取，预览转换未完成；依赖预览的图表或图片可能未被识别。"})
+    return None
 
 
 def parse_docx(path: Path, source_id: str) -> ParsedDocument:
@@ -170,7 +226,18 @@ def parse_docx(path: Path, source_id: str) -> ParsedDocument:
     blocks: list[ParsedBlock] = []
     section = "文档"
     ordinal = 0
-    for paragraph in document.paragraphs:
+    table_index = 0
+    for element in document.element.body:
+        if element.tag.endswith("}tbl"):
+            table_index += 1
+            table = Table(element, document)
+            rows = [" | ".join(_clean_text(cell.text) for cell in row.cells) for row in table.rows]
+            if any(rows):
+                blocks.append(ParsedBlock("\n".join(rows), {"kind": "table", "table": table_index, "section": section, "structured": True}))
+            continue
+        if not element.tag.endswith("}p"):
+            continue
+        paragraph = Paragraph(element, document)
         text = _clean_text(paragraph.text)
         if not text:
             continue
@@ -179,18 +246,16 @@ def parse_docx(path: Path, source_id: str) -> ParsedDocument:
             section = text
         blocks.append(ParsedBlock(text=text, locator={"kind": "section", "section": section, "paragraph": ordinal + 1}))
         ordinal += 1
-    for table_index, table in enumerate(document.tables, start=1):
-        rows = [" | ".join(_clean_text(cell.text) for cell in row.cells) for row in table.rows]
-        table_text = _clean_text("\n".join(rows))
-        if table_text:
-            blocks.append(ParsedBlock(text=table_text, locator={"kind": "table", "table": table_index, "section": section}))
-    preview = _convert_office_to_pdf(path, source_id)
+    metadata: dict[str, Any] = {"locator_unit": "section"}
+    preview = _office_preview(path, source_id, metadata)
     page_count = 0
     if preview:
         with fitz.open(preview) as pdf:
             page_count = len(pdf)
             render_dir = PATHS.renders / source_id
             for index, page in enumerate(pdf):
+                if not _page_needs_vision(page, _clean_text(page.get_text())):
+                    continue
                 image_path = _render_pdf_page(page, render_dir / f"page-{index + 1:04d}.png")
                 blocks.append(ParsedBlock(text="", locator={"kind": "page", "page": index + 1, "visual_only": True}, image_path=image_path, visual_needed=True))
     return ParsedDocument(
@@ -198,7 +263,7 @@ def parse_docx(path: Path, source_id: str) -> ParsedDocument:
         page_count=page_count or max(1, len(document.sections)),
         parser="python-docx+libreoffice" if preview else "python-docx",
         preview_path=str(preview.relative_to(PATHS.root)) if preview else None,
-        metadata={"visual_preview": bool(preview), "locator_unit": "section"},
+        metadata={**metadata, "visual_preview": bool(preview)},
     )
 
 
@@ -208,12 +273,20 @@ def parse_pptx(path: Path, source_id: str) -> ParsedDocument:
     for slide_number, slide in enumerate(presentation.slides, start=1):
         parts: list[str] = []
         image_count = 0
-        for shape in slide.shapes:
+        def shapes_in(shapes: Any) -> Any:
+            for shape in shapes:
+                yield shape
+                if hasattr(shape, "shapes"):
+                    yield from shapes_in(shape.shapes)
+
+        for shape in shapes_in(slide.shapes):
             if getattr(shape, "has_text_frame", False):
                 value = _clean_text(shape.text)
                 if value:
                     parts.append(value)
             if getattr(shape, "shape_type", None) == 13:
+                image_count += 1
+            if getattr(shape, "has_chart", False):
                 image_count += 1
             if getattr(shape, "has_table", False):
                 rows = [" | ".join(_clean_text(cell.text) for cell in row.cells) for row in shape.table.rows]
@@ -228,7 +301,8 @@ def parse_pptx(path: Path, source_id: str) -> ParsedDocument:
                 visual_needed=image_count > 0 or len(text) < 80,
             )
         )
-    preview = _convert_office_to_pdf(path, source_id)
+    metadata: dict[str, Any] = {"locator_unit": "slide"}
+    preview = _office_preview(path, source_id, metadata)
     if preview:
         with fitz.open(preview) as pdf:
             render_dir = PATHS.renders / source_id
@@ -240,8 +314,177 @@ def parse_pptx(path: Path, source_id: str) -> ParsedDocument:
         page_count=len(presentation.slides),
         parser="python-pptx+libreoffice" if preview else "python-pptx",
         preview_path=str(preview.relative_to(PATHS.root)) if preview else None,
-        metadata={"visual_preview": bool(preview), "locator_unit": "slide"},
+        metadata={**metadata, "visual_preview": bool(preview)},
     )
+
+
+def _spreadsheet_value(cell: Any, cached: Any) -> str:
+    value = cached.value if cell.data_type == "f" else cell.value
+    if value is None:
+        return f"[公式未缓存：{cell.value}]" if cell.data_type == "f" else ""
+    if isinstance(value, (datetime, date, datetime_time)):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)) and "%" in cell.number_format:
+        decimals = re.search(r"\.([0#]+)%", cell.number_format)
+        return f"{value * 100:.{len(decimals[1]) if decimals else 0}f}%"
+    return _clean_text(str(value))
+
+
+def _cached_chart_block(xml: bytes, name: str) -> ParsedBlock | None:
+    """Keep complete standard chart caches as native evidence; otherwise render."""
+    root = ElementTree.fromstring(xml)
+    ns = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart", "a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+    plot = root.find(".//c:plotArea", ns)
+    if plot is None:
+        return None
+    charts = [item for item in plot if item.tag.rsplit("}", 1)[-1].endswith("Chart")]
+    if len(charts) != 1 or charts[0].tag.rsplit("}", 1)[-1] not in {"barChart", "lineChart", "pieChart"}:
+        return None
+    chart = charts[0]
+    # Cached series do not represent fitted trends, uncertainty bars or custom
+    # labels. Keep the visual path for those additional chart semantics.
+    if any(node.tag.rsplit("}", 1)[-1] in {"trendline", "errBars", "dLbl", "extLst"}
+           for node in chart.iter()):
+        return None
+    title = " · ".join(node.text or "" for node in root.findall(".//c:title//a:t", ns)) or "图表"
+    lines = [title, "类别 | 系列 | 图表缓存原始数值"]
+    refs = [node.text or "" for node in chart.findall(".//c:f", ns)]
+
+    def values(parent: Any) -> list[str] | None:
+        if parent is None:
+            return None
+        cache = next((item for item in parent.iter() if item.tag.rsplit("}", 1)[-1] in {"strCache", "numCache", "strLit", "numLit"}), None)
+        if cache is None:
+            return None
+        points = cache.findall("c:pt", ns)
+        count = cache.find("c:ptCount", ns)
+        if count is None or count.get("val") != str(len(points)) or not points:
+            return None
+        by_index = {int(item.attrib["idx"]): item.findtext("c:v", default="", namespaces=ns) for item in points}
+        if set(by_index) != set(range(len(points))) or not all(by_index.values()):
+            return None
+        return [by_index[index] for index in range(len(points))]
+
+    series = chart.findall("c:ser", ns)
+    if not series:
+        return None
+    for item in series:
+        categories, numbers = values(item.find("c:cat", ns)), values(item.find("c:val", ns))
+        if not categories or not numbers or len(categories) != len(numbers):
+            return None
+        label = item.findtext("c:tx//c:v", default="数值", namespaces=ns)
+        lines.extend(f"{category} | {label} | {number}" for category, number in zip(categories, numbers))
+    lines.append("图表原始数值按原文件保存；百分比显示请对照工作表单元格。")
+    sheet = refs[0].split("!")[0].strip("'").replace("''", "'") if refs and "!" in refs[0] else ""
+    return ParsedBlock("\n".join(lines), {"kind": "chart", "chart": name, "sheet": sheet,
+        "data_ranges": refs, "structured": True})
+
+
+def parse_xlsx(path: Path, source_id: str) -> ParsedDocument:
+    """Read values and formula caches without evaluating formulas or external links."""
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if len(members) > EPUB_MAX_ENTRIES or sum(member.file_size for member in members) > EPUB_MAX_UNCOMPRESSED_BYTES:
+            raise ValueError("XLSX 解压规模超过解析限制")
+        if any(member.filename.endswith(".xml") and member.file_size > EPUB_MAX_TEXT_MEMBER_BYTES for member in members):
+            raise ValueError("XLSX XML 部件超过解析限制")
+        relations = {item.attrib["Id"]: item.attrib.get("Target", "") for item in
+            ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            if item.attrib.get("TargetMode") != "External"}
+        merges: dict[str, list[str]] = {}
+        for sheet in ElementTree.fromstring(archive.read("xl/workbook.xml")).iter():
+            if sheet.tag.rsplit("}", 1)[-1] != "sheet":
+                continue
+            relationship = next((value for key, value in sheet.attrib.items() if key.endswith("}id")), "")
+            target = relations.get(relationship, "")
+            member = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+            if member in archive.namelist():
+                merges[sheet.attrib["name"]] = [element.attrib["ref"] for element in
+                    ElementTree.fromstring(archive.read(member)).iter()
+                    if element.tag.rsplit("}", 1)[-1] == "mergeCell"]
+        native_charts = []
+        has_visuals = any(member.filename.startswith("xl/media/") for member in members)
+        for member in members:
+            if re.fullmatch(r"xl/charts/chart\d+\.xml", member.filename):
+                try:
+                    block = _cached_chart_block(archive.read(member), Path(member.filename).name)
+                except (ValueError, KeyError, ElementTree.ParseError):
+                    block = None
+                if block:
+                    native_charts.append(block)
+                else:
+                    has_visuals = True
+            elif re.fullmatch(r"xl/drawings/drawing\d+\.xml", member.filename):
+                if any(element.tag.rsplit("}", 1)[-1] in {"sp", "cxnSp", "pic"} for element in ElementTree.fromstring(archive.read(member.filename)).iter()):
+                    has_visuals = True
+    result = ParsedDocument(parser="openpyxl", metadata={"locator_unit": "sheet", "merged_cells": merges})
+    formulas = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+    try:
+        cached = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+        try:
+            result.page_count = len(formulas.worksheets)
+            missing = 0
+            for sheet in formulas:
+                rows: list[tuple[int, str]] = []
+                max_column = 1
+                # Ignore inflated producer dimensions; iterate actual worksheet XML.
+                sheet.reset_dimensions()
+                cached_sheet = cached[sheet.title]
+                cached_sheet.reset_dimensions()
+                for row_number, (row, cached_row) in enumerate(zip_longest(sheet.rows, cached_sheet.rows, fillvalue=()), 1):
+                    values = []
+                    for column, (cell, value_cell) in enumerate(zip(row, cached_row), 1):
+                        if cell.value is None:
+                            continue
+                        value = _spreadsheet_value(cell, value_cell)
+                        missing += int(cell.data_type == "f" and value_cell.value is None)
+                        values.append(f"{get_column_letter(column)}{row_number}: {value}")
+                        max_column = max(max_column, column)
+                    if values:
+                        rows.append((row_number, " | ".join(values)))
+                if not rows:
+                    continue
+                header = f"工作表：{sheet.title}\n表头/起始行：" + "\n".join(value for _, value in rows[:2])
+                if merges.get(sheet.title):
+                    header += "\n合并单元格：" + ", ".join(merges[sheet.title])
+                batch: list[tuple[int, str]] = []
+                size = len(header)
+
+                def flush() -> None:
+                    if batch:
+                        result.blocks.append(ParsedBlock(header + "\n" + "\n".join(value for _, value in batch),
+                            {"kind": "sheet", "sheet": sheet.title, "cell_range": f"A{batch[0][0]}:{get_column_letter(max_column)}{batch[-1][0]}",
+                             "header_range": f"A{rows[0][0]}:{get_column_letter(max_column)}{rows[min(1, len(rows) - 1)][0]}", "structured": True}))
+
+                for row in rows:
+                    if batch and size + len(row[1]) > 1700:
+                        flush()
+                        batch = []
+                        size = len(header)
+                    batch.append(row)
+                    size += len(row[1]) + 1
+                flush()
+            if missing:
+                result.metadata.setdefault("warnings", []).append({"code": "formula_cache_missing", "count": missing,
+                    "message": "部分公式没有保存计算结果，已保留公式并标注，未推算数值。"})
+        finally:
+            cached.close()
+    finally:
+        formulas.close()
+    result.blocks.extend(native_charts)
+    result.metadata["native_charts"] = len(native_charts)
+    if has_visuals:
+        preview = _office_preview(path, source_id, result.metadata)
+        if preview:
+            result.preview_path = str(preview.relative_to(PATHS.root))
+            with fitz.open(preview) as pdf:
+                for index, page in enumerate(pdf):
+                    if _page_needs_vision(page, _clean_text(page.get_text())):
+                        image = _render_pdf_page(page, PATHS.renders / source_id / f"preview-{index + 1:04d}.png")
+                        result.blocks.append(ParsedBlock("", {"kind": "page", "page": index + 1, "visual_only": True}, image, True))
+    return result
 
 
 def _epub_member(base: str, href: str) -> str:
@@ -424,6 +667,21 @@ def parse_image(path: Path, source_id: str) -> ParsedDocument:
 
 
 def parse_document(path: Path, source_id: str) -> ParsedDocument:
+    measured: dict[str, float] = {}
+    token = _PARSE_TIMINGS.set(measured)
+    started = perf_counter()
+    try:
+        result = _parse_document(path, source_id)
+        timings = result.metadata.setdefault("ingest_timings", {})
+        timings.update({key: round(value, 4) for key, value in measured.items()})
+        timings["native_seconds"] = round(max(0.0, perf_counter() - started
+            - measured.get("render_seconds", 0.0) - timings.get("office_conversion_seconds", 0.0)), 4)
+        return result
+    finally:
+        _PARSE_TIMINGS.reset(token)
+
+
+def _parse_document(path: Path, source_id: str) -> ParsedDocument:
     extension = path.suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported document type: {extension}")
@@ -433,6 +691,8 @@ def parse_document(path: Path, source_id: str) -> ParsedDocument:
         return parse_docx(path, source_id)
     if extension == ".pptx":
         return parse_pptx(path, source_id)
+    if extension == ".xlsx":
+        return parse_xlsx(path, source_id)
     if extension == ".epub":
         return parse_epub(path, source_id)
     if extension in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -441,13 +701,37 @@ def parse_document(path: Path, source_id: str) -> ParsedDocument:
 
 
 def chunk_blocks(blocks: list[ParsedBlock], target_chars: int = 1800, overlap_chars: int = 260) -> list[ParsedBlock]:
-    chunks: list[ParsedBlock] = []
+    grouped: list[ParsedBlock] = []
     for block in blocks:
+        previous = grouped[-1] if grouped else None
+        if (previous and block.locator.get("kind") == previous.locator.get("kind") == "section"
+                and block.locator.get("section") == previous.locator.get("section")
+                and block.locator.get("paragraph") and previous.locator.get("paragraph")
+                and not block.image_path and not previous.image_path
+                and len(previous.text) + len(block.text) + 1 <= target_chars):
+            previous.text += "\n" + block.text
+            previous.locator["paragraph_end"] = block.locator["paragraph"]
+        else:
+            grouped.append(ParsedBlock(block.text, dict(block.locator), block.image_path, block.visual_needed))
+    chunks: list[ParsedBlock] = []
+    for block in grouped:
         text = _clean_text(block.text)
         if not text:
             continue
         if len(text) <= target_chars:
             chunks.append(block)
+            continue
+        if block.locator.get("structured"):
+            lines = text.splitlines()
+            header = lines[0]
+            batch = header
+            for line in lines[1:]:
+                if len(batch) + len(line) + 1 > target_chars and batch != header:
+                    chunks.append(ParsedBlock(batch, dict(block.locator)))
+                    batch = header
+                batch += "\n" + line
+            if batch.strip():
+                chunks.append(ParsedBlock(batch, dict(block.locator)))
             continue
         start = 0
         while start < len(text):
