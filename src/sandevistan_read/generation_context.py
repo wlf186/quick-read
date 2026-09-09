@@ -42,9 +42,17 @@ class GenerationContext:
     notes: list[dict[str, Any]] = field(default_factory=list)
     preparation_attempted: bool = False
     cancel_check: Callable[[], bool] | None = None
+    sent_by_stage: dict[str, set[str]] = field(default_factory=dict)
+    audit: dict[str, Any] = field(default_factory=dict)
 
 
 CURRENT: ContextVar[GenerationContext | None] = ContextVar("generation_context", default=None)
+
+
+def evidence_cost(row: dict[str, Any]) -> int:
+    locator = row.get("locator") or json.loads(row.get("locator_json") or "{}")
+    location = str(locator.get("section") or "") + str(locator.get("sheet") or "") + str(locator.get("cell_range") or "")
+    return estimate_text_tokens(str(row["content"])) + estimate_text_tokens(str(row.get("filename") or "") + location) + 80
 
 
 def current() -> GenerationContext | None:
@@ -92,7 +100,11 @@ def report(citations: list[dict[str, Any]] | None = None) -> dict[str, Any] | No
     return {"plan": state.plan.as_dict(), "candidate_segments": len(state.rows),
             "selected_segments": len(state.selected), "sent_segments": len(state.sent),
             "partially_sent_segments": len(state.partial), "cited_segments": len(cited),
-            "sources": details, "meaning": "原文选材与调用覆盖，不代表重要信息完整覆盖"}
+            "sources": details, "stages": {stage: {"sent_segments": len(ids),
+                "source_tokens": sum(estimate_text_tokens(row["content"]) for row in state.rows if row["id"] in ids)}
+                for stage, ids in state.sent_by_stage.items()},
+            "audit": state.audit,
+            "meaning": "原文选材与调用覆盖，不代表重要信息完整覆盖；预读不等于最终综合读取"}
 
 
 def mark_selected(rows: list[dict[str, Any]]) -> None:
@@ -101,7 +113,7 @@ def mark_selected(rows: list[dict[str, Any]]) -> None:
         state.selected.update(str(row["id"]) for row in rows)
 
 
-def mark_sent(build: Any) -> None:
+def mark_sent(build: Any, stage: str = "generation") -> None:
     state = current()
     if not state:
         return
@@ -123,6 +135,7 @@ def mark_sent(build: Any) -> None:
         compact = re.sub(r"\s+", " ", content).strip()
         if compact and compact in normalized:
             state.sent.add(identifier)
+            state.sent_by_stage.setdefault(stage, set()).add(identifier)
             state.partial.discard(identifier)
         elif len(compact) >= 40 and compact[:40] in normalized:
             if identifier not in state.sent:
@@ -253,23 +266,29 @@ def adaptive_generation(kind: str) -> Callable:
                           "revision_id": row.pop("snapshot_revision"), "selected": row.pop("snapshot_selected")}
                 sources_by_id[source_id] = source
                 if row.get("id"):
+                    row["filename"] = source["filename"]
                     rows.append(row)
             sources = list(sources_by_id.values())
             if not sources:
                 return await function(*args, **kwargs)
-            rows = [row for row in rows if retrieval.is_quality_chunk(row)]
+            rows = (retrieval.context_candidates(rows) if actual_kind in {"summary", "chat"}
+                    else [row for row in rows if retrieval.is_quality_chunk(row)])
             if not rows:
                 return await function(*args, **kwargs)
-            costs = [estimate_text_tokens(row["content"]) + 80 for row in rows]
+            costs = [evidence_cost(row) if actual_kind in {"summary", "chat"} else estimate_text_tokens(row["content"]) + 80 for row in rows]
             actual_kind = values.get("kind", kind)
             plan = plan_context(TokenLimits.from_provider(provider), actual_kind,
                                 material_tokens=sum(costs), segment_tokens=math.ceil(sum(costs) / len(costs)),
                                 count=values.get("count", 10), minutes=payload.get("minutes") or 20)
-            if not any(cost <= plan.evidence_tokens for cost in costs):
+            if actual_kind not in {"summary", "chat"} and not any(cost <= plan.evidence_tokens for cost in costs):
                 # Existing builders can clip individual passages and preserve
                 # local fallbacks when the window cannot hold one full chunk.
                 return await function(*args, **kwargs)
             trace = ContextUsage(total_token_limit=plan.total_token_limit, request_limit=80)
+            from .delivery import CURRENT as DELIVERY
+            if actual_kind == "podcast" and DELIVERY.get():
+                from .context_budget import reserve_podcast_audit
+                reserve_podcast_audit(trace, TokenLimits.from_provider(provider))
             state = GenerationContext(copy.deepcopy(provider), plan, rows, sources, trace)
             state.cancel_check = values.get("cancel_check")
             if values.get("job_id"):

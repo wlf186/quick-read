@@ -36,10 +36,12 @@ def public_artifact(item: dict[str, Any]) -> dict[str, Any]:
     public_items = []
     for source in payload.get("items") or []:
         question = dict(source)
-        for field in ("answer", "answer_index", "explanation", "citations"):
+        for field in ("answer", "answer_index", "explanation", "citations", "quality_issues"):
             question.pop(field, None)
         public_items.append(question)
     payload["items"] = public_items
+    if payload.get("quality_assessment"):
+        payload["quality_assessment"] = {**payload["quality_assessment"], "issues": []}
     usage = dict(payload.get("context_usage") or {})
     coverage = dict(usage.get("coverage") or {})
     if coverage:
@@ -191,7 +193,7 @@ def get_session(session_id: str) -> dict[str, Any]:
     for item_id in item_ids:
         source = dict(by_id.get(item_id) or {})
         if session["kind"] == "quiz":
-            public = {key: value for key, value in source.items() if key not in {"answer", "answer_index", "explanation", "citations"}}
+            public = {key: value for key, value in source.items() if key not in {"answer", "answer_index", "explanation", "citations", "quality_issues"}}
             if item_id in state.get("results", {}):
                 public["result"] = state["results"][item_id]
             rendered.append(public)
@@ -230,6 +232,7 @@ def answer_quiz(session_id: str, item_id: str, option_index: int) -> dict[str, A
     if answer_index not in range(4):
         raise ValueError("题目缺少有效答案")
     result = {
+        "quality_issues": item.get("quality_issues", []),
         "item_id": item_id,
         "selected_index": option_index,
         "answer_index": answer_index,

@@ -19,6 +19,10 @@ def context_strategy(provider: dict[str, Any], kind: str) -> str:
     configured = (provider.get("config") or {}).get("context_strategy")
     if isinstance(configured, str) and configured in {"balanced", "conservative"}:
         return configured
+    if provider.get("id") and kind in {"summary", "chat"}:
+        from .context_qualification import qualified
+        if qualified(provider, kind):
+            return "balanced"
     return "balanced" if kind in QUALIFIED_BALANCED_TASKS else DEFAULT_CONTEXT_STRATEGY
 
 
@@ -189,7 +193,7 @@ def prompt_budget(limits: TokenLimits, requested_output: int, minimum_output: in
     return PromptBudget(limits.effective_context_tokens, input_tokens, output, limits.image_tokens_per_image, scale)
 
 
-CONTEXT_STRATEGY_VERSION = "balanced_v3"
+CONTEXT_STRATEGY_VERSION = "evidence_v4"
 TASK_TOKEN_CEILING = 300_000
 
 
@@ -207,10 +211,21 @@ class ContextPlan:
     final_reserve_tokens: int
     output_items: int
     limiting_factor: str
+    path: str = "sampled"
 
     def as_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
         return asdict(self)
+
+
+def chat_history_budget(budget: PromptBudget) -> int:
+    """At most 10% of safe input, bounded by the usable task budget as well.
+
+    Reserving 10% of a million-token window would otherwise reduce evidence
+    once the cumulative task ceiling binds. The cap meets that crossing point.
+    """
+    usable_task_input = max(0, math.floor(TASK_TOKEN_CEILING * .75) - budget.output_tokens)
+    return min(budget.input_tokens, usable_task_input) // 10
 
 
 def plan_context(
@@ -224,6 +239,22 @@ def plan_context(
     requested = {"chat": 3600, "summary": 8192, "quiz": 8192,
                  "flashcard": 8192, "podcast": 16_384}[kind]
     budget = prompt_budget(limits, requested, 128, 1.0)
+    if kind in {"summary", "chat"}:
+        # Hold output demand constant while evaluating the value of more input.
+        output = 1800 if kind == "chat" else structured_output_tokens(2200)
+        budget = prompt_budget(limits, output, 128, 1.0)
+        overhead = 4096 + (chat_history_budget(budget) if kind == "chat" else 0)
+        capacity = max(0, budget.input_tokens - overhead)
+        demand = material_tokens if material_tokens is not None else capacity
+        total = min(TASK_TOKEN_CEILING, max(24_000, math.ceil((min(demand, capacity) * 2 + budget.output_tokens * 4 + overhead) / .75)))
+        reserve = math.ceil(total * .25)
+        evidence = min(demand, capacity, max(0, total - reserve - overhead - budget.output_tokens))
+        direct = material_tokens is not None and evidence >= material_tokens
+        reason = "资料已可容纳" if direct else "任务累计预算" if evidence < min(demand, capacity) else "有效上下文与输出预算"
+        return ContextPlan(CONTEXT_STRATEGY_VERSION, kind, limits.effective_context_tokens,
+            budget.output_tokens, evidence, evidence, evidence // max(1, segment_tokens),
+            0, total, reserve, 6 if kind == "summary" else 1, reason,
+            "direct" if direct and kind == "summary" else "structured" if kind == "summary" else "query")
     # Reserve instructions, history, source labels and intermediate reasoning.
     batch = max(0, min(64_000, budget.input_tokens - 2048))
     per_item = {"chat": 450, "summary": 500, "quiz": 900, "flashcard": 500, "podcast": 500}[kind]
@@ -329,6 +360,7 @@ class ContextUsage:
     cached_tokens: int = 0
     accounted_tokens: int = 0
     reserved_tokens: int = 0
+    episode_audit_reserve_tokens: int = 0
     temperature_sources: dict[str, int] | None = None
     effective_temperatures: dict[str, int] | None = None
     request_limit: int | None = None
@@ -437,6 +469,7 @@ class ContextUsage:
             "cached_tokens": self.cached_tokens or None,
             "temperature_sources": self.temperature_sources or {},
             "effective_temperatures": self.effective_temperatures or {},
+            "episode_audit_reserve_tokens": self.episode_audit_reserve_tokens,
             "request_limit": self.request_limit,
             "total_token_limit": self.total_token_limit,
             "actual_total_tokens": self.actual_total_tokens or None,
@@ -459,4 +492,12 @@ def is_context_error(status: int | None, code: str, message: str) -> bool:
         return False
     return code.lower() in {"context_length_exceeded", "context_window_exceeded", "too_many_tokens"} or bool(
         CONTEXT_ERROR_PATTERN.search(message)
+    )
+
+
+def reserve_podcast_audit(trace: ContextUsage, limits: TokenLimits) -> None:
+    """Protect one final review inside the existing task and model limits."""
+    budget = prompt_budget(limits, 4096, 128, 1.0)
+    trace.episode_audit_reserve_tokens = min(
+        (trace.total_token_limit or 0) // 4, budget.input_tokens + budget.output_tokens
     )

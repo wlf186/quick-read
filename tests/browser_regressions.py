@@ -28,6 +28,7 @@ class Fixture:
         self.artifact = None
         self.messages = None
         self.provider = None
+        self.qualified_summary = False
         page.on("pageerror", lambda error: self.errors.append(str(error)))
         page.on("console", lambda message: self.console_errors.append(message.text) if message.type == "error" else None)
         page.route("**/auth/status", lambda route: route.fulfill(json={"required": False, "authenticated": True}))
@@ -65,6 +66,10 @@ class Fixture:
             from sandevistan_read.context_budget import TokenLimits, plan_context
             limits=TokenLimits.from_provider({"config":body["config"]})
             result={"strategy":"conservative","plans":[plan_context(limits,kind).as_dict() for kind in ('summary','chat','quiz','flashcard','podcast')],"saved_plans":[],"basis":"按每段约 1000 tokens 估算","assumptions":"预算上限不是质量保证。","candidate_segments":None,"material_tokens":None}
+            kinds = ('summary', 'chat', 'quiz', 'flashcard', 'podcast')
+            matched = self.qualified_summary and body['config'].get('context_window_tokens') == 30720
+            result['strategies'] = {kind: 'balanced' if matched and kind == 'summary' else 'conservative' for kind in kinds}
+            result['strategy_reasons'] = {kind: '当前 Provider、配置与功能已通过对照验收' if matched and kind == 'summary' else '当前 Provider、配置与功能尚无匹配的质量资格' for kind in kinds}
         elif path == "/settings/image-processing":
             result = {"mode": "process", "processors": ["ocr"]}
         elif path == "/status":
@@ -327,6 +332,7 @@ def run_context_regressions(browser: Browser) -> None:
         expect(panel.locator('tbody tr')).to_have_count(5)
         expect(panel).to_contain_text('当前使用保守策略')
         original=panel.locator('tbody tr').first.text_content()
+        expect(panel).to_contain_text('当前 Provider、配置与功能尚无匹配的质量资格')
         page.get_by_label('上下文窗口覆盖（tokens）').fill('1000000')
         page.get_by_label('最大输出覆盖（tokens）').fill('384000')
         expect(panel.locator('tbody tr').first).not_to_have_text(original)
@@ -334,11 +340,47 @@ def run_context_regressions(browser: Browser) -> None:
         page.get_by_label('上下文窗口覆盖（tokens）').fill('30720')
         page.get_by_label('最大输出覆盖（tokens）').fill('4096')
         expect(panel.locator('tbody tr').first).to_have_text(original)
+        fixture.qualified_summary = True
+        page.get_by_label('上下文窗口覆盖（tokens）').fill('30721')
+        page.get_by_label('上下文窗口覆盖（tokens）').fill('30720')
+        expect(panel.locator('tbody tr').first).to_contain_text('已通过对照验收')
+        expect(panel.locator('tbody tr').nth(1)).to_contain_text('尚无匹配的质量资格')
+        page.get_by_label('上下文窗口覆盖（tokens）').fill('30722')
+        expect(panel.locator('tbody tr').first).to_contain_text('尚无匹配的质量资格')
         assert_layout(page)
         panel.scroll_into_view_if_needed()
         page.screenshot(path=f'/tmp/quick-read-context-capacity-{width}.png')
         assert not fixture.errors and not fixture.console_errors
         assert not any(method=='PATCH' for method,_,_ in fixture.requests)
+        context.close()
+
+
+def run_summary_coverage_regressions(browser: Browser) -> None:
+    for width in (1440, 390):
+        context = browser.new_context(viewport={'width': width, 'height': 900})
+        page = context.new_page()
+        fixture = Fixture(page)
+        coverage = {'candidate_segments': 100, 'selected_segments': 30, 'sent_segments': 20,
+                    'partially_sent_segments': 0, 'cited_segments': 3,
+                    'plan': {'total_token_limit': 300000, 'evidence_tokens': 20000, 'limiting_factor': '任务累计预算'},
+                    'stages': {'context_prepare': {'sent_segments': 20}, 'summary': {'sent_segments': 10}},
+                    'audit': {'supported': 3, 'unsupported': 1, 'unreviewed': 2}}
+        fixture.artifact = {'id': 'cards', 'type': 'summary', 'title': '核验摘要', 'status': 'partial',
+                            'citations': [], 'payload': {'content': '已保留原文支持的要点。',
+                                                        'context_usage': {'coverage': coverage}}}
+        page.goto(BASE_URL)
+        if width < 600:
+            page.locator('.workspace-tabs button').filter(has_text='Studio').click()
+        page.locator('.artifact').filter(has_text='核验摘要').click()
+        drawer = page.get_by_role('dialog', name='核验摘要')
+        drawer.locator('.coverage-details > summary').click()
+        expect(drawer).to_contain_text('预读 20 段 · 最终生成 10 段')
+        expect(drawer).to_contain_text('模型核验支持 3 项 · 不支持 1 项 · 未完成 2 项')
+        assert_layout(page)
+        page.screenshot(path=f'/tmp/quick-read-summary-coverage-{width}.png')
+        page.keyboard.press('Escape')
+        expect(drawer).not_to_be_visible()
+        assert not fixture.errors and not fixture.console_errors
         context.close()
 
 
@@ -376,6 +418,43 @@ if __name__ == "__main__":
         run_core_regressions(browser)
         run_generation_regressions(browser)
         run_context_regressions(browser)
+        run_summary_coverage_regressions(browser)
         run_import_regressions(browser)
         browser.close()
     print("Core UI regressions passed")
+
+
+def run_delivery_regressions(browser: Browser) -> None:
+    """Mocked responses only: expand rating details and inspect a script-only artifact."""
+    for width, review_status in [(w, status) for w in (1440,390) for status in (None,"complete","partial","unavailable")]:
+        context = browser.new_context(viewport={'width': width, 'height': 900})
+        page = context.new_page()
+        fixture = Fixture(page)
+        quality = {'level':'needs_review','reviewed_units':1,'total_units':2,
+                   'issues':[{'unit':'turn_1','code':'evidence_unconfirmed','message':'该轮原文支持待核实。'}]}
+        fixture.messages = [{'role':'assistant','content':'保留原始回答。','metadata':{'quality_assessment':quality,'delivery_status':'full'}}]
+        fixture.artifact = {'id':'cards','type':'podcast','title':'仅脚本示例','status':'partial','citations':[],
+            'payload':{'version':4,'delivery_status':'script_only','quality_assessment':quality,'duration':{'target_minutes':5},
+                       'turns':[{'id':'turn_1','speaker':'HOST_A','text':'这是保留的脚本。','quality_issues':quality['issues']}],'chapters':[]}}
+        if review_status:
+            fixture.artifact['payload']['quality_report'] = {'episode_audit': {'status':review_status,'coverage_mode':'sampled' if review_status!='complete' else 'full','checked_transitions':2 if review_status=='complete' else 1 if review_status=='partial' else 0,'total_transitions':2,'reviewed_transitions':[]}}
+        page.goto(BASE_URL)
+        rating = page.locator('.messages details').filter(has_text='质量：待核实')
+        rating.locator('summary').focus()
+        page.keyboard.press('Enter')
+        expect(rating).to_contain_text('自动检查 1 / 2 项')
+        if width < 600:
+            page.locator('.workspace-tabs button').filter(has_text='Studio').click()
+        page.locator('.artifact').filter(has_text='仅脚本示例').click()
+        drawer = page.get_by_role('dialog', name='仅脚本示例')
+        expect(drawer).to_contain_text('质量：待核实 · 仅脚本')
+        expect(drawer.locator('audio')).to_have_count(0)
+        expect(drawer.get_by_label('播客连贯性检查')).to_contain_text({'complete':'连贯性检查已完成','partial':'连贯性已部分检查'}.get(review_status,'连贯性未验证'))
+        expect(drawer).to_contain_text('这是保留的脚本。')
+        expect(drawer).to_contain_text('该轮原文支持待核实。')
+        assert_layout(page)
+        page.screenshot(path=f'/tmp/quick-read-coherence-{review_status or "legacy"}-{width}.png')
+        page.keyboard.press('Escape')
+        expect(drawer).not_to_be_visible()
+        assert not fixture.errors and not fixture.console_errors
+        context.close()

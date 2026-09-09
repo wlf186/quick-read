@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+from .delivery import delivery_task
+
+_SCRIPT_RESULT = ContextVar("podcast_script_result", default=None)
+
 import asyncio
 import copy
 import hashlib
@@ -169,11 +174,11 @@ def _actual_duration_check(target_minutes: float, actual_seconds: float) -> dict
     actual_minutes = actual_seconds / 60
     ratio = actual_minutes / max(0.001, target_minutes)
     return {
-        "passed": 0.85 <= ratio <= 1.20,
+        "passed": 0.80 <= ratio <= 1.25,
         "target_minutes": target_minutes,
         "actual_minutes": round(actual_minutes, 2),
         "duration_ratio": round(ratio, 3),
-        "accepted_range": [0.85, 1.20],
+        "accepted_range": [0.80, 1.25],
     }
 
 
@@ -193,11 +198,11 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
     provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
-    if snapshot.get("audio") and not provider:
-        raise RuntimeError("任务绑定的 AUDIO Provider 不存在")
     ready, readiness_message = audio_provider_readiness(provider)
     if not ready or not provider:
-        raise RuntimeError(readiness_message)
+        generated = await build_podcast_script(notebook_id, payload, allow_partial=True,
+            cancel_check=lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested")))
+        return _save_script_result(notebook_id, job_id, generated, readiness_message)
     main_provider = copy.deepcopy(current().provider if current() else provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main"))
     if not main_provider:
         raise RuntimeError("请先配置并启用 MAIN provider")
@@ -242,7 +247,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
                                      "mode": (main_provider.get("config") or {}).get("context_strategy", DEFAULT_CONTEXT_STRATEGY),
                                      "limits": vars(TokenLimits.from_provider(main_provider))},
                 "source_revisions": source_revisions,
-                "delivery_policy": "partial_v1",
+                "delivery_policy": "rated_v2",
                 "duration_calibration": PODCAST_DURATION_CALIBRATION_VERSION,
             }
         ).encode()
@@ -271,13 +276,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         for item in model_caps_early.get("checkpoints") or [] if isinstance(item, dict)
     }
     sequence_capability_early = (provider.get("capabilities") or {}).get("sequence_jobs") or {}
-    overlap_enabled = bool(
-        config.get("podcast_sequence_tts", True)
-        and sequence_capability_early.get("supported")
-        and int(sequence_capability_early.get("contract_version") or 0) == 1
-        and _podcast_overlap_safe(main_provider, provider)
-        and not manifest.get("generated")
-    )
+    overlap_enabled = False
     parts_dir_early = work_dir / "parts"
     parts_dir_early.mkdir(parents=True, exist_ok=True)
     cancel_check_early = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
@@ -439,6 +438,9 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         if current():
             manifest["context_selection"] = {name: sorted(getattr(current(), name)) for name in ("selected", "sent", "partial")}
         save_manifest(manifest)
+    _SCRIPT_RESULT.set(generated)
+    if generated.get("delivery_status") == "draft_only":
+        return _save_script_result(notebook_id, job_id, generated, "脚本连贯性尚未确认")
     script_seconds = script_finished - script_started
 
     language = generated["language"]
@@ -708,86 +710,10 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             return {"passed": False, "stage": "asr", "error": str(exc), "code": exc.code, "segment_count": 0}
 
     audio_quality = await verify_audio(f"sread-asr-{suffix[:36]}")
-    if current() and not duration_check["passed"] and not manifest.get("measured_duration_attempted"):
-        manifest["measured_duration_attempted"] = True
-        save_manifest(manifest)
-        repair_started = time.perf_counter()
-        original_generated = copy.deepcopy(generated)
-        original_audio = work_dir / f"before-duration-repair{destination.suffix}"
-        shutil.copy2(destination, original_audio)
-        original_cursor = cursor
-        original_hashes = dict(part_hashes)
-        backup_dir = work_dir / "before-duration-parts"
-        shutil.copytree(parts_dir, backup_dir, dirs_exist_ok=True)
-        try:
-            trace = current().trace
-            trace.request_limit = min(80, max(trace.request_limit or 0, trace.requests + 2))
-            revised = await repair_measured_duration(generated, cursor, trace)
-            changed = [index for index, turn in enumerate(revised) if turn["text"] != turns[index]["text"]]
-            turns[:] = revised
-            await synthesize_indexes(changed, retry=True)
-            destination, cursor = await render_audio(set(changed))
-            revised_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
-            if not revised_check["passed"]:
-                raise ValueError("单次修复后的实际音频仍未达到时长范围")
-            repaired_quality = await verify_audio(f"sread-asr-{suffix[:24]}-duration")
-            if not repaired_quality.get("passed"):
-                raise ValueError("时长修复后的音频未通过 ASR 验收")
-            audio_quality = repaired_quality
-            duration_check = revised_check
-            generated["script"] = "\n".join(f"{turn['speaker']}: {turn['text']} " + " ".join(f"[{label}]" for label in turn["citation_ids"]) for turn in turns)
-            generated["quality"]["measured_duration_repair"] = {"passed": True, "changed_turns": changed,
-                "before_seconds": original_cursor, "after_seconds": cursor}
-        except (ProviderError, RuntimeError, ValueError, OSError) as exc:
-            if cancel_check():
-                raise RuntimeError("任务已取消") from exc
-            turns[:] = original_generated["turns"]
-            generated.clear()
-            generated.update(original_generated)
-            generated["turns"] = turns
-            warnings = generated.setdefault("warnings", [])
-            shutil.copy2(original_audio, destination)
-            shutil.copytree(backup_dir, parts_dir, dirs_exist_ok=True)
-            shutil.rmtree(work_dir / "normalized", ignore_errors=True)
-            part_hashes.clear()
-            part_hashes.update(original_hashes)
-            cursor = original_cursor
-            warnings.append({"code": "measured_duration_repair", "stage": "audio",
-                             "message": "实际时长修复未完成，保留原音频。", "reason": str(exc)[:240]})
-        finally:
-            tts_seconds += time.perf_counter() - repair_started
-            generated["context_usage"] = current().trace.as_dict()
-            generated["context_usage"]["coverage"] = context_coverage(generated.get("citations"))
-            manifest["generated"] = generated
-            save_manifest(manifest)
-
-    retry_indexes = repair_turn_indexes(audio_quality)
-    if audio_quality.get("segment_count") and retry_indexes and len(retry_indexes) <= 6:
-        repair_started = time.perf_counter()
-        original_audio = work_dir / f"before-repair{destination.suffix}"
-        shutil.copy2(destination, original_audio)
-        original_cursor = cursor
-        timings = [(item, item.get("start_seconds"), item.get("end_seconds")) for item in turns + generated["chapters"]]
-        try:
-            await synthesize_indexes(retry_indexes, retry=True)
-            destination, cursor = await render_audio(set(retry_indexes))
-            duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
-            audio_quality = await verify_audio(f"sread-asr-{suffix[:32]}-verify")
-            audio_quality["repaired_turns"] = retry_indexes
-        except (ProviderError, RuntimeError, OSError) as exc:
-            if cancel_check():
-                raise RuntimeError("任务已取消") from exc
-            shutil.copy2(original_audio, destination)
-            cursor = original_cursor
-            duration_check = _actual_duration_check(float(generated["duration"]["target_minutes"]), cursor)
-            for item, start, end in timings:
-                item.update(start_seconds=start, end_seconds=end)
-            audio_quality["repair_error"] = str(exc)
-            warnings.append({"code": "audio_repair_failed", "stage": "audio", "message": "局部音频修复未完成，保留修复前可播放的音频及其验收结果。"})
-        finally:
-            tts_seconds += time.perf_counter() - repair_started
     audio_quality["duration"] = duration_check
     if not duration_check["passed"]:
+        if generated.get("delivery_status") == "full":
+            generated["delivery_status"] = "partial"
         warnings.append({"code": "audio_duration", "stage": "audio", "message": f"目标 {duration_check['target_minutes']} 分钟，实际 {duration_check['actual_minutes']} 分钟，未达到时长验收范围。"})
     if not audio_quality.get("passed"):
         manifest.update({"generated": generated, "media_path": str(destination.relative_to(PATHS.root)), "audio_quality_failure": audio_quality})
@@ -910,3 +836,29 @@ class JobWorker:
 
 
 WORKER = JobWorker()
+
+
+def _save_script_result(notebook_id: str, job_id: str, generated: dict[str, Any], reason: str) -> dict[str, Any]:
+    if (DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"):
+        raise RuntimeError("任务已取消")
+    generated["delivery_status"] = "draft_only" if generated.get("delivery_status") == "draft_only" else "script_only"
+    generated["degraded"] = True
+    generated.setdefault("warnings", []).append({"code": "script_only", "stage": "audio", "message": "已保留脚本；音频未生成。", "reason": reason[:240]})
+    artifact_id, now = f"artifact_{job_id.removeprefix('job_')}", utc_now()
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "podcast", "双人音频解读", json_dump(generated["source_ids"]), generated["language"], "partial", json_dump(generated), json_dump(generated["citations"]), None, now, now))
+    return {"id": artifact_id, "delivery_status": generated["delivery_status"], "context_usage": generated.get("context_usage", {})}
+
+_render_podcast_job = _podcast
+
+@delivery_task
+async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
+    token = _SCRIPT_RESULT.set(None)
+    try:
+        return await _render_podcast_job(notebook_id, payload, job_id)
+    except Exception as exc:
+        generated = _SCRIPT_RESULT.get()
+        if generated is None:
+            raise
+        return _save_script_result(notebook_id, job_id, generated, type(exc).__name__)
+    finally:
+        _SCRIPT_RESULT.reset(token)

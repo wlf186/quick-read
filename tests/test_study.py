@@ -119,7 +119,7 @@ async def test_lite_quiz_generation_uses_model_items_without_template_fillers(tm
     monkeypatch.setattr(study, "budgeted_chat", fake_chat)
     monkeypatch.setattr(study, "_semantic_unique", lambda candidate, accepted, kind: True)
     result = await generate_study_artifact("n1", "quiz", 3, ["s1"], "zh-CN", "medium")
-    assert result["status"] == "ready"
+    assert result["status"] == "partial"  # Mock returns malformed audit; playable output survives.
     assert len(result["payload"]["items"]) == 3
     assert all("直接出现在" not in item["question"] for item in result["payload"]["items"])
     assert [item["answer_index"] for item in result["payload"]["items"]] == [0, 1, 2]
@@ -168,10 +168,10 @@ async def test_full_generation_keeps_one_recovery_after_candidate_round_limit(tm
 
     monkeypatch.setattr(study, "budgeted_chat", fake_chat)
     result = await generate_study_artifact("n1", "quiz", 3, ["s1"], "zh-CN", "medium")
-    assert result["status"] == "ready"
-    assert generated_calls == 4
-    assert audit_calls == 2
-    assert result["payload"]["quality_report"]["stop_reason"] == "recovery_completed"
+    assert result["status"] == "partial"
+    assert generated_calls == 1
+    assert audit_calls == 1
+    assert result["payload"]["quality_report"]["stop_reason"] == "partial_delivery"
 
 
 def _study_database(tmp_path) -> Database:
@@ -321,7 +321,7 @@ async def test_duplicate_only_rounds_do_not_trip_consecutive_zero_stop(tmp_path,
         return BudgetedCompletion(content, build, budget)
 
     monkeypatch.setattr(study, "budgeted_chat", fake_chat)
-    with pytest.raises(ValueError, match="通过证据校验"):
-        await generate_study_artifact("n1", "flashcard", 10, ["s1"], "zh-CN", "medium")
-    # 每轮都有通过校验的候选（只是被判重复），不应触发连续零产出提前停止：lite 档 10+6 轮全部跑完
-    assert calls == 16
+    result = await generate_study_artifact("n1", "flashcard", 10, ["s1"], "zh-CN", "medium")
+    assert len(result["payload"]["items"]) == 10
+    assert calls == 11  # Ten necessary batches and one audit, no refill loop.
+    assert result["payload"]["quality_assessment"]["issues"]

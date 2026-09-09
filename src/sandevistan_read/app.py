@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -295,7 +296,7 @@ async def ask(notebook_id: str, body: ChatRequest):
     )
     result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language, conversation_id=conversation_id)
     context_usage = result.pop("context_usage", {})
-    metadata = {"context_usage": context_usage, "degraded": result.get("degraded", False), "warnings": result.get("warnings", [])}
+    metadata = {"quality_assessment": result.get("quality_assessment"), "delivery_status": result.get("delivery_status"), "context_usage": context_usage, "degraded": result.get("degraded", False), "warnings": result.get("warnings", [])}
     message_id = new_id("message")
     DB.execute(
         """INSERT INTO messages
@@ -321,7 +322,16 @@ def summary(notebook_id: str, body: SummaryRequest): _require_notebook(notebook_
 
 @api.get("/notebooks/{notebook_id}/summary")
 def latest_summary(notebook_id: str):
-    row = DB.fetchone("SELECT * FROM summaries WHERE notebook_id=? ORDER BY created_at DESC LIMIT 1", (notebook_id,)); return normalize(row) if row else None
+    row = DB.fetchone("SELECT * FROM summaries WHERE notebook_id=? ORDER BY created_at DESC LIMIT 1", (notebook_id,))
+    if not row:
+        return None
+    result = normalize(row)
+    artifact = DB.fetchone("SELECT payload_json FROM artifacts WHERE notebook_id=? AND type='summary' AND created_at=? ORDER BY id DESC LIMIT 1", (notebook_id, row["created_at"]))
+    payload = json_load(artifact["payload_json"], {}) if artifact else {}
+    for field in ("quality_assessment", "delivery_status", "warnings", "degraded", "context_usage"):
+        if field in payload:
+            result[field] = payload[field]
+    return result
 
 
 @api.post("/notebooks/{notebook_id}/quiz")
@@ -345,7 +355,14 @@ def podcast(notebook_id: str, body: PodcastRequest):
 def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     rows = DB.fetchall("SELECT * FROM artifacts WHERE notebook_id=? AND (? IS NULL OR type=?) ORDER BY created_at DESC", (notebook_id, type, type))
     if view == "summary":
-        return [{key: row.get(key) for key in ("id", "notebook_id", "type", "title", "language", "status", "created_at", "updated_at")} | {"payload": {}, "citations": []} for row in rows]
+        output = []
+        for row in rows:
+            payload = json_load(row.get("payload_json"), {})
+            quality = payload.get("quality_assessment")
+            # List metadata never carries Quiz answer-related issue text.
+            public_quality = {**quality, "issues": []} if isinstance(quality, dict) else None
+            output.append({key: row.get(key) for key in ("id", "notebook_id", "type", "title", "language", "status", "created_at", "updated_at")} | {"payload": {"quality_assessment": public_quality, "delivery_status": payload.get("delivery_status")}, "citations": []})
+        return output
     output = [normalize(row) for row in rows]
     for item in output:
         if item.get("media_path"):
@@ -680,7 +697,11 @@ def context_preview(body: ContextPreviewRequest):
     if body.provider_id and not stored:
         raise HTTPException(404, "Provider 不存在")
     known = stored.get("capabilities", {}).get("token_limits", {}) if stored and stored.get("model") == body.model else body.token_limits
-    candidate = {"config": body.config, "capabilities": {"token_limits": known}}
+    from .context_qualification import strategy_reason
+    from .generation_context import evidence_cost
+    from .retrieval import context_candidates
+    candidate = {**(stored or {}), "model": body.model, "config": body.config,
+                 "capabilities": {**((stored or {}).get("capabilities") or {}), "token_limits": known}}
     limits = TokenLimits.from_provider(candidate)
     manual_context = positive_int(body.config.get("context_window_tokens"))
     manual_output = positive_int(body.config.get("max_output_tokens"))
@@ -689,24 +710,36 @@ def context_preview(body: ContextPreviewRequest):
     if manual_output and manual_output >= limits.effective_context_tokens:
         raise HTTPException(422, "人工最大输出必须小于有效上下文窗口")
     total, average, segments = None, 1000, None
+    rows = None
     if body.notebook_id:
         _require_notebook(body.notebook_id)
         sources = DB.fetchall("SELECT id,selected FROM sources WHERE notebook_id=? AND state='ready'", (body.notebook_id,))
         ids = [source["id"] for source in sources if source["id"] in body.source_ids] if body.source_ids is not None else [source["id"] for source in sources if source["selected"]]
         if ids:
             marks = ",".join("?" for _ in ids)
-            rows = DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks})", tuple(ids))
-            costs = [estimate_text_tokens(row["content"]) + 80 for row in rows if is_quality_chunk(row)]
+            rows = DB.fetchall(f"SELECT c.id,c.source_id,c.ordinal,c.content,c.locator_json,s.filename FROM chunks c JOIN sources s ON s.id=c.source_id WHERE c.source_id IN ({marks})", tuple(ids))
+            costs = [evidence_cost(row) for row in context_candidates(rows)]
         else:
+            rows = []
             costs = []
         segments, total = len(costs), sum(costs)
         average = max(1, (total + max(1, segments) - 1) // max(1, segments))
     def plans(provider_limits):
-        return [plan_context(provider_limits, kind, material_tokens=total, segment_tokens=average,
-                             count=20 if kind == "flashcard" else 10, minutes=20).as_dict()
-                for kind in ("summary", "chat", "quiz", "flashcard", "podcast")]
+        result = []
+        for kind in ("summary", "chat", "quiz", "flashcard", "podcast"):
+            eligible = None if rows is None else context_candidates(rows) if kind in {"summary", "chat"} else [row for row in rows if is_quality_chunk(row)]
+            costs = None if eligible is None else [evidence_cost(row) if kind in {"summary", "chat"} else estimate_text_tokens(row["content"]) + 80 for row in eligible]
+            size = sum(costs) if costs is not None else None
+            mean = max(1, math.ceil(size / max(1, len(costs)))) if costs is not None else 1000
+            plan = plan_context(provider_limits, kind, material_tokens=size, segment_tokens=mean,
+                                count=20 if kind == "flashcard" else 10, minutes=20).as_dict()
+            if costs is not None and kind in {"summary", "chat"}:
+                plan["estimated_segments"] = len(costs) if sum(costs) <= plan["evidence_tokens"] else plan["estimated_segments"]
+            result.append(plan)
+        return result
     return {"strategy": body.config.get("context_strategy", DEFAULT_CONTEXT_STRATEGY),
             "strategies": {kind: context_strategy(candidate, kind) for kind in ("summary", "chat", "quiz", "flashcard", "podcast")},
+            "strategy_reasons": {kind: strategy_reason(candidate, kind) for kind in ("summary", "chat", "quiz", "flashcard", "podcast")},
             "plans": plans(limits), "saved_plans": plans(TokenLimits.from_provider(stored)) if stored and stored.get("model") == body.model else [],
             "basis": "当前选中资料的实际片段长度（含定位估算）" if total is not None else "按每段约 1000 tokens 估算",
             "candidate_segments": segments, "material_tokens": total,

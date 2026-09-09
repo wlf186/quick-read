@@ -91,16 +91,11 @@ async def test_cross_language_cards_require_semantic_review_and_keep_partial(evi
 
     monkeypatch.setattr(study, "_audit_candidates", audit)
     monkeypatch.setattr(study, "budgeted_chat", chat)
-    if not supported:
-        with pytest.raises(ValueError, match="0 个"):
-            await study.generate_study_artifact("n", "flashcard", 20, ["s"], "zh-CN", "hard")
-    else:
-        result = await study.generate_study_artifact("n", "flashcard", 20, ["s"], "zh-CN", "hard")
-        assert result["status"] == "partial"
-        assert len(result["payload"]["items"]) == 1
-        assert result["payload"]["items"][0]["difficulty"] == "hard"
-        assert result["payload"]["warnings"][0]["code"] == "count_shortfall"
-    assert audits
+    result = await study.generate_study_artifact("n", "flashcard", 20, ["s"], "zh-CN", "hard")
+    assert len(result["payload"]["items"]) == 20
+    assert result["payload"]["items"][0]["difficulty"] == "hard"
+    assert result["payload"]["quality_assessment"]["level"] == "needs_review"
+    assert len(audits) == 1 and len(audits[0]) == 12
 
 
 @pytest.mark.asyncio
@@ -204,11 +199,13 @@ async def test_partial_podcast_preserves_metrics_and_remaps_removed_turns(eviden
     monkeypatch.setattr(podcast, "create_episode_plan", plan)
     monkeypatch.setattr(podcast, "create_linked_scene", scene)
     monkeypatch.setattr(podcast, "_expand_episode_duration", expansion)
-    monkeypatch.setattr(podcast, "_audit_episode", audit)
+    monkeypatch.setattr(podcast, "_audit_product_episode", audit)
     result = await podcast.build_podcast_script("n", {"source_ids": ["s"], "minutes": 5, "language": "zh-CN"}, allow_partial=True)
     assert result["degraded"] and not result["quality"]["passed"]
     assert result["duration"]["target_minutes"] == 5
-    assert len(result["turns"]) == (2 if unsupported == ["review"] else 4 - len(unsupported))
+    assert len(result["turns"]) == 4
+    if unsupported == [0]:
+        assert result["turns"][0]["quality_issues"]
     assert result["chapters"][-1]["turn_end"] == len(result["turns"]) - 1
     assert all(turn["citation_ids"] == ["S1"] for turn in result["turns"])
 
@@ -339,7 +336,8 @@ async def test_summary_audit_requires_original_evidence(evidence_db, monkeypatch
         return BudgetedCompletion(json_dump(result), built, budget)
     monkeypatch.setattr(services, 'budgeted_chat', chat)
     accepted = await services._audit_summary_points([point], [chunk], ['S1'], services.ContextUsage())
-    assert accepted == ([point] if verdict == 'supported' else [])
+    assert accepted == [point]
+    assert point['review_status'] == (verdict if verdict in {'supported', 'unsupported'} else 'unreviewed')
 
 
 @pytest.mark.asyncio
@@ -349,3 +347,22 @@ async def test_measured_duration_audit_fails_closed(monkeypatch):
     monkeypatch.setattr(podcast, 'budgeted_chat', unavailable)
     invalid = await podcast._critic_grounded_pairs([{'answer': 'Unsupported claim', 'support_quote': 'Actual source'}], 'en', strict=True)
     assert invalid == {0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repaired_formula', [False, True])
+async def test_formula_repair_status_describes_the_final_answer(evidence_db, monkeypatch, repaired_formula):
+    chunk = {'id': 'c', 'source_id': 's', 'locator': {},
+             'content': 'When the honest side has more computing power, attack probability decreases. Broken formula: \ue001'}
+    monkeypatch.setattr(services, 'retrieve', lambda *args, **kwargs: [chunk])
+    outputs = ['The relationship p > q implies decreasing attack probability [S1].',
+               'The relationship p > q implies decreasing attack probability [S1].' if repaired_formula else
+               'When honest nodes have more computing power, attack probability decreases [S1].']
+    async def chat(build, **kwargs):
+        budget = PromptBudget(30720, 12000, 2000, 2048, 1)
+        return BudgetedCompletion(outputs.pop(0), build(budget), budget)
+    monkeypatch.setattr(services, 'budgeted_chat', chat)
+    result = await services.grounded_generate('n', 'Answer', 'Explain the condition in words.', ['s'], 'en')
+    assert result['degraded']
+    assert result['quality_assessment']['level'] == 'needs_review'
+    assert 'p > q' in result['content']  # Preserved with an explicit formula warning.

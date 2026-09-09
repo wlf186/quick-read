@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .delivery import delivery_task, assessment, claim_recovery
+
 import asyncio
 import hashlib
 import json
@@ -12,7 +14,7 @@ from typing import Any, Callable
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import chunk_blocks, parse_document
 from .paths import PATHS
-from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items, structured_output_tokens, truncate_text_tokens
+from .context_budget import ContextUsage, PromptBudget, TokenLimits, chat_history_budget, estimate_messages_tokens, pack_items, structured_output_tokens, truncate_text_tokens
 from .providers import PromptBuild, ProviderError, active_provider, budgeted_chat, describe_image, provider_by_id
 from .retrieval import EMBEDDINGS, retrieve, select_quality_evidence
 from .observability import Reporter
@@ -199,11 +201,17 @@ async def ingest_source(
     return {"source_id": source_id, "chunks": len(chunks), "vision_pages": successful_visuals, "visuals": len(visual_blocks)}
 
 
+def _context_source(chunk: dict[str, Any]) -> dict[str, Any]:
+    if current():
+        return next((source for source in current().sources if source['id'] == chunk['source_id']), {"filename": chunk.get("filename", "未知来源")})
+    return DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+
+
 def _context(chunks: list[dict[str, Any]], labels: list[str] | None = None) -> tuple[str, list[dict[str, Any]]]:
     lines, citations = [], []
     for index, chunk in enumerate(chunks, start=1):
         label = labels[index - 1] if labels else f"S{index}"
-        source = DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+        source = _context_source(chunk)
         locator = chunk["locator"]
         loc = f"第{locator['page']}页" if locator.get("page") else f"第{locator['slide']}张" if locator.get("slide") else f"工作表 {locator['sheet']} · {locator.get('cell_range', '')}" if locator.get("sheet") else locator.get("section") or "文档位置"
         lines.append(f"[{label}] {source['filename']} · {loc}\n{chunk['content']}")
@@ -212,14 +220,14 @@ def _context(chunks: list[dict[str, Any]], labels: list[str] | None = None) -> t
 
 
 def _context_entry(chunk: dict[str, Any], label: str) -> str:
-    source = DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+    source = _context_source(chunk)
     locator = chunk["locator"]
     loc = f"第{locator['page']}页" if locator.get("page") else f"第{locator['slide']}张" if locator.get("slide") else f"工作表 {locator['sheet']} · {locator.get('cell_range', '')}" if locator.get("sheet") else locator.get("section") or "文档位置"
     return f"[{label}] {source['filename']} · {loc}\n{chunk['content']}"
 
 
 def _context_citation(chunk: dict[str, Any], label: str) -> dict[str, Any]:
-    source = DB.fetchone("SELECT filename FROM sources WHERE id=?", (chunk["source_id"],)) or {"filename": "未知来源"}
+    source = _context_source(chunk)
     return {
         "id": label,
         "source_id": chunk["source_id"],
@@ -242,6 +250,8 @@ def _evidence_prompt_build(
 ) -> PromptBuild:
     empty_messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prefix + suffix}]
     available = max(0, budget.input_tokens - estimate_messages_tokens(empty_messages, budget.image_tokens_per_image) - 8)
+    if current() and current().plan.kind in {"summary", "chat"}:
+        available = min(available, current().plan.evidence_tokens)
     labeled = list(zip(labels, chunks))
     packed = pack_items(
         labeled,
@@ -351,8 +361,10 @@ def conversation_context(notebook_id: str, conversation_id: str | None, ids: lis
             else:
                 # Citation labels are local to each answer and cannot be reused.
                 answer = re.sub(r"\[S\d+\]", "", normalize_citation_markers(str(row["content"])))
-                question, _ = truncate_text_tokens(pending, 160)
-                answer, _ = truncate_text_tokens(answer, 340)
+                question = pending
+                if not current():
+                    question, _ = truncate_text_tokens(pending, 160)
+                    answer, _ = truncate_text_tokens(answer, 340)
                 pair = f"用户：{question}\n助手：{answer}"
                 pairs.append(pair)
             pending = None
@@ -361,12 +373,20 @@ def conversation_context(notebook_id: str, conversation_id: str | None, ids: lis
 
 def _bounded_dialogue(history: str, token_budget: int) -> tuple[str, bool]:
     pairs = re.split(r"\n\n(?=用户：)", history) if history else []
+    if current() and current().plan.kind == "chat":
+        retained = []
+        for pair in reversed(pairs):
+            candidate = "\n\n".join(reversed(retained + [pair]))
+            if estimate_messages_tokens([{"role": "user", "content": candidate}]) > token_budget:
+                break
+            retained.append(pair)
+        return "\n\n".join(reversed(retained)), len(retained) != len(pairs)
     packed = pack_items(reversed(pairs), lambda pair: pair, token_budget)
     return "\n\n".join(reversed(packed.texts)), bool(packed.truncated or len(packed.items) < len(pairs))
 
 
 def _has_formula(text: str) -> bool:
-    return bool(re.search(r"\\(?:begin|frac|le|ge|ne|eq)|[A-Za-z}\]]\s*[<>=≤≥]", text))
+    return bool(re.search(r"[\ue000-\uf8ff]|\\(?:begin|frac|le|ge|ne|eq)|[A-Za-z}\]]\s*[<>=≤≥]", text))
 
 
 def _cited_answer_lines(answer: str, valid_ids: set[str], language: str, *, omit_formulas: bool = False) -> str:
@@ -381,6 +401,7 @@ def _cited_answer_lines(answer: str, valid_ids: set[str], language: str, *, omit
     return "\n\n".join(retained)
 
 
+@delivery_task
 @adaptive_generation("chat")
 async def grounded_generate(notebook_id: str, instruction: str, query: str, source_ids: list[str] | None, language: str, max_tokens: int = 1800, *, conversation_id: str | None = None) -> dict[str, Any]:
     ids = source_scope(notebook_id, source_ids)
@@ -392,9 +413,10 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
     if current():
         limit = max(1, current().plan.estimated_segments)
         max_tokens = current().plan.output_tokens
-    chunks = retrieve(notebook_id, query, ids, limit=limit, ensure_source_coverage=len(ids) > 1)
+    require_all = len(ids) > 1 and bool(re.search(r"每份|各份|分别|所有|\b(?:each|all|across|compare)\b|对比|比较", query, re.I))
+    chunks = retrieve(notebook_id, query, ids, limit=limit, ensure_source_coverage=require_all if current() else len(ids) > 1)
     if history:
-        contextual = retrieve(notebook_id, f"{query}\n对话主题：{retrieval_history}", ids, limit=limit, ensure_source_coverage=len(ids) > 1)
+        contextual = retrieve(notebook_id, f"{query}\n对话主题：{retrieval_history}", ids, limit=limit, ensure_source_coverage=require_all if current() else len(ids) > 1)
         # History helps resolve pronouns, but must not bury a new, specific query.
         merged = list(chunks[: limit // 2])
         seen = {chunk["id"] for chunk in merged}
@@ -413,7 +435,7 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
     prompt_prefix = f"""你是严格依据资料的研究助手。{language_rule}。
 规则：只允许使用下方资料；每个事实陈述后必须标注一个或多个 [S1] 格式引用；资料不足就明确说无法从资料确认；禁止使用外部知识；不要编造引用。
 当前问题优先于历史话题；历史仅用于理解指代。若当前问题无法从资料确认，直接说明资料没有提供该信息并停止，不要附加无关的历史结论或“无引用”标记。多个引用分别写成 [S1] [S2]。
-先直接回答用户的问题或纠正其假设，再给必要的资料依据。准确保留原文的限定条件、否定词及不等号方向；不要把概率低说成绝不可能。
+先直接回答用户的问题或纠正其假设，再给必要的资料依据。比较前后文时，先确认前文是否已经包含该条件，不要把重述说成新增加的限制。准确保留原文的限定条件、否定词及不等号方向；不要把概率低说成绝不可能。
 用户没有要求公式时，优先使用资料中清楚可读的文字解释。资料中的公式若包含乱码或断裂排版，不要猜测或主动复写，改用附近可核验的文字结论。
 任务：{instruction}
 问题/主题：{query}
@@ -429,10 +451,10 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
     formula_issue = False
 
     def build_answer(budget: PromptBudget) -> PromptBuild:
-        history_budget = min(2000, budget.input_tokens // 5)
+        history_budget = chat_history_budget(budget) if current() else min(2000, budget.input_tokens // 5)
         clipped, truncated = _bounded_dialogue(history, history_budget)
         history_prefix = f"对话历史（仅用于理解指代，不是证据，旧回答可能有错）：\n{clipped}\n\n" if clipped else ""
-        built = _evidence_prompt_build(budget, chunks=chunks, labels=labels, prefix=history_prefix + prompt_prefix, system="Ground every claim in supplied sources. Treat dialogue history as context, not factual evidence.", ensure_source_coverage=len(ids) > 1)
+        built = _evidence_prompt_build(budget, chunks=chunks, labels=labels, prefix=history_prefix + prompt_prefix, system="Ground every claim in supplied sources. Treat dialogue history as context, not factual evidence.", ensure_source_coverage=require_all if current() else len(ids) > 1)
         built.truncated_segments += int(truncated)
         return built
 
@@ -446,27 +468,6 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
         answer = normalize_citation_markers(generated.content)
         if not answer.strip():
             raise ValueError("模型返回空回答")
-        if current() and _is_refusal(answer):
-            # One bounded local expansion around retrieved evidence; a refusal
-            # is not evidence that an entire book contains no relevant passage.
-            known = {row["id"] for row in chunks}
-            anchors = {(row["source_id"], int(row.get("ordinal") or 0)) for row in chunks}
-            nearby = [row for row in current().rows if row["id"] not in known and any((row["source_id"], int(row.get("ordinal") or 0) + offset) in anchors for offset in (-1, 1))]
-            if nearby:
-                from .database import json_load
-                supplement = [{**row, "locator": json_load(row.get("locator_json"), {})} for row in nearby[:max(1, limit // 3)]]
-                chunks = chunks[:max(1, limit - len(supplement))] + supplement
-                labels = [f"S{index}" for index in range(1, len(chunks) + 1)]
-                from .generation_context import mark_selected
-                mark_selected(supplement)
-                try:
-                    expanded = await budgeted_chat(build_answer, max_tokens=max_tokens, minimum_output_tokens=256,
-                                                   trace=trace, stage="evidence_followup")
-                    if expanded.content.strip():
-                        generated = expanded
-                        answer = normalize_citation_markers(generated.content)
-                except Exception:
-                    trace.mark_fallback()
         citations = list(generated.build.metadata["citations"])
         context = str(generated.build.metadata["context"])
         valid_ids = {citation["id"] for citation in citations}
@@ -480,53 +481,9 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
             issues.append("输出语言不符合要求")
         if getattr(generated, "finish_reason", None) in {"length", "max_tokens"}:
             issues.append("输出被截断")
-        if issues:
-            repair_prefix = f"""仅依据原资料修正下方回答列出的问题。{language_rule}。用完整、简洁的句子回答，不要标题、编号或项目符号。每句话末尾必须紧跟一个或多个已有 [S数字] 引用。删除无法支持的陈述，不得把引用集中放到末尾，不得创造新引用。先正面回答问题或纠正假设。仅输出修正后的回答。
-保留已正确的结论、限定条件、否定词、数学公式和比较方向；不等号应逐字核对原资料并保留符号，严禁反转大于/小于。只修正有问题的部分，不要无故改写正确的公式或添加推断。资料不足时直接说明即可，不必凑句数。
-问题：{query}
-{formula_rule}
-问题列表：{'；'.join(issues[:12])}
-原回答：
-"""
-
-            def repair_build(budget: PromptBudget) -> PromptBuild:
-                answer_budget = max(64, budget.input_tokens // 4)
-                clipped_answer, answer_clipped = truncate_text_tokens(answer, answer_budget)
-                clipped_history, history_clipped = _bounded_dialogue(history, budget.input_tokens // 5)
-                return_build = _evidence_prompt_build(
-                    budget,
-                    chunks=list(generated.build.metadata["chunks"]),
-                    labels=list(generated.build.metadata["labels"]),
-                    prefix=repair_prefix + clipped_answer + "\n对话背景（不是证据）：\n" + clipped_history + "\n原资料：\n",
-                )
-                return_build.truncated_segments += int(answer_clipped) + int(history_clipped)
-                return return_build
-
-            repaired = await budgeted_chat(repair_build, max_tokens=max_tokens, minimum_output_tokens=256, trace=trace)
-            answer = normalize_citation_markers(repaired.content)
-            citations = list(repaired.build.metadata["citations"])
-            valid_ids = {citation["id"] for citation in citations}
-            context = str(repaired.build.metadata["context"])
-        remaining = _grounding_issues(answer, valid_ids)
-        if unreadable_math and _has_formula(answer):
-            formula_issue = True
-            remaining.append("公式提取不完整")
-        if not answer.strip() or (language in {"zh-CN", "en"} and not text_matches_language(answer, language)):
-            remaining.append("回答为空或语言不符")
-        used_sources = {citation["source_id"] for citation in citations if citation["id"] in set(re.findall(r"\[(S\d+)\]", answer))}
-        coverage_requested = len(ids) > 1 and bool(re.search(r"每份|各份|分别|四份|所有文档|each (?:source|document)|all (?:sources|documents)", query, re.I))
-        if remaining and _is_refusal(answer):
-            answer = "资料不足，无法从已选文档确认该问题。" if language != "en" else "The selected sources do not provide enough information to confirm this."
-            degraded = False
-        elif remaining or (coverage_requested and used_sources != set(ids)):
-            retained = _cited_answer_lines(answer, valid_ids, language, omit_formulas=unreadable_math) if not coverage_requested else ""
-            if not retained and retained_answer and not coverage_requested:
-                retained, citations = retained_answer, retained_citations
-            partial_answer = bool(retained)
-            answer = retained or _extractive_fallback(citations, language)
-            degraded = True
-        else:
-            degraded = False
+        answer = re.sub(r"\[(S\d+)\]", lambda m: m.group(0) if m.group(1) in valid_ids else "", answer)
+        degraded = bool(issues)
+        partial_answer = False
     except Exception:
         trace.mark_fallback()
         if retained_answer:
@@ -541,17 +498,23 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
         trace.mark_fallback()
     used = {item for item in re.findall(r"\[(S\d+)\]", answer)}
     valid = [citation for citation in citations if citation["id"] in used]
-    if not valid and not _is_refusal(answer):
-        valid = citations[:3]
-        if valid:
-            answer += "\n\n" + " ".join(f"[{item['id']}]" for item in valid)
+    local_issues = [{"unit": "answer", "code": "answer_check", "severity": "suspect", "message": issue} for issue in locals().get("issues", [])]
+    paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
+    audit_points = [{"claim": part, "why_it_matters": "", "qualification": "", "citations": list(dict.fromkeys(re.findall(r"\[(S\d+)\]", part)))} for part in paragraphs[:12]]
+    verdicts = {} if _is_refusal(answer) else await _audit_summary_batch(audit_points, chunks, labels, trace)
+    for index, value in verdicts.items():
+        if value == "unsupported":
+            local_issues.append({"unit": f"paragraph_{index + 1}", "code": "evidence_unconfirmed", "severity": "suspect", "message": "该段落的原文支持待核实。"})
+    quality_assessment = assessment(len(paragraphs), len(verdicts), local_issues, method="model_sample", supported=sum(v == "supported" for v in verdicts.values()))
     return {
         "content": answer,
+        "quality_assessment": quality_assessment,
+        "delivery_status": "partial" if degraded else "full",
         "citations": valid,
         "scope_hash": scope_hash(ids),
         "source_ids": ids,
         "degraded": degraded,
-        "warnings": ([{"code": "source_formula_unreadable" if formula_issue else "answer_partial" if partial_answer else "extractive_fallback", "stage": "answer", "message": "原文公式提取含无法识别的字符，已保留可读文字解释或原文摘录，请通过原文件核对精确公式。" if formula_issue else "部分回答未通过引用校验，已保留有有效引用的回答段落。" if partial_answer else "模型综合回答未通过校验，已保留可核验的原文摘录。"}] if degraded else []) + ([{"code":"retrieval_scope","stage":"answer","message":"本次回答基于检索到的原文片段；资料不足不代表整本书不存在相关信息。"}] if current() and _is_refusal(answer) else []),
+        "warnings": ([{"code": "source_formula_unreadable" if formula_issue else "answer_partial" if partial_answer else "extractive_fallback", "stage": "answer", "message": "原文公式提取含无法识别的字符，已保留可读文字解释或原文摘录，请通过原文件核对精确公式。" if formula_issue else "部分回答需要核对，已保留模型输出。" if partial_answer else "回答包含待核实内容或使用了原文摘录，请查看质量说明。"}] if degraded else []) + ([{"code":"retrieval_scope","stage":"answer","message":"本次回答基于检索到的原文片段；资料不足不代表整本书不存在相关信息。"}] if current() and _is_refusal(answer) else []),
         "context_usage": trace.as_dict(),
     }
 
@@ -565,9 +528,9 @@ def _evenly_spaced(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any
     return [row for index, row in enumerate(rows) if index in indexes]
 
 
-async def _audit_summary_points(
+async def _audit_summary_batch(
     points: list[dict[str, Any]], chunks: list[dict[str, Any]], labels: list[str], trace: ContextUsage,
-) -> list[dict[str, Any]]:
+) -> dict[int, str]:
     """Audit against original evidence, rejecting missing or unverifiable verdicts."""
     requested = {label for point in points for label in point["citations"]}
     evidence = [(label, chunk) for label, chunk in zip(labels, chunks) if label in requested]
@@ -576,6 +539,9 @@ async def _audit_summary_points(
         "中间笔记不是证据。核对陈述者、虚构对话/示例/假设与事实的区别、否定、概率、条件及因果方向。"
         "任何部分夸大、限定丢失或原文未显示都不能通过。不要凭外部知识认可。原文 I/my 等第一人称没有明确归属时，不得认可将其说成作者观点的要点。"
         '仅输出 JSON {"verdicts":[{"index":0,"supported":true,"evidence":[{"id":"S1","quote":"原文连续摘录"}]}]}。'
+        '每个要点都必须有判定，索引从 0 开始；不支持也返回 supported:false，不要用空数组表示检查完成。'
+        f"本次恰好 {len(points)} 个要点，合法 index 仅为 {list(range(len(points)))}；不要把一个要点拆成多个判定。"
+        "evidence 必须为对象数组，不能用字符串数组。每个判定附 reason，简述具体不受支持的子句或通过原因。"
         "逐点检查全部引用，但每个通过的要点只返回一段 20–80 字符的原文定位摘录，不复写整段，不加省略号。\n待核验摘要："
         + json.dumps(points, ensure_ascii=False) + "\n原文：\n"
     )
@@ -625,14 +591,31 @@ async def _audit_summary_points(
             if (verdict.get("supported") is True and set(points[index]["citations"]) <= visible.keys()
                     and set(points[index]["citations"]) & supported):
                 accepted.add(index)
-            else:
+            elif verdict.get("supported") is False and set(points[index]["citations"]) <= visible.keys():
                 rejected.add(index)
-        return [point for index, point in enumerate(points) if index in accepted - rejected]
+        return {index: "unsupported" if index in rejected else "supported" for index in accepted | rejected}
     except (ProviderError, RuntimeError, ValueError, TypeError):
         trace.mark_fallback()
-        return []
+        return {}
 
 
+async def _audit_summary_points(
+    points: list[dict[str, Any]], chunks: list[dict[str, Any]], labels: list[str], trace: ContextUsage,
+) -> list[dict[str, Any]]:
+    """One sampled pass; preserve supported, suspect and unreviewed points."""
+    sampled = points[:12]
+    verdicts = await _audit_summary_batch(sampled, chunks, labels, trace)
+    status = {"total": len(points), "supported": sum(v == "supported" for v in verdicts.values()),
+              "unsupported": sum(v == "unsupported" for v in verdicts.values()),
+              "unreviewed": len(points) - len(verdicts), "supplement_attempted": False}
+    if current():
+        current().audit = status
+    for index, point in enumerate(points):
+        point["review_status"] = verdicts.get(index, "unreviewed")
+    return points
+
+
+@delivery_task
 @adaptive_generation("summary")
 async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str, reporter: Reporter | None = None) -> dict[str, Any]:
     representatives = select_quality_evidence(notebook_id, ids, limit=min(36, max(24, len(ids) * 12)))
@@ -643,9 +626,9 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     original_representatives = representatives
     original_labels = labels
     trace = generation_trace()
-    trace.request_limit = 10 if current() else 2
+    trace.request_limit = 4
     if not current():
-        trace.total_token_limit = 24_000
+        trace.total_token_limit = 300_000
     if current() and current().plan.preparation_batches:
         if reporter:
             reporter.update("summarize", "按资料区间提炼证据", 0.20)
@@ -658,7 +641,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
         representatives = [by_id[key] for key in dict.fromkeys(note["chunk_id"] for note in notes)]
         label_by_chunk = {citation["chunk_id"]: label for label, citation in citations_by_id.items()}
         labels = [label_by_chunk[row["id"]] for row in representatives]
-    target_points = min(24, max(6, current().plan.output_items)) if current() else 6
+    target_points = 6
 
     def parse_points(raw: str, valid_labels: set[str]) -> list[dict[str, Any]]:
         try:
@@ -687,7 +670,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
             why = re.sub(r"\s+", " ", str(value.get("why_it_matters") or "")).strip()
             refs = list(dict.fromkeys(str(item).strip().strip("[]").upper() for item in value.get("citations") or [] if str(item).strip().strip("[]").upper() in valid_labels))[:3]
             key = re.sub(r"\W+", "", claim).lower()
-            if len(claim) < 24 or len(why) < 16 or not refs or key in seen or not text_matches_language(claim + why, language):
+            if not claim or key in seen:
                 continue
             seen.add(key)
             points.append(
@@ -703,7 +686,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     language_rule = "自然简体中文" if language != "en" else "natural English"
     output_limit = TokenLimits.from_provider(active_provider("main") or {}).max_output_tokens
     batch_points = min(target_points, max(1, (output_limit - 512) // 350))
-    prefix = f"""你是严谨的研究编辑。只依据资料，用{language_rule}提炼 {batch_points} 个相互独立、覆盖全文主线的高信息密度要点。每点保持简洁。先概括资料的主要论题、核心机制及其关系，再解释必要的例证；不要让孤立轶事取代全书主线。保留虚构对话、假设和例子的性质；说话人不明确时不要擅自归因给作者。不要复述封面、版权、目录、书目或索引。每点只能引用真正支持该点的 1–3 个编号；不得给每点附整批编号。仅输出 JSON：{{"points":[{{"claim":"完整核心判断","why_it_matters":"为何重要或如何作用","qualification":"资料中的限制或空字符串","citations":["S1"]}}]}}。\n资料：\n"""
+    prefix = f"""你是严谨的研究编辑。只依据资料，用{language_rule}提炼 {batch_points} 个相互独立、覆盖全文主线的高信息密度要点。先通读所有提供的原文区段，再决定六点的主题分配，不能只依次概括开篇内容。避免用多个要点重复介绍同一背景；为核心机制、后部结论及重要限制保留空间。紧密相关的背景与机制可以合并，但每点只表达一个可由所引段落直接支持的判断，claim 最多两句；不要串联多个例子、独立结论或不必要的数字、音程等细节。why_it_matters 简述原文明确解释的作用，禁止添加“全书共同地基”等概括性评价。写出结论前核对其成立条件，将必要前提直接写入 claim；不要把概率性、条件性结论改写为无条件保证。why_it_matters 也必须有原文支持，不补充原文没有的意义或评价。先概括资料的主要论题、核心机制及其关系，再解释必要的例证；不要让孤立轶事取代全书主线。保留虚构对话、假设和例子的性质；说话人不明确时不要擅自归因给作者。不要复述封面、版权、目录、书目或索引。每点只能引用真正支持该点的 1–3 个编号；不得给每点附整批编号。仅输出 JSON：{{"points":[{{"claim":"完整核心判断","why_it_matters":"为何重要或如何作用","qualification":"","citations":["S1"]}}]}}。\n资料：\n"""
     points: list[dict[str, Any]] = []
     valid_labels: set[str] = set()
     if reporter:
@@ -714,15 +697,15 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
                 budget, chunks=representatives, labels=labels, prefix=prefix, ensure_source_coverage=len(ids) > 1
             ),
             json_mode=True,
-            max_tokens=structured_output_tokens(batch_points * 500) if current() else structured_output_tokens(2200),
+            max_tokens=structured_output_tokens(2200),
             minimum_output_tokens=700,
             trace=trace,
             stage="summary",
         )
         valid_labels = set(generated.build.metadata["labels"])
         points = parse_points(generated.content, valid_labels)
-        for _ in range(2 if current() else 1):
-            if len(points) >= target_points:
+        for _ in range(1):
+            if points or not claim_recovery():
                 break
             repair_prefix = f"""上次摘要只有 {len(points)} 个有效要点。用{language_rule}只依据资料补充 {min(batch_points, target_points - len(points))} 个简洁要点，避免与现有要点重复，并保持每点 1–3 个精确引用。现有有效要点：{json.dumps(points, ensure_ascii=False)}。仅输出同一 JSON points 结构。\n资料：\n"""
             repaired = await budgeted_chat(
@@ -745,10 +728,13 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     except Exception:
         trace.mark_fallback()
     audit_removed = False
-    if current() and points:
+    if points:
         audited = await _audit_summary_points(points, original_representatives, original_labels, trace)
         audit_removed = len(audited) != len(points)
         points = audited
+    quality_issues = [{"unit": f"point_{i + 1}", "code": "evidence_unconfirmed", "severity": "suspect", "message": "该要点的原文支持待核实。"}
+                      for i, point in enumerate(points) if point.get("review_status") == "unsupported" or not point["citations"]]
+    quality_assessment = assessment(len(points), sum(p.get("review_status") in {"supported", "unsupported"} for p in points), quality_issues, method="model_sample", supported=sum(p.get("review_status") == "supported" for p in points))
     degraded = audit_removed or len(points) < target_points
     if degraded and not points:
         points = [
@@ -756,6 +742,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
             for chunk, label in zip(original_representatives[:6], original_labels[:6])
         ]
         valid_labels = set(original_labels[:6])
+        quality_assessment = assessment(len(points), method="local_excerpt")
     if degraded:
         trace.mark_fallback()
     heading = "## Evidence-bound summary" if language == "en" else "## 可追溯摘要"
@@ -768,7 +755,11 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     used_labels = list(dict.fromkeys(label for point in points for label in point["citations"]))
     output_citations = [citations_by_id[label] for label in used_labels if label in citations_by_id]
     warnings = [{"code": "summary_partial", "stage": "summary", "message": "摘要综合未完整完成，已保留有效要点或可核验的原文摘录。"}] if degraded else []
-    return {"version": 2, "content": answer, "points": points, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "warnings": warnings, "context_usage": trace.as_dict()}
+    if current() and current().audit.get("unreviewed"):
+        warnings.append({"code": "summary_audit_incomplete", "stage": "audit", "message": "部分要点的核验未完成，不等同于已认定事实错误。", "count": current().audit["unreviewed"]})
+    if current() and current().audit.get("unsupported"):
+        warnings.append({"code": "summary_unsupported", "stage": "audit", "message": "已保留原文支持待核实的要点，请核对引用。", "count": current().audit["unsupported"]})
+    return {"version": 2, "quality_assessment": quality_assessment, "delivery_status": "partial" if degraded else "full", "content": answer, "points": points, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "warnings": warnings, "context_usage": trace.as_dict()}
 
 
 async def make_summary(notebook_id: str, source_ids: list[str] | None, language: str, job_id: str | None = None) -> dict[str, Any]:
@@ -786,7 +777,7 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     summary_id = f"summary_{suffix}" if suffix else new_id("summary")
     artifact_id, now = (f"artifact_{suffix}" if suffix else new_id("artifact")), utc_now()
     DB.execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?)", (summary_id, notebook_id, result["scope_hash"], result["content"], json_dump(result["citations"]), now))
-    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "partial" if result["degraded"] else "ready", json_dump({"version": result["version"], "content": result["content"], "points": result["points"], "degraded": result["degraded"], "warnings": result["warnings"], "context_usage": result["context_usage"], "language_selection": language_selection}), json_dump(result["citations"]), None, now, now))
+    DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "summary", "资料摘要", json_dump(ids), language, "partial" if result["degraded"] else "ready", json_dump({"quality_assessment": result.get("quality_assessment"), "delivery_status": result.get("delivery_status"), "version": result["version"], "content": result["content"], "points": result["points"], "degraded": result["degraded"], "warnings": result["warnings"], "context_usage": result["context_usage"], "language_selection": language_selection}), json_dump(result["citations"]), None, now, now))
     result["language"] = language
     result["language_selection"] = language_selection
     result["id"] = summary_id

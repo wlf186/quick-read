@@ -207,7 +207,7 @@ class SummaryRequest(BaseModel):
 
 class QuizRequest(BaseModel):
     source_ids: list[str] | None = None
-    count: int = Field(default=10, ge=1, le=30)
+    count: int = Field(default=10, ge=1, le=30, description="目标题数；保留结构可用的题目，不为质量偏差反复补写，实际数量及评级随产物返回。")
     difficulty: StudyDifficulty = "mixed"
     language: Literal["auto", "zh-CN", "en"] = "auto"
     custom_prompt: str = Field(default="", max_length=1000)
@@ -215,7 +215,7 @@ class QuizRequest(BaseModel):
 
 class FlashcardRequest(BaseModel):
     source_ids: list[str] | None = None
-    count: int = Field(default=20, ge=1, le=50)
+    count: int = Field(default=20, ge=1, le=50, description="目标卡数；保留可用卡片，数量不足或质量待核实会在结果中注明。")
     difficulty: StudyDifficulty = "mixed"
     language: Literal["auto", "zh-CN", "en"] = "auto"
     custom_prompt: str = Field(default="", max_length=1000)

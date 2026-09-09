@@ -4,7 +4,7 @@ import re
 import tomllib
 
 from playwright.sync_api import Page, sync_playwright
-from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions
+from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +49,7 @@ def main() -> None:
         run_generation_regressions(browser)
         run_context_regressions(browser)
         run_import_regressions(browser)
+        run_delivery_regressions(browser)
         context = browser.new_context(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         page = context.new_page()
         api_requests: list[str] = []

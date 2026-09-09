@@ -19,7 +19,7 @@ PROVIDER_CONFIG_DOCS = {
     "properties": {
         "context_strategy": {
             "type": "string", "enum": ["balanced", "conservative"],
-            "description": "MAIN 上下文策略，缺省 conservative；均衡策略尚待质量资格。balanced 按有效窗口、输出预算和资料量动态规划；conservative 保留原有选材策略，供对照和回退。",
+            "description": "MAIN 上下文策略；缺省按 Provider、配置与功能匹配质量资格，无匹配时 conservative。balanced 按有效窗口、输出预算和资料量动态规划；conservative 保留原有选材策略，供对照和回退。",
         },
         "thinking": {
             "type": "string",
@@ -161,10 +161,10 @@ ARTIFACT_SCHEMA = _object({
     "id": {"type": "string"}, "notebook_id": {"type": "string"},
     "type": {"type": "string"}, "title": {"type": "string"},
     "language": {"type": "string"}, "status": {"type": "string", "description": "ready/partial 表示产物交付状态，不保证全部质量通过；ready 也可能伴随 degraded 或 warnings。任务 complete 仅表示处理结束。"},
-    "payload": _object({"performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA,
+    "payload": _object({"quality_assessment": _object({}, "自动质量评级：level good/fair/needs_review/unrated，实际 reviewed_units/total_units 与逐项 issues；未评级不视为正确。"), "delivery_status": {"type": "string", "enum": ["full", "partial", "script_only", "draft_only"]}, "performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA,
                         "degraded": {"type": "boolean", "description": "生成使用了回退或保留部分内容；应与 status、warnings 和质量报告一起查看。"},
                         "quality": _object({"passed": {"type": "boolean"}}, "Podcast 原始脚本质量结果；部分交付不改写 passed。"),
-                        "quality_report": _object({}, "按产物类型变化；题卡包含请求/实际数量、模型标注难度及审校状态，不等于人工质量认证。"),
+                        "quality_report": _object({"episode_audit": _object({"status": {"type": "string", "enum": ["complete", "partial", "unavailable"]}, "coverage_mode": {"type": "string", "enum": ["full", "sampled"]}, "checked_transitions": {"type": "integer"}, "total_transitions": {"type": "integer"}, "reviewed_transitions": {"type": "array", "items": {"type": "integer"}}, "reason": {"type": "string"}}, "连贯性审校完成状态和实际检查的相邻对话；不等于事实认证。")}),
                         "audio_quality": _object({
                             "passed": {"type": "boolean", "description": "ASR 验收结果，不包含独立的实际时长结论。"},
                             "duration": _object({"passed": {"type": "boolean"}}, "实际音频时长验收，旧产物可能缺省。"),
@@ -207,6 +207,7 @@ JOB_LIST_RESPONSES = json_response(_object({}), "分页任务列表；Quiz resul
 CONTEXT_PREVIEW_RESPONSES = json_response(_object({
     "strategy": {"type": "string", "enum": ["balanced", "conservative"]},
     "strategies": _object({}, "各功能实际生效策略；与执行使用同一资格清单及显式配置优先级。"),
+    "strategy_reasons": _object({}, "各功能实际策略的资格或显式配置原因。"),
     "plans": _array(_object({})), "saved_plans": _array(_object({})),
     "basis": {"type": "string"}, "assumptions": {"type": "string"},
 }), "仅在本地估算选材、分批和任务预算；不承诺质量。实际 context_usage.coverage 分别记录选材、成功调用原文及最终引用，旧产物可缺省。Quiz 作答前不公开逐来源覆盖明细。")

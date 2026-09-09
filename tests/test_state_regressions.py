@@ -223,7 +223,7 @@ async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp
                 "capabilities": {"models": [{"id": "tts", "installed": True}], "asr": {
                     "models": [{"id": "asr", "installed": True, "devices": [{"id": "cpu", "available": True}]}],
                     "diarization": True, "timestamp_precisions": ["segment"], "languages": ["Chinese", "English"], "aligner_languages": ["Chinese", "English"]}}}
-    main = {"id": "main", "name": "Main", "kind": "ollama", "model": "fixture", "config": {}, "base_url": "http://localhost"}
+    main = {"id": "main", "role": "main", "name": "Main", "kind": "ollama", "model": "fixture", "config": {}, "base_url": "http://localhost"}
     active = {"audio": original, "main": main}
     replacement = None if pause else {**original, "id": "new", "name": "New AUDIO"}
     monkeypatch.setattr(jobs, "active_provider", lambda role: active[role])
@@ -267,20 +267,16 @@ async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp
     monkeypatch.setattr(jobs, "build_podcast_script", script)
     monkeypatch.setattr(jobs, "synthesize", synthesize)
     monkeypatch.setattr(providers, "_transcribe_with_provider", transcribe)
-    monkeypatch.setattr(jobs, "assess_transcription", lambda *args: {"passed": bool(asr_ok) and len(asr_providers) > 1, "segment_count": 2, "turn_errors": [0] if len(asr_providers) == 1 else []})
+    monkeypatch.setattr(jobs, "assess_transcription", lambda *args: {"passed": bool(asr_ok), "segment_count": 2, "turn_errors": [0] if len(asr_providers) == 1 else []})
     result = await jobs._podcast("n", payload, job["id"])
     artifact = database.fetchone("SELECT status,payload_json FROM artifacts WHERE id=?", (result["id"],))
     assert artifact["status"] == ("ready" if asr_ok else "partial")
     saved = json_load(artifact["payload_json"], {})
     assert saved["audio_quality"]["passed"] == bool(asr_ok)
     assert saved["degraded"] == (not asr_ok)
-    if asr_ok is None:
-        assert saved["audio_quality"]["repair_error"] == "Repair provider unavailable"
-        media = tmp_path / database.fetchone("SELECT media_path FROM artifacts WHERE id=?", (result["id"],))["media_path"]
-        with wave.open(str(media)) as audio:
-            assert audio.getnframes() / audio.getframerate() > 300
-    assert len(tts_providers) == 3 and all(value is original for value in tts_providers)
-    assert len(asr_providers) == (1 if asr_ok is None else 2) and all(value is original for value in asr_providers)
+    assert "repair_error" not in saved["audio_quality"]
+    assert len(tts_providers) == 2 and all(value is original for value in tts_providers)
+    assert len(asr_providers) == 1 and all(value is original for value in asr_providers)
     assert database.fetchone("SELECT id FROM artifacts WHERE id=?", (result["id"],))
     later = jobs.enqueue("podcast", "n", {})
     assert json_load(later["payload_json"], {})["provider_ids"]["audio"] == (None if pause else "new")
@@ -289,9 +285,12 @@ async def test_podcast_tts_and_both_asr_passes_keep_enqueued_audio(database, tmp
 @pytest.mark.asyncio
 async def test_missing_bound_audio_never_falls_back(database, monkeypatch):
     monkeypatch.setattr(jobs, "provider_by_id", lambda key: None)
-    monkeypatch.setattr(jobs, "active_provider", lambda role: pytest.fail("must not resolve a different AUDIO"))
-    with pytest.raises(RuntimeError, match="任务绑定的 AUDIO Provider 不存在"):
-        await jobs._podcast("n", {"provider_ids": {"audio": "deleted"}}, "job_missing")
+    monkeypatch.setattr(jobs, "active_provider", lambda role: None if role == "main" else pytest.fail("must not resolve a different AUDIO"))
+    async def script(*args, **kwargs):
+        return {"source_ids": ["s"], "language": "en", "citations": [], "script": "A complete script.", "turns": []}
+    monkeypatch.setattr(jobs, "build_podcast_script", script)
+    result = await jobs._podcast("n", {"provider_ids": {"audio": "deleted"}}, "job_missing")
+    assert result["delivery_status"] == "script_only"
 
 
 @pytest.mark.asyncio
@@ -299,7 +298,7 @@ async def test_missing_bound_audio_never_falls_back(database, monkeypatch):
 async def test_measured_duration_recovery_preserves_original_on_failure(database, tmp_path, monkeypatch, repair_passed):
     from sandevistan_read.context_budget import ContextUsage, TokenLimits, plan_context
     from sandevistan_read.generation_context import CURRENT, GenerationContext
-    main = {'id': 'main', 'name': 'Main', 'kind': 'ollama', 'model': 'fixture', 'base_url': 'http://localhost',
+    main = {'id': 'main', 'role': 'main', 'name': 'Main', 'kind': 'ollama', 'model': 'fixture', 'base_url': 'http://localhost',
             'config': {'context_window_tokens': 30720, 'max_output_tokens': 4096}}
     audio = {'id': 'audio', 'name': 'Audio', 'kind': 'sandevistan_audio', 'model': 'tts', 'base_url': 'http://audio.invalid',
              'config': {}, 'capabilities': {}}
@@ -344,8 +343,9 @@ async def test_measured_duration_recovery_preserves_original_on_failure(database
         CURRENT.reset(token)
     saved = json_load(database.fetchone('SELECT payload_json FROM artifacts WHERE id=?', (result['id'],))['payload_json'], {})
     assert saved['audio_quality']['passed']  # Failed new audio must not replace the accepted original.
-    assert saved['audio_quality']['duration']['passed'] == repair_passed
-    assert saved['turns'][0]['text'] == ('long' if repair_passed else 'short')
-    assert saved['duration']['actual_seconds'] == pytest.approx(300.44 if repair_passed else 180.44)
-    assert saved['context_usage']['accounted_total_tokens'] == 500
-    assert rendered == ['short', 'short', 'long', 'long']
+    assert saved['audio_quality']['duration']['passed'] is False
+    assert saved['turns'][0]['text'] == 'short'
+    assert saved['duration']['actual_seconds'] == pytest.approx(180.44)
+    assert saved.get('context_usage', {}).get('accounted_total_tokens', 0) == 0
+    assert rendered == ['short', 'short']
+    assert len(asr_calls) == 1

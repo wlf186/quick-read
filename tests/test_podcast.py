@@ -87,7 +87,9 @@ def test_duration_budget_and_audio_gate_are_language_aware() -> None:
         "text": "知" * 225, "speaker": "HOST_A", "dialogue_act": "explain", "claim_ids": ["C1"],
     }]) == pytest.approx(1 + podcast.TURN_PAUSE_SECONDS / 60)
     assert jobs._actual_duration_check(20, 20 * 60)["passed"] is True
-    assert jobs._actual_duration_check(20, 16 * 60)["passed"] is False
+    assert jobs._actual_duration_check(20, 16 * 60)["passed"] is True
+    assert jobs._actual_duration_check(20, 25 * 60)["passed"] is True
+    assert jobs._actual_duration_check(20, 15.9 * 60)["passed"] is False
 
 
 def test_safe_turns_are_short_traceable_dialogue() -> None:

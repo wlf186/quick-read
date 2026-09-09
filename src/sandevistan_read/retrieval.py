@@ -12,7 +12,7 @@ from .config import CONFIG
 from .database import DB, json_load
 from .paths import PATHS
 from .context_budget import estimate_text_tokens
-from .generation_context import current, mark_selected, region
+from .generation_context import current, mark_selected, region, evidence_cost
 
 
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9_]+|[\u3400-\u9fff]+", re.UNICODE)
@@ -122,6 +122,76 @@ def is_quality_chunk(row: dict[str, Any], *, minimum_chars: int = 120) -> bool:
     return not bool(LOW_VALUE_PATTERN.search(section))
 
 
+def is_context_chunk(row: dict[str, Any]) -> bool:
+    """Keep short definitions and qualifications; only exclude obvious metadata."""
+    text = str(row.get("content") or "").strip()
+    return bool(text) and not LOW_VALUE_PATTERN.search(text[:500])
+
+
+def context_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude an explicitly labelled metadata page, including its split chunks.
+
+    A heading/footer belongs to the whole source page, not just its final chunk.
+    Numerical tables and short definitions remain eligible.
+    """
+    metadata_pages = set()
+    footer = re.compile(r"(?:^|\n)\s*(?:Index|Bibliography|Contents|Table of Contents|目录|索引|参考文献)\s*(?:\n+\s*[\divxlcdm\s]{1,12})?\s*$", re.I)
+    for row in rows:
+        locator = row.get('locator') or json_load(row.get('locator_json'), {})
+        if locator.get('page') is not None and footer.search(str(row.get('content') or '')):
+            metadata_pages.add((row['source_id'], locator['page']))
+    return [row for row in rows if is_context_chunk(row) and
+            (row['source_id'], (row.get('locator') or json_load(row.get('locator_json'), {})).get('page')) not in metadata_pages]
+
+
+def select_context_evidence(rows: list[dict[str, Any]], token_budget: int) -> list[dict[str, Any]]:
+    """Stable source/region round robin, with central and qualifying passages."""
+    groups: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for row in rows:
+        groups.setdefault(row["source_id"], {}).setdefault(region(row), []).append(row)
+    priority = re.compile(r"however|unless|provided|only if|limitation|in contrast|theorem|main (?:thesis|argument)|但是|然而|仅当|前提|限制|例外|主要论点", re.I)
+    queues: dict[str, list[dict[str, Any]]] = {}
+    for source, regions in groups.items():
+        source_rows = [row for values in regions.values() for row in values]
+        vectors = [json_load(row.get('embedding_json'), []) for row in source_rows]
+        available = [v for v in vectors if v]
+        centroid = np.asarray(available, dtype=np.float32).mean(axis=0).tolist() if available else []
+        scores = {row['id']: _cosine(vector, centroid) + .15 * bool(priority.search(row['content']))
+                  for row, vector in zip(source_rows, vectors)}
+        values_by_region = list(regions.values())
+        # A budget-independent breadth-first order spans the book even when
+        # only a few regions fit, and remains nested as capacity increases.
+        count = len(values_by_region)
+        order = [0] + ([count - 1] if count > 1 else [])
+        pending = [(1, count - 2)]
+        for left, right in pending:
+            if left <= right:
+                middle = (left + right) // 2
+                order.append(middle)
+                pending.extend([(left, middle - 1), (middle + 1, right)])
+        ranked = [sorted(values_by_region[index], key=lambda row: (-scores[row['id']], int(row.get('ordinal') or 0)))
+                  for index in order]
+        queues[source] = [values[index] for index in range(max(map(len, ranked))) for values in ranked if index < len(values)]
+    ordered = [values[index] for index in range(max(map(len, queues.values()), default=0))
+               for values in queues.values() if index < len(values)]
+    selected = []
+    for row in ordered:
+        cost = evidence_cost(row)
+        # A stable prefix means a larger budget cannot displace existing evidence.
+        if cost > token_budget:
+            break
+        selected.append(row)
+        token_budget -= cost
+    if not selected and ordered:
+        # Let the prompt packer clip one oversized passage and report it as
+        # partial, rather than failing before the bounded fallback can run.
+        selected = ordered[:1]
+    selected.sort(key=lambda row: (list(groups).index(row['source_id']), int(row.get('ordinal') or 0)))
+    result = [{**row, 'locator': row.get('locator') or json_load(row.get('locator_json'), {})} for row in selected]
+    mark_selected(result)
+    return result
+
+
 def select_quality_evidence(
     notebook_id: str,
     source_ids: list[str],
@@ -136,6 +206,8 @@ def select_quality_evidence(
     marks = ",".join("?" for _ in source_ids)
     state = current()
     rows = [row for row in state.rows if row["source_id"] in source_ids] if state else DB.fetchall(f"SELECT * FROM chunks WHERE source_id IN ({marks}) ORDER BY source_id,ordinal", tuple(source_ids))
+    if state and state.plan.kind == "summary":
+        return select_context_evidence(rows, state.plan.evidence_tokens)
     if state:
         limit = max(1, state.plan.estimated_segments)
     candidates = [row for row in rows if is_quality_chunk(row, minimum_chars=minimum_chars)]
@@ -248,7 +320,8 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
         key=lambda row: _cosine(query_vector, json_load(row.get("embedding_json"), [])),
         reverse=True,
     )
-    dense = dense_all[: max(limit * 4, 30)]
+    pool_size = len(all_chunks) if state and state.plan.kind == "chat" else max(limit * 4, 30)
+    dense = dense_all[:pool_size]
     query_tokens = tokenize(query)
     cjk_query = bool(CJK_PATTERN.search(query))
     # Keep technical names even when a long Chinese question precedes them.
@@ -265,7 +338,7 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
                 f"""SELECT c.* FROM chunks_fts f JOIN chunks c ON c.id=f.chunk_id
                 WHERE chunks_fts MATCH ? AND c.source_id IN ({placeholders})
                 ORDER BY bm25(chunks_fts) LIMIT ?""",
-                (match_query, *source_ids, max(limit * 4, 30)),
+                (match_query, *source_ids, pool_size),
             )
         except Exception:
             lexical = []
@@ -276,7 +349,7 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
             score = sum(lowered.count(term) * (2 if len(term) > 1 else 1) for term in terms)
             if score:
                 scored.append((score, row))
-        lexical = [row for _, row in sorted(scored, key=lambda item: item[0], reverse=True)[: max(limit * 4, 30)]]
+        lexical = [row for _, row in sorted(scored, key=lambda item: item[0], reverse=True)[:pool_size]]
     fused = reciprocal_rank_fusion([[row["id"] for row in dense], [row["id"] for row in lexical]])
     by_id = {row["id"]: row for row in all_chunks}
     ordered = sorted(fused, key=fused.get, reverse=True)
@@ -295,7 +368,7 @@ def retrieve(notebook_id: str, query: str, source_ids: list[str] | None = None, 
             continue
         row["locator"] = json_load(row.pop("locator_json"), {})
         row.pop("embedding_json", None)
-        row["score"] = fused[chunk_id]
+        row["score"] = fused.get(chunk_id, 0.0)
         results.append(row)
         per_source[row["source_id"]] += 1
         if len(results) >= limit:

@@ -140,7 +140,7 @@ async def test_preparation_salvages_complete_exact_quotes_only(monkeypatch):
     from sandevistan_read.generation_context import prepare_evidence
     text = 'This original passage explains a central proposition and its important limitations in detail.'
     row = {'id': 'c', 'source_id': 's', 'content': text, 'ordinal': 0}
-    plan = plan_context(TokenLimits.from_provider(provider(30720,4096)), 'summary', material_tokens=1000000)
+    plan = plan_context(TokenLimits.from_provider(provider(30720,4096)), 'quiz', material_tokens=1000000)
     state = GenerationContext(provider(), plan, [row], [], ContextUsage())
     valid = {'chunk_id':'c','claim':'A supported claim','quote':text}
     fabricated = {'chunk_id':'c','claim':'A fabricated claim','quote':'This quotation does not occur anywhere in the document.'}
@@ -188,7 +188,7 @@ async def test_generation_is_opt_in_and_pins_provider(monkeypatch):
 @pytest.mark.asyncio
 async def test_preparation_stops_before_spending_final_reserve(monkeypatch):
     from sandevistan_read.context_budget import PromptBudget
-    plan=plan_context(TokenLimits.from_provider(provider()),'summary',material_tokens=1000000)
+    plan=plan_context(TokenLimits.from_provider(provider()),'quiz',material_tokens=1000000)
     trace=ContextUsage(total_token_limit=plan.total_token_limit)
     trace.accounted_tokens=plan.total_token_limit-plan.final_reserve_tokens
     state=GenerationContext(provider(),plan,[],[],trace)
@@ -228,7 +228,7 @@ def test_many_page_regions_do_not_crowd_out_another_selected_book():
 @pytest.mark.asyncio
 async def test_failed_preparation_is_not_repeated_by_recovery(monkeypatch):
     from sandevistan_read.generation_context import prepare_evidence
-    plan=plan_context(TokenLimits.from_provider(provider(30720,4096)),'summary',material_tokens=1000000)
+    plan=plan_context(TokenLimits.from_provider(provider(30720,4096)),'quiz',material_tokens=1000000)
     row={'id':'c','source_id':'s','content':'Valid source passage with detailed supporting facts and qualifications. '*5}
     state=GenerationContext(provider(),plan,[row],[],ContextUsage())
     calls=[]

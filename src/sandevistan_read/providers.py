@@ -1000,6 +1000,10 @@ async def inspect_provider(candidate: dict[str, Any], mode: str = "catalog") -> 
 
 def active_provider(role: str) -> dict[str, Any] | None:
     from .generation_context import current
+    from .delivery import CURRENT as DELIVERY
+    delivery = DELIVERY.get()
+    if role == "main" and delivery and delivery.provider:
+        return delivery.provider
     state = current()
     if state and role == "main":
         return state.provider
@@ -1139,6 +1143,9 @@ async def _chat_once(
             response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
             if response.status_code == 400 and "thinking" in payload and "thinking" in response.text:
                 # Servers without a thinking switch (or forced-thinking models) reject the parameter.
+                from .delivery import CURRENT as DELIVERY, claim_recovery
+                if DELIVERY.get() and (DELIVERY.get().audits or not claim_recovery()):
+                    raise _provider_response_error(response)
                 payload.pop("thinking", None)
                 response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
             if not response.is_success:
@@ -1222,15 +1229,29 @@ async def budgeted_chat(
     provider_override: dict[str, Any] | None = None,
 ) -> BudgetedCompletion:
     from .generation_context import current, mark_sent
+    from .delivery import CURRENT as DELIVERY, claim_audit, claim_recovery
+    is_audit = "audit" in stage
+    product_audit = is_audit and DELIVERY.get() is not None
+    if role == "main" and is_audit and not claim_audit():
+        raise RuntimeError("本任务的轻量审校已使用")
     state = current() if role == "main" else None
     if state:
         trace = state.trace
-    provider = state.provider if state else provider_override or _chat_provider(role)
+    provider = state.provider if state else provider_override or (DELIVERY.get().provider if role == "main" and DELIVERY.get() and DELIVERY.get().provider else _chat_provider(role))
     limits = TokenLimits.from_provider(provider)
     last_error: ContextOverflowError | None = None
     escalated = False
     for attempt, scale in enumerate(RETRY_SCALES, start=1):
         budget = prompt_budget(limits, max_tokens, minimum_output_tokens, scale)
+        if state and state.plan.kind in {"summary", "chat"} and trace.total_token_limit is not None:
+            held = state.plan.final_reserve_tokens if stage in {"summary", "generation"} and trace.requests == 0 else 0
+            available = max(0, trace.total_token_limit - trace.accounted_tokens - trace.reserved_tokens - held - budget.output_tokens)
+            budget = replace(budget, input_tokens=min(budget.input_tokens, available))
+        if role == "main" and DELIVERY.get() and trace and trace.episode_audit_reserve_tokens and trace.total_token_limit is not None:
+            held = 0 if stage == "episode_audit" else trace.episode_audit_reserve_tokens
+            available = max(0, trace.total_token_limit - trace.accounted_tokens - held)
+            budget = replace(budget, output_tokens=min(budget.output_tokens, max(1, available // 3)))
+            budget = replace(budget, input_tokens=min(budget.input_tokens, max(0, available - budget.output_tokens)))
         build = builder(budget)
         estimated = estimate_messages_tokens(build.messages, budget.image_tokens_per_image)
         if estimated > budget.input_tokens:
@@ -1242,7 +1263,11 @@ async def budgeted_chat(
                 if state and state.cancel_check and state.cancel_check():
                     raise RuntimeError("任务已取消")
                 if trace:
-                    if state and stage == "context_prepare" and trace.accounted_tokens + estimated + output_tokens > state.plan.total_token_limit - state.plan.final_reserve_tokens:
+                    if role == "main" and DELIVERY.get() and trace.episode_audit_reserve_tokens and stage != "episode_audit":
+                        if (trace.request_limit is not None and trace.requests >= trace.request_limit - 1
+                                or trace.total_token_limit is not None and trace.accounted_tokens + estimated + output_tokens > trace.total_token_limit - trace.episode_audit_reserve_tokens):
+                            raise RuntimeError("已为最终连贯性审校保留预算")
+                    if state and (stage == "context_prepare" or (state.plan.kind in {"summary", "chat"} and stage in {"summary", "generation"} and trace.requests == 0)) and trace.accounted_tokens + estimated + output_tokens > state.plan.total_token_limit - state.plan.final_reserve_tokens:
                         raise RuntimeError("已为最终综合与审校保留预算")
                     trace.begin_request(estimated_tokens=estimated + output_tokens)
                 try:
@@ -1263,7 +1288,7 @@ async def budgeted_chat(
                                  truncated_segments=build.truncated_segments)
                     if result.finish_reason in {"length", "max_tokens"}:
                         trace.output_limited_calls += 1
-                mark_sent(build)
+                mark_sent(build, stage)
                 return result
             try:
                 completion = await invoke(budget.output_tokens)
@@ -1275,8 +1300,10 @@ async def budgeted_chat(
                 ):
                     raise
                 # Retry transient failures once on the same provider and budget.
+                if product_audit or not claim_recovery():
+                    raise
                 completion = await invoke(budget.output_tokens)
-            if not escalated and _needs_output_escalation(completion):
+            if not product_audit and not escalated and _needs_output_escalation(completion) and claim_recovery():
                 # 推理模型把预算烧在隐藏思考上：同一 scale 下翻倍输出预算重试一次，不消耗溢出降档
                 escalated = True
                 escalated_output = _escalated_output(limits, budget, estimated, scale)
@@ -1297,6 +1324,8 @@ async def budgeted_chat(
                             elif trace:
                                 trace.mark_fallback()
         except ContextOverflowError as exc:
+            if product_audit or not claim_recovery():
+                raise
             if trace:
                 trace.overflow_retries += 1
             last_error = exc

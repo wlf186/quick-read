@@ -69,37 +69,80 @@ async def worker(args) -> int:
         save(args.output / "fixture-manifest.json",DB.fetchall("SELECT id,revision_id,filename,page_count FROM sources WHERE notebook_id=?",(notebook,)))
         return 0
     pinned = json.loads(os.environ.pop("QUICK_READ_EVAL_PROVIDER"))
-    pinned['config']={**pinned.get('config',{}),'context_strategy':'balanced'}
+    if pinned['kind'] == 'ollama' and args.main_concurrency != 1:
+        raise ValueError('Ollama evaluation must remain serial')
+    pinned['config']={**pinned.get('config',{}),'context_strategy':args.strategy}
+    if args.context_window:
+        pinned['config']['context_window_tokens'] = args.context_window
     DB.execute("UPDATE provider_profiles SET kind=?,base_url=?,model=?,config_json=?,capabilities_json=?,secret_enc=? WHERE role='main'",
                (pinned["kind"],pinned["base_url"],pinned["model"],json_dump(pinned["config"]),json_dump(pinned.get("capabilities",{})),VAULT.encrypt(pinned.get("api_key", ""))))
     original = providers._chat_once
+    consecutive_failures = 0
     async def recorded(provider,messages,**kwargs):
+        nonlocal consecutive_failures
+        if consecutive_failures >= 3:
+            raise RuntimeError("Evaluation stopped after three consecutive provider failures")
         assert provider["base_url"].rstrip('/')==pinned["base_url"].rstrip('/') and provider["model"]==pinned["model"], "MAIN changed during evaluation"
         started=time.monotonic()
         event={"at":time.time(),"model":provider["model"],"options":kwargs,"estimated_input_chars":sum(len(str(m.get('content',''))) for m in messages)}
         key=hashlib.sha256((pinned['base_url']+pinned['model']).encode()).hexdigest()[:16]
-        lock=sqlite3.connect(ROOT / 'runtime/evals' / f'.context-main-{key}.sqlite',timeout=0)
+        lock = None
         try:
-            while True:
-                try:lock.execute('BEGIN IMMEDIATE');break
-                except sqlite3.OperationalError as exc:
-                    if 'locked' not in str(exc):raise
+            while lock is None:
+                for slot in range(args.main_concurrency):
+                    suffix = '' if slot == 0 else f'-{slot}'
+                    attempt = sqlite3.connect(ROOT / 'runtime/evals' / f'.context-main-{key}{suffix}.sqlite', timeout=0)
+                    try:
+                        attempt.execute('BEGIN IMMEDIATE')
+                    except sqlite3.OperationalError as exc:
+                        attempt.close()
+                        if 'locked' not in str(exc):
+                            raise
+                    else:
+                        lock = attempt
+                        event['concurrency_slot'] = slot
+                        break
+                if lock is None:
                     await asyncio.sleep(.5)
             event["queue_seconds"]=round(time.monotonic()-started,3)
             inference_started=time.monotonic()
             result=await original(provider,messages,**kwargs)
             event["inference_seconds"]=round(time.monotonic()-inference_started,3)
+            consecutive_failures = 0
             event["response"]=vars(result)
             return result
         except Exception as exc:
+            consecutive_failures += 1
             event["error"]=type(exc).__name__
+            event["error_code"]=getattr(exc,"code",None)
+            event["http_status"]=getattr(exc,"status",None)
             raise
         finally:
-            lock.close()
+            if lock is not None:
+                lock.close()
             event["seconds"]=round(time.monotonic()-started,2)
             with (args.output / "main-calls.jsonl").open("a",encoding="utf-8") as handle:
                 handle.write(json.dumps(event,ensure_ascii=False)+"\n")
     providers._chat_once=recorded
+    if args.selection == 'conservative':
+        # Diagnostic only: old local selection with the candidate's prompt,
+        # output target and cumulative budget. This avoids confusing the old
+        # 24K task-limit rejection with evidence-selection quality.
+        from sandevistan_read.generation_context import CURRENT, mark_selected
+        original_selection = services.select_quality_evidence
+        def conservative_selection(*values, **options):
+            token = CURRENT.set(None)
+            try:
+                selected = original_selection(*values, **options)
+            finally:
+                CURRENT.reset(token)
+            mark_selected(selected)
+            return selected
+        services.select_quality_evidence = conservative_selection
+    if args.audit_mode == 'external':
+        async def external_audit(points, *unused):
+            return points
+        services._audit_summary_points = external_audit
     if args.script_file:
         from sandevistan_read import jobs
         fixed = json.loads((args.output / 'fixed-script.json').read_text())
@@ -121,7 +164,7 @@ async def worker(args) -> int:
             for kind in args.kind:
                 identifier=f"{corpus}-{kind}-{repeat}-{args.language}-{'audio' if args.audio else 'text'}"
                 if any(item['id']==identifier for item in results):continue
-                event={"id":identifier,"kind":kind,"corpus":corpus,"repeat":repeat,"model":pinned['model'],"status":"running", "script_reused":bool(args.script_file)}
+                event={"id":identifier,"kind":kind,"corpus":corpus,"repeat":repeat,"model":pinned['model'],"status":"running", "script_reused":bool(args.script_file), 'strategy':args.strategy,'audit_mode':args.audit_mode}
                 save(args.output / "current.json",event)
                 started=time.monotonic()
                 try:
@@ -141,7 +184,7 @@ async def worker(args) -> int:
                         result={'turns':turns,'degraded':any(t.get('degraded') for t in turns)}
                     elif args.audio:
                         from sandevistan_read.jobs import enqueue,_podcast
-                        payload={'source_ids':ids,'language':args.language,'minutes':args.minutes or (5 if corpus=='bitcoin' else 30),'duration_mode':'fixed'}
+                        payload={'source_ids':ids,'language':args.language,'minutes':args.minutes or (5 if corpus=='bitcoin' else 30),'duration_mode':args.duration_mode}
                         job=enqueue('podcast',notebook,payload)
                         audio_lock=sqlite3.connect(ROOT/'runtime/evals/.context-audio.sqlite',timeout=0)
                         try:
@@ -157,10 +200,12 @@ async def worker(args) -> int:
                         finally:
                             audio_lock.close()
                     else:
-                        result=await podcast.build_podcast_script(notebook,{'source_ids':ids,'language':args.language,'minutes':args.minutes or (5 if corpus=='bitcoin' else 30 if corpus=='geb' else 20),'duration_mode':'fixed'},allow_partial=True)
+                        result=await podcast.build_podcast_script(notebook,{'source_ids':ids,'language':args.language,'minutes':args.minutes or (5 if corpus=='bitcoin' else 30 if corpus=='geb' else 20),'duration_mode':args.duration_mode},allow_partial=True)
                         event['script_only']=True
                     event['result']=result
                     payload=result.get('payload') or result
+                    event['delivery_status']=payload.get('delivery_status') or ('script_only' if event.get('script_only') else 'full')
+                    event['full_target_completed']=event['delivery_status']=='full' and not event.get('script_only')
                     event['status']='degraded' if payload.get('degraded') or payload.get('warnings') or result.get('status')=='partial' else 'passed'
                 except Exception as exc:
                     event.update(status='failed',error=f'{type(exc).__name__}: {exc}')
@@ -168,6 +213,9 @@ async def worker(args) -> int:
                 results.append(event);save(result_path,results)
                 save(args.output / (identifier+'.json'),event)
                 print(identifier,event['status'],event['seconds'],flush=True)
+                if consecutive_failures >= 3:
+                    save(args.output / 'stopped.json', {'reason':'three_consecutive_provider_failures'})
+                    return 2
     return int(any(item['status']=='failed' for item in results))
 
 
@@ -179,6 +227,11 @@ def main() -> int:
     parser.add_argument('--prepare',action='store_true')
     parser.add_argument('--sample',action='append',default=[],metavar='NAME=PATH',help='Preparation sample overrides: bitcoin, geb, strange-loop')
     parser.add_argument('--provider-id')
+    parser.add_argument('--main-concurrency',type=int,choices=[1,2],default=1,help='At most two independent remote MAIN calls; default serial. Ollama remains serial.')
+    parser.add_argument('--selection',choices=['native','conservative'],default='native',help='Diagnostic only: legacy selection with the candidate budget and prompts; requires external audit.')
+    parser.add_argument('--strategy',choices=['balanced','conservative'],default='balanced')
+    parser.add_argument('--context-window',type=int,help='Application-side input capacity for same-model comparisons; cannot exceed the configured window.')
+    parser.add_argument('--audit-mode',choices=['native','external'],default='native',help='External is an ablation only; results require independent review and cannot qualify native behavior.')
     parser.add_argument('--corpus',nargs='+',choices=['bitcoin','geb','multi'],default=['bitcoin','geb','multi'])
     parser.add_argument('--kind',nargs='+',choices=['summary','chat','quiz','flashcard','podcast'],default=['summary','chat','quiz','flashcard','podcast'])
     parser.add_argument('--repeats',type=int,default=2)
@@ -186,6 +239,7 @@ def main() -> int:
     parser.add_argument('--audio',action='store_true')
     parser.add_argument('--count',type=int,help='Quiz or Flashcard item count, validated against the request schema.')
     parser.add_argument('--difficulty',choices=['easy','medium','hard','mixed'],default='mixed')
+    parser.add_argument('--duration-mode',choices=['auto','fixed'],default='fixed')
     parser.add_argument('--minutes',type=int,choices=[5,10,20,30])
     parser.add_argument('--script-file',type=Path,help='Replay a frozen Podcast script through the complete AUDIO job; requires --audio.')
     parser.add_argument('--reference',type=Path,help='Frozen source-backed quality rubric, hashed into the run identity.')
@@ -197,6 +251,8 @@ def main() -> int:
         parser.error('--script-file requires --audio --kind podcast')
     if args.count is not None and (not set(args.kind) <= {'quiz','flashcard'} or not 1 <= args.count <= (30 if 'quiz' in args.kind else 50)):
         parser.error('--count requires only quiz/flashcard and a legal item count')
+    if args.selection != 'native' and (args.audit_mode != 'external' or args.strategy != 'balanced' or args.kind != ['summary']):
+        parser.error('--selection conservative requires --strategy balanced --audit-mode external --kind summary')
     if args.worker:return asyncio.run(worker(args))
     pinned = None
     if not args.prepare:
@@ -205,16 +261,32 @@ def main() -> int:
             pinned=provider_by_id(args.provider_id)
             if not pinned or pinned.get('role')!='main':raise ValueError('A configured MAIN provider is required')
         else:
-            pinned={'kind':'ollama','base_url':'http://100.80.59.126:11434','model':'gemma4:e4b','api_key':'','config':{'context_window_tokens':30720},'capabilities':{}}
+            pinned={'kind':'ollama','base_url':'http://100.80.59.126:11434','model':'gemma4:e4b','api_key':'','config':{'context_window_tokens':30720,'max_output_tokens':4096},'capabilities':{}}
+        if args.context_window is not None:
+            from sandevistan_read.context_budget import TokenLimits
+            if not 1024 <= args.context_window <= TokenLimits.from_provider(pinned).effective_context_tokens:
+                raise ValueError('Comparison window must be between 1024 and the configured effective window')
     if args.output.exists() and not args.resume:raise ValueError('Use a new output directory, or --resume for the same frozen run')
     identity={'source_root':str(args.source_root.resolve()),'provider_id':args.provider_id,'corpus':args.corpus,'kind':args.kind,'repeats':args.repeats,'language':args.language,'audio':args.audio}
+    identity['delivery_policy']='rated_v2' if (args.source_root/'src/sandevistan_read/delivery.py').exists() else 'legacy'
+    identity['duration_mode']=args.duration_mode
     identity.update(count=args.count,difficulty=args.difficulty,minutes=args.minutes)
+    identity.update(strategy=args.strategy,context_window=args.context_window,audit_mode=args.audit_mode)
+    if args.main_concurrency != 1:
+        identity['main_concurrency'] = args.main_concurrency
+    if args.selection != 'native':
+        identity['selection'] = args.selection
     if args.script_file:
         identity['script_hash']=hashlib.sha256(args.script_file.read_bytes()).hexdigest()
     if args.reference:
         identity['reference_hash']=hashlib.sha256(args.reference.read_bytes()).hexdigest()
     if pinned:
         public_settings={key:pinned.get(key) for key in ('kind','base_url','model','config','capabilities')}
+        from sandevistan_read.context_qualification import fingerprint
+        effective_provider = copy.deepcopy(pinned)
+        if args.context_window is not None:
+            effective_provider['config'] = {**effective_provider.get('config', {}), 'context_window_tokens': args.context_window}
+        identity['provider_fingerprint']=fingerprint(effective_provider)
         identity['provider_settings_hash']=hashlib.sha256(json.dumps(public_settings,sort_keys=True).encode()).hexdigest()
         identity['audio_url']=args.audio_url
         if args.fixture:
