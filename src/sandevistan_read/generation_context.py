@@ -44,6 +44,7 @@ class GenerationContext:
     cancel_check: Callable[[], bool] | None = None
     sent_by_stage: dict[str, set[str]] = field(default_factory=dict)
     audit: dict[str, Any] = field(default_factory=dict)
+    preparation: dict[str, Any] = field(default_factory=dict)
 
 
 CURRENT: ContextVar[GenerationContext | None] = ContextVar("generation_context", default=None)
@@ -53,6 +54,20 @@ def evidence_cost(row: dict[str, Any]) -> int:
     locator = row.get("locator") or json.loads(row.get("locator_json") or "{}")
     location = str(locator.get("section") or "") + str(locator.get("sheet") or "") + str(locator.get("cell_range") or "")
     return estimate_text_tokens(str(row["content"])) + estimate_text_tokens(str(row.get("filename") or "") + location) + 80
+
+
+def context_material(kind: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[int]]:
+    """Use identical eligibility and source costs in preview and execution."""
+    from . import retrieval
+    if kind == "podcast":
+        eligible = retrieval.podcast_candidates(retrieval.context_candidates(rows))
+    elif kind in {"summary", "chat"}:
+        eligible = retrieval.context_candidates(rows)
+    else:
+        eligible = [row for row in rows if retrieval.is_quality_chunk(row)]
+    costs = [evidence_cost(row) if kind in {"summary", "chat", "podcast"}
+             else estimate_text_tokens(row["content"]) + 80 for row in eligible]
+    return eligible, costs
 
 
 def current() -> GenerationContext | None:
@@ -103,7 +118,7 @@ def report(citations: list[dict[str, Any]] | None = None) -> dict[str, Any] | No
             "sources": details, "stages": {stage: {"sent_segments": len(ids),
                 "source_tokens": sum(estimate_text_tokens(row["content"]) for row in state.rows if row["id"] in ids)}
                 for stage, ids in state.sent_by_stage.items()},
-            "audit": state.audit,
+            "audit": state.audit, "preparation": {**state.preparation, "accepted_notes": len(state.notes)},
             "meaning": "原文选材与调用覆盖，不代表重要信息完整覆盖；预读不等于最终综合读取"}
 
 
@@ -148,11 +163,23 @@ async def prepare_evidence(rows: list[dict[str, Any]], language: str) -> list[di
     if not state or not state.plan.preparation_batches or state.preparation_attempted:
         return state.notes if state else []
     state.preparation_attempted = True
+    state.preparation = {"planned_batches": state.plan.preparation_batches, "attempted_batches": 0, "failed_batches": 0}
+    podcast = state.plan.kind == "podcast"
+    preparation_start = state.trace.accounted_tokens
+    rejected: dict[str, int] = {}
+    state.preparation["rejected"] = rejected
+    def reject(reason: str) -> None:
+        rejected[reason] = rejected.get(reason, 0) + 1
     from .context_budget import estimate_messages_tokens, pack_items
     from .providers import PromptBuild, budgeted_chat
     batches: list[list[dict[str, Any]]] = [[]]
     cost = 0
+    # Spread sources across batches; a long first book must not consume all preparation slots.
+    buckets: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        buckets.setdefault(row['source_id'], []).append(row)
+    ordered = [values[i] for i in range(max(map(len, buckets.values()), default=0)) for values in buckets.values() if i < len(values)]
+    for row in ordered:
         size = estimate_text_tokens(row["content"]) + 80
         if cost + size > state.plan.batch_evidence_tokens and batches[-1]:
             batches.append([])
@@ -160,30 +187,40 @@ async def prepare_evidence(rows: list[dict[str, Any]], language: str) -> list[di
         batches[-1].append(row)
         cost += size
     by_id = {row["id"]: row for row in rows}
-    for batch in batches[:4]:
+    for batch in batches[:state.plan.preparation_batches]:
         if state.cancel_check and state.cancel_check():
             raise RuntimeError("任务已取消")
-        if state.trace.request_limit is not None and state.trace.requests >= state.trace.request_limit - 4:
+        if state.trace.request_limit is not None and state.trace.requests >= state.trace.request_limit - 3:
             break
+        output = state.plan.preparation_output_tokens or state.plan.output_tokens
+        remaining = state.plan.preparation_token_limit - (state.trace.accounted_tokens - preparation_start)
+        if podcast and remaining < output + 1024:
+            state.preparation["stop_reason"] = "preparation_budget"
+            break
+        before_notes = len(state.notes)
         def build(budget: Any) -> Any:
-            note_slots = max(1, min(24, (budget.output_tokens - 512) // 400))
+            note_slots = max(1, min(len(batch), (budget.output_tokens - 512) // 400))
             prefix = (f"Read every supplied region. Extract up to {note_slots} distinct central claims, "
                       "including qualifications, exceptions and disagreements. Do not invent facts. "
-                      "Prioritize the central argument and mechanisms of each region over isolated anecdotes. "
+                      "Organize each note as the question or premise, the mechanism that answers it, and its necessary qualification. Prefer central arguments and source examples over isolated remarks. "
                       "Represent every supplied source and spread notes across its regions; do not merge different authors' claims. "
                       f"Write claims in {'English' if language == 'en' else 'Simplified Chinese'}. "
                       "Preserve who makes each statement and whether it is a hypothesis, fictional dialogue, example, or established assertion. "
                       'Return JSON {"notes":[{"chunk_id":"exact id","claim":"","qualification":"","statement_kind":"","quote":"verbatim supporting substring"}]}. '
                       "Keep each claim under 100 characters and the qualification under 60 characters. "
                       "The quote must be copied exactly from that chunk, 30 to 160 characters; do not use ellipses.\n")
+            input_limit = min(budget.input_tokens, remaining - output) if podcast else budget.input_tokens
             packed = pack_items(batch, lambda row: f"[{row['id']}|{row['source_id']}|{region(row)}] {row['content']}",
-                                max(0, budget.input_tokens - estimate_messages_tokens([{"role": "user", "content": prefix}]) - 16),
+                                max(0, input_limit - estimate_messages_tokens([{"role": "user", "content": prefix}]) - 16),
                                 group_key=lambda row: row["source_id"])
             return PromptBuild([{"role": "user", "content": prefix + "\n".join(packed.texts)}],
                                total_segments=packed.total, included_segments=len(packed.items),
                                truncated_segments=packed.truncated, metadata={"chunks": packed.items})
         try:
-            result = await budgeted_chat(build, json_mode=True, max_tokens=state.plan.output_tokens,
+            state.preparation["attempted_batches"] += 1
+            from .podcast_contracts import notes_schema
+            result = await budgeted_chat(build, json_mode=True, max_tokens=output,
+                                         **({"response_schema": notes_schema()} if podcast else {}),
                                          trace=state.trace, stage="context_prepare")
             try:
                 parsed = json.loads(result.content[result.content.find("{"):result.content.rfind("}") + 1])
@@ -203,19 +240,77 @@ async def prepare_evidence(rows: list[dict[str, Any]], language: str) -> list[di
                 parsed = {"notes": []}
             visible = {row["id"] for row in result.build.metadata["chunks"]}
             for note in parsed.get("notes") or []:
-                if not isinstance(note, dict) or note.get("chunk_id") not in visible:
+                identifier = note.get("chunk_id") if isinstance(note, dict) else None
+                # Some models omit the storage prefix. Resolve only an exact visible
+                # identifier; the verbatim quote check below remains mandatory.
+                if podcast and isinstance(identifier, str) and identifier not in visible and f"chunk_{identifier}" in visible:
+                    identifier = f"chunk_{identifier}"
+                if not isinstance(identifier, str) or identifier not in visible:
+                    reject("invalid_source_or_shape")
                     continue
-                original = by_id[note["chunk_id"]]
+                original = by_id[identifier]
                 quote = re.sub(r"\s+", " ", str(note.get("quote") or "")).strip()
                 if len(quote) < 30 or quote not in re.sub(r"\s+", " ", original["content"]):
+                    reject("quote_not_found_or_short")
                     continue
                 if str(note.get("claim") or "").strip():
                     state.notes.append({"chunk_id": original["id"], "claim": str(note["claim"])[:600],
                                         "statement_kind": str(note.get("statement_kind") or "unspecified")[:120],
                                         "qualification": str(note.get("qualification") or "")[:360], "quote": quote[:1200]})
+                else:
+                    reject("empty_claim")
         except Exception:
+            state.preparation["failed_batches"] += 1
             state.trace.mark_fallback()
+        if podcast and len(state.notes) == before_notes:
+            state.preparation["stop_reason"] = "no_accepted_notes"
+            break
+    state.preparation["accounted_tokens"] = state.trace.accounted_tokens - preparation_start
+    if state.cancel_check and state.cancel_check():
+        raise RuntimeError("任务已取消")
     return state.notes
+
+
+def synthesis_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select original passages, retaining source fallbacks when notes are missing."""
+    state = current()
+    if not state or not state.preparation_attempted:
+        return rows
+    noted = {note['chunk_id'] for note in state.notes}
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        buckets.setdefault(row['source_id'], []).append(row)
+    for values in buckets.values():
+        values.sort(key=lambda row: row['id'] not in noted)
+    ordered = [values[i] for i in range(max(map(len, buckets.values()), default=0)) for values in buckets.values() if i < len(values)]
+    remaining = state.plan.final_evidence_tokens or state.plan.evidence_tokens
+    selected = []
+    for row in ordered:
+        cost = evidence_cost(row)
+        if cost <= remaining:
+            selected.append(row)
+            remaining -= cost
+    return selected or rows[:1]
+
+
+def synthesis_hints(rows: list[dict[str, Any]], labels: list[str]) -> str:
+    """Attach bounded notes only when their original passage accompanies synthesis."""
+    state = current()
+    if not state or not state.notes:
+        return ""
+    visible = {row['id']: label for row, label in zip(rows, labels)}
+    remaining = min(state.plan.output_tokens, (state.plan.final_evidence_tokens or state.plan.evidence_tokens) // 4)
+    lines = []
+    for note in state.notes:
+        if note['chunk_id'] not in visible:
+            continue
+        line = json.dumps({'citation': visible[note['chunk_id']], 'claim': note['claim'],
+                           'qualification': note.get('qualification', ''), 'statement_kind': note.get('statement_kind', '')}, ensure_ascii=False)
+        cost = estimate_text_tokens(line) + 2
+        if cost <= remaining:
+            lines.append(line)
+            remaining -= cost
+    return ("\nPre-reading hints (fallible; verify attribution, conditions and every claim against the ORIGINAL passages below):\n" + "\n".join(lines) + "\n") if lines else ""
 
 
 def adaptive_generation(kind: str) -> Callable:
@@ -271,15 +366,14 @@ def adaptive_generation(kind: str) -> Callable:
             sources = list(sources_by_id.values())
             if not sources:
                 return await function(*args, **kwargs)
-            rows = (retrieval.context_candidates(rows) if actual_kind in {"summary", "chat"}
-                    else [row for row in rows if retrieval.is_quality_chunk(row)])
+            rows, costs = context_material(actual_kind, rows)
             if not rows:
                 return await function(*args, **kwargs)
-            costs = [evidence_cost(row) if actual_kind in {"summary", "chat"} else estimate_text_tokens(row["content"]) + 80 for row in rows]
             actual_kind = values.get("kind", kind)
             plan = plan_context(TokenLimits.from_provider(provider), actual_kind,
                                 material_tokens=sum(costs), segment_tokens=math.ceil(sum(costs) / len(costs)),
-                                count=values.get("count", 10), minutes=payload.get("minutes") or 20)
+                                count=values.get("count", 10), minutes=payload.get("minutes") or 20,
+                                source_count=len(sources), broad_query=bool(re.search(r"每份|各份|分别|所有|对比|比较|\b(?:each|all|across|compare)\b", str(values.get('query') or ''), re.I)))
             if actual_kind not in {"summary", "chat"} and not any(cost <= plan.evidence_tokens for cost in costs):
                 # Existing builders can clip individual passages and preserve
                 # local fallbacks when the window cannot hold one full chunk.

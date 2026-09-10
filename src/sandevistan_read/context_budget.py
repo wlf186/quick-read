@@ -57,6 +57,9 @@ def positive_int(value: Any) -> int | None:
 def validate_token_overrides(config: dict[str, Any]) -> None:
     if "context_strategy" in config and config["context_strategy"] not in ("balanced", "conservative"):
         raise ValueError("上下文策略必须是 balanced 或 conservative")
+    effort = config.get("reasoning_effort")
+    if effort is not None and (not isinstance(effort, str) or effort not in {"low", "medium", "high", "xhigh", "max"}):
+        raise ValueError("reasoning_effort 必须是 low、medium、high、xhigh 或 max")
     context_value = config.get("context_window_tokens")
     output_value = config.get("max_output_tokens")
     if context_value is not None:
@@ -193,8 +196,25 @@ def prompt_budget(limits: TokenLimits, requested_output: int, minimum_output: in
     return PromptBudget(limits.effective_context_tokens, input_tokens, output, limits.image_tokens_per_image, scale)
 
 
-CONTEXT_STRATEGY_VERSION = "evidence_v4"
+CONTEXT_STRATEGY_VERSION = "evidence_v6"
 TASK_TOKEN_CEILING = 300_000
+PODCAST_TASK_TOKEN_CEILING = TASK_TOKEN_CEILING * 5 // 4
+
+
+def task_token_ceiling(context_tokens: int, kind: str) -> int:
+    """Bound broad synthesis by capacity; small tasks still budget actual demand."""
+    return max(TASK_TOKEN_CEILING, math.ceil(context_tokens * 1.25)) if kind in {"summary", "chat"} else PODCAST_TASK_TOKEN_CEILING if kind == "podcast" else TASK_TOKEN_CEILING
+
+
+def podcast_chapter_capacity(output_tokens: int, minutes: float) -> int:
+    """Bound the compact chapter map before any provider call."""
+    return min(6, max(1, (output_tokens - 768) // 512), max(1, math.ceil(minutes / 5)))
+
+
+def podcast_stage_minutes(output_tokens: int, language: str) -> float:
+    # Include JSON labels and variable tokenization; this is a planning estimate.
+    units_per_minute = 150 * 2 if language == "en" else 300 * 1.5
+    return max(.3, min(5.0, (output_tokens - 768) / (units_per_minute + 100)))
 
 
 @dataclass(frozen=True)
@@ -212,6 +232,13 @@ class ContextPlan:
     output_items: int
     limiting_factor: str
     path: str = "sampled"
+    final_evidence_tokens: int = 0
+    note_capacity: int = 0
+    overview_items: int = 0
+    preparation_token_limit: int = 0
+    preparation_output_tokens: int = 0
+    core_output_tokens: int = 0
+    podcast_chapters: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
@@ -224,13 +251,14 @@ def chat_history_budget(budget: PromptBudget) -> int:
     Reserving 10% of a million-token window would otherwise reduce evidence
     once the cumulative task ceiling binds. The cap meets that crossing point.
     """
-    usable_task_input = max(0, math.floor(TASK_TOKEN_CEILING * .75) - budget.output_tokens)
+    usable_task_input = max(0, math.floor(task_token_ceiling(budget.context_tokens, "chat") * .75) - budget.output_tokens)
     return min(budget.input_tokens, usable_task_input) // 10
 
 
 def plan_context(
     limits: TokenLimits, kind: str, *, material_tokens: int | None = None,
     segment_tokens: int = 1000, count: int = 10, minutes: int = 20,
+    source_count: int = 1, broad_query: bool = False,
 ) -> ContextPlan:
     """Plan bounded work from capacity and actual demand, never from a model name."""
     kind = {"flashcards": "flashcard", "podcasts": "podcast"}.get(kind, kind)
@@ -240,21 +268,30 @@ def plan_context(
                  "flashcard": 8192, "podcast": 16_384}[kind]
     budget = prompt_budget(limits, requested, 128, 1.0)
     if kind in {"summary", "chat"}:
-        # Hold output demand constant while evaluating the value of more input.
-        output = 1800 if kind == "chat" else structured_output_tokens(2200)
+        source_count = max(1, source_count)
+        desired_items = 6 if source_count == 1 else 6 + 4 * source_count
+        output = (min(8192, 1800 + 450 * (source_count - 1)) if broad_query else 1800) if kind == "chat" else max(structured_output_tokens(2200), 512 + desired_items * 350)
         budget = prompt_budget(limits, output, 128, 1.0)
         overhead = 4096 + (chat_history_budget(budget) if kind == "chat" else 0)
         capacity = max(0, budget.input_tokens - overhead)
         demand = material_tokens if material_tokens is not None else capacity
-        total = min(TASK_TOKEN_CEILING, max(24_000, math.ceil((min(demand, capacity) * 2 + budget.output_tokens * 4 + overhead) / .75)))
+        total = min(task_token_ceiling(limits.effective_context_tokens, kind), max(24_000, math.ceil((min(demand, capacity) * 2 + budget.output_tokens * 4 + overhead) / .75)))
         reserve = math.ceil(total * .25)
         evidence = min(demand, capacity, max(0, total - reserve - overhead - budget.output_tokens))
         direct = material_tokens is not None and evidence >= material_tokens
         reason = "资料已可容纳" if direct else "任务累计预算" if evidence < min(demand, capacity) else "有效上下文与输出预算"
+        final_evidence = min(evidence, max(12_000, budget.output_tokens * 6))
+        prepare = kind == "summary" and (source_count >= 3 or demand > final_evidence)
+        prepare = prepare or (kind == "chat" and broad_query and demand > final_evidence)
+        batches = min(4, max(1, math.ceil(evidence / max(1, final_evidence)))) if prepare else 0
+        batch_evidence = min(capacity, max(1, math.ceil(evidence / max(1, batches))))
+        items = min(desired_items, max(1, (budget.output_tokens - 512) // 350)) if kind == "summary" else 1
+        overview = min(6, max(1, items - min(source_count, items - 1))) if kind == "summary" and source_count > 1 else items if kind == "summary" else 0
         return ContextPlan(CONTEXT_STRATEGY_VERSION, kind, limits.effective_context_tokens,
-            budget.output_tokens, evidence, evidence, evidence // max(1, segment_tokens),
-            0, total, reserve, 6 if kind == "summary" else 1, reason,
-            "direct" if direct and kind == "summary" else "structured" if kind == "summary" else "query")
+            budget.output_tokens, evidence, batch_evidence if batches else evidence,
+            evidence // max(1, segment_tokens), batches, total, reserve, items, reason,
+            "prepared" if batches else "direct" if direct and kind == "summary" else "structured" if kind == "summary" else "query",
+            final_evidence, batches * max(1, (budget.output_tokens - 512) // 400), overview)
     # Reserve instructions, history, source labels and intermediate reasoning.
     batch = max(0, min(64_000, budget.input_tokens - 2048))
     per_item = {"chat": 450, "summary": 500, "quiz": 900, "flashcard": 500, "podcast": 500}[kind]
@@ -268,6 +305,8 @@ def plan_context(
     evidence = min(demand, batch * max(1, preparation), 120_000 if kind != "chat" else 32_000)
     work = (minutes * 4200 if kind == "podcast" else count * 1400 if kind in {"quiz", "flashcard"} else 12_000)
     total = min(TASK_TOKEN_CEILING, max(base, math.ceil((evidence * 2 + work) / 0.75)))
+    if kind == "podcast":
+        total = math.floor(total * 1.25)
     reserve = math.ceil(total * 0.25)
     # Requested duration/count can exceed the bounded task budget. Keep room
     # for evidence instead of allowing an aspirational output cost to erase it.
@@ -276,15 +315,26 @@ def plan_context(
     preparation = min(4, math.ceil(evidence / max(1, batch))) if preparation else 0
     if material_tokens is not None and evidence >= material_tokens:
         reason = "资料已可容纳"
-    elif total == TASK_TOKEN_CEILING or evidence == 120_000:
+    elif total == task_token_ceiling(limits.effective_context_tokens, kind) or evidence == 120_000:
         reason = "均衡任务总预算"
     elif batch == 64_000 or (kind == "chat" and evidence == 32_000):
         reason = "单阶段均衡预算"
     else:
         reason = "有效上下文与输出预算"
+    podcast_prepare = min(2, preparation) if kind == "podcast" else preparation
+    preparation_limit = total // 10 if kind == "podcast" else 0
+    preparation_output = min(2048, budget.output_tokens) if kind == "podcast" else 0
+    if kind == "podcast":
+        batch = min(batch, max(0, preparation_limit // max(1, podcast_prepare) - preparation_output - 2048))
     return ContextPlan(CONTEXT_STRATEGY_VERSION, kind, limits.effective_context_tokens,
                        budget.output_tokens, evidence, batch, evidence // max(1, segment_tokens),
-                       preparation, total, reserve, output_items, reason)
+                       podcast_prepare, total, reserve, output_items, reason,
+                       final_evidence_tokens=evidence,
+                       note_capacity=podcast_prepare * max(1, ((preparation_output or budget.output_tokens) - 512) // 400),
+                       preparation_token_limit=preparation_limit,
+                       preparation_output_tokens=preparation_output,
+                       core_output_tokens=min(6000, budget.output_tokens) if kind == "podcast" else 0,
+                       podcast_chapters=podcast_chapter_capacity(min(6000, budget.output_tokens), minutes) if kind == "podcast" else 0)
 
 
 T = TypeVar("T")
@@ -304,6 +354,7 @@ def pack_items(
     token_budget: int,
     *,
     group_key: Callable[[T], str] | None = None,
+    allow_truncation: bool = True,
 ) -> PackedItems:
     values = list(items)
     ordered: list[T] = []
@@ -327,7 +378,7 @@ def pack_items(
             texts.append(rendered)
             remaining -= cost
             continue
-        if remaining >= 64 and (not selected or (group_key and group_key(item) not in {group_key(value) for value in selected})):
+        if allow_truncation and remaining >= 64 and (not selected or (group_key and group_key(item) not in {group_key(value) for value in selected})):
             clipped, changed = truncate_text_tokens(rendered, remaining - 2)
             if clipped:
                 selected.append(item)

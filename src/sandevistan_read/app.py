@@ -698,7 +698,7 @@ def context_preview(body: ContextPreviewRequest):
         raise HTTPException(404, "Provider 不存在")
     known = stored.get("capabilities", {}).get("token_limits", {}) if stored and stored.get("model") == body.model else body.token_limits
     from .context_qualification import strategy_reason
-    from .generation_context import evidence_cost
+    from .generation_context import evidence_cost, context_material
     from .retrieval import context_candidates
     candidate = {**(stored or {}), "model": body.model, "config": body.config,
                  "capabilities": {**((stored or {}).get("capabilities") or {}), "token_limits": known}}
@@ -727,12 +727,12 @@ def context_preview(body: ContextPreviewRequest):
     def plans(provider_limits):
         result = []
         for kind in ("summary", "chat", "quiz", "flashcard", "podcast"):
-            eligible = None if rows is None else context_candidates(rows) if kind in {"summary", "chat"} else [row for row in rows if is_quality_chunk(row)]
-            costs = None if eligible is None else [evidence_cost(row) if kind in {"summary", "chat"} else estimate_text_tokens(row["content"]) + 80 for row in eligible]
+            eligible, costs = (None, None) if rows is None else context_material(kind, rows)
             size = sum(costs) if costs is not None else None
             mean = max(1, math.ceil(size / max(1, len(costs)))) if costs is not None else 1000
             plan = plan_context(provider_limits, kind, material_tokens=size, segment_tokens=mean,
-                                count=20 if kind == "flashcard" else 10, minutes=20).as_dict()
+                                count=20 if kind == "flashcard" else 10, minutes=20,
+                                source_count=len({row['source_id'] for row in eligible}) if eligible else 1).as_dict()
             if costs is not None and kind in {"summary", "chat"}:
                 plan["estimated_segments"] = len(costs) if sum(costs) <= plan["evidence_tokens"] else plan["estimated_segments"]
             result.append(plan)

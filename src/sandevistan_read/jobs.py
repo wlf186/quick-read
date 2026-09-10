@@ -259,13 +259,21 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         temporary.replace(manifest_path)
 
     manifest = json_load(manifest_path.read_text(encoding="utf-8"), {}) if manifest_path.exists() else {}
-    if current() and manifest.get("generated"):
-        restore_trace(current().trace, manifest["generated"].get("context_usage") or {})
-        if manifest.get("signature") == signature:
+    if current() and manifest.get("signature") == signature:
+        saved_usage = (manifest.get("generated") or {}).get("context_usage") or manifest.get("script_usage") or {}
+        if saved_usage:
+            restore_trace(current().trace, saved_usage)
+        if manifest.get("generated") or manifest.get("script_checkpoint"):
             checkpoint = manifest.get("context_selection") or {}
             allowed = {row["id"] for row in current().rows}
             for name in ("selected", "sent", "partial"):
                 getattr(current(), name).update(set(checkpoint.get(name) or []) & allowed)
+            for name in ("notes", "preparation", "sent_by_stage", "preparation_attempted"):
+                if name in checkpoint:
+                    value = checkpoint[name]
+                    if name == "sent_by_stage":
+                        value = {stage: set(ids) & allowed for stage, ids in value.items()}
+                    setattr(current(), name, value)
     selected_model_early = str(provider.get("model") or "")
     selected_device_early = str(config.get("compute_device") or "gpu")
     model_caps_early = next(
@@ -408,18 +416,37 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         def report(stage: str, progress: float) -> None:
             Reporter(job_id).update("script", stage, progress, current=progress, total=1, unit="阶段")
 
+        def script_checkpoint(value: dict[str, Any]) -> None:
+            if cancel_check():
+                raise RuntimeError("任务已取消")
+            saved = {"version": PODCAST_ENGINE_VERSION, "signature": signature, "script_checkpoint": value}
+            if current():
+                saved["script_usage"] = current().trace.as_dict()
+                saved["context_selection"] = {
+                    **{name: sorted(getattr(current(), name)) for name in ("selected", "sent", "partial")},
+                    "notes": current().notes, "preparation": current().preparation,
+                    "preparation_attempted": current().preparation_attempted,
+                    "sent_by_stage": {stage: sorted(ids) for stage, ids in current().sent_by_stage.items()},
+                }
+            save_manifest(saved)
+
         try:
             generated = await build_podcast_script(
                 notebook_id, payload, progress=report, act_ready=on_act_ready if overlap_enabled else None,
                 allow_partial=True,
                 cancel_check=cancel_check,
+                checkpoint_ready=script_checkpoint,
+                resume_checkpoint=manifest.get("script_checkpoint") if manifest.get("signature") == signature else None,
             )
             script_finished = time.perf_counter()
         except PodcastQualityError as exc:
             if speculative_task:
                 speculative_task.cancel()
                 await asyncio.gather(speculative_task, return_exceptions=True)
-            save_manifest({"version": PODCAST_ENGINE_VERSION, "signature": signature, "quality_failure": exc.report})
+            saved = json_load(manifest_path.read_text(encoding="utf-8"), {}) if manifest_path.exists() else {}
+            if saved.get("signature") != signature:
+                saved = {}
+            save_manifest({**saved, "version": PODCAST_ENGINE_VERSION, "signature": signature, "quality_failure": exc.report})
             raise RuntimeError(f"播客脚本未通过质量门槛：{exc}") from exc
         except Exception:
             if speculative_task:
@@ -437,6 +464,9 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
         }
         if current():
             manifest["context_selection"] = {name: sorted(getattr(current(), name)) for name in ("selected", "sent", "partial")}
+            manifest["context_selection"].update(notes=current().notes, preparation=current().preparation,
+                preparation_attempted=current().preparation_attempted,
+                sent_by_stage={stage: sorted(ids) for stage, ids in current().sent_by_stage.items()})
         save_manifest(manifest)
     _SCRIPT_RESULT.set(generated)
     if generated.get("delivery_status") == "draft_only":

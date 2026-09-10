@@ -1047,6 +1047,7 @@ class ChatCompletion:
     cached_tokens: int | None = None
     temperature: float | None = None
     temperature_source: str | None = None
+    response_model: str | None = None
 
 
 @dataclass
@@ -1097,6 +1098,7 @@ async def _chat_once(
     messages: list[dict[str, Any]],
     *,
     json_mode: bool,
+    response_schema: dict[str, Any] | None = None,
     timeout: float,
     max_tokens: int,
     temperature: float,
@@ -1119,7 +1121,7 @@ async def _chat_once(
                 "options": {"temperature": request_temperature, "num_predict": max_tokens, "num_ctx": limits.effective_context_tokens},
             }
             if json_mode:
-                payload["format"] = "json"
+                payload["format"] = response_schema or "json"
             response = await client.post(f"{provider['base_url'].rstrip('/')}/api/chat", json=payload, headers=headers)
             if not response.is_success:
                 raise _provider_response_error(response)
@@ -1136,6 +1138,9 @@ async def _chat_once(
             payload = {"model": provider["model"], "messages": messages, "temperature": request_temperature, "max_tokens": max_tokens}
             if json_mode:
                 payload["response_format"] = {"type": "json_object"}
+            effort = (provider.get("config") or {}).get("reasoning_effort")
+            if effort is not None:
+                payload["reasoning_effort"] = effort
             thinking = str((provider.get("config") or {}).get("thinking") or "auto")
             if thinking in {"disabled", "enabled"}:
                 # Zhipu-style thinking switch; reasoning tokens otherwise share the max_tokens budget.
@@ -1168,6 +1173,7 @@ async def _chat_once(
                 positive_int(prompt_details.get("cached_tokens")) or positive_int(usage.get("cached_tokens")),
                 request_temperature,
                 "provider" if (provider.get("config") or {}).get("temperature") is not None else "task_default",
+                response_model=str(result.get("model") or "") or None,
             )
     raise ProviderError(f"Provider {provider['kind']} cannot serve chat")
 
@@ -1220,6 +1226,7 @@ async def budgeted_chat(
     *,
     role: str = "main",
     json_mode: bool = False,
+    response_schema: dict[str, Any] | None = None,
     timeout: float = 180,
     max_tokens: int = 1400,
     minimum_output_tokens: int = 128,
@@ -1273,7 +1280,8 @@ async def budgeted_chat(
                 try:
                     result = await _chat_once(provider, build.messages, json_mode=json_mode,
                                              timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state else timeout,
-                                             max_tokens=output_tokens, temperature=temperature)
+                                             max_tokens=output_tokens, temperature=temperature,
+                                             **({"response_schema": response_schema} if response_schema is not None and provider.get("kind") == "ollama" else {}))
                 except Exception:
                     if trace:
                         trace.record_failure()

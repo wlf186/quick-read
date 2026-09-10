@@ -734,7 +734,7 @@ async def test_build_podcast_script_emits_v4_editorial_payload(monkeypatch: pyte
         "n1", {"source_ids": ["s1"], "minutes": 5, "duration_mode": "fixed"},
         act_ready=ready_acts.append,
     )
-    assert result["version"] == 4
+    assert result["version"] == podcast.PODCAST_ENGINE_VERSION
     assert result["engine"]["strategy"] == "editorial_acts"
     assert result["quality_report"]["passed"] is True
     assert result["chapters"][0]["turn_start"] < result["chapters"][1]["turn_start"]
@@ -949,9 +949,16 @@ def test_v3_quality_gate_rejects_underlength_episode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stale_checkpoint", [False, True])
+async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, monkeypatch: pytest.MonkeyPatch, stale_checkpoint: bool) -> None:
     work = tmp_path / "job-work"
     artifacts = tmp_path / "artifacts"
+    if stale_checkpoint:
+        (work / "job_quality").mkdir(parents=True)
+        (work / "job_quality" / "manifest.json").write_text(json.dumps({
+            "signature": "old-provider-or-sources", "generated": {"turns": ["obsolete"]},
+            "script_checkpoint": {"core_turns": ["obsolete"]},
+        }))
     monkeypatch.setattr(jobs, "PATHS", SimpleNamespace(job_work=work, artifacts=artifacts, root=tmp_path))
     monkeypatch.setattr(jobs, "active_provider", lambda role: {"name": "TTS", "model": "tts", "config": {}, "capabilities": {}})
     monkeypatch.setattr(jobs, "audio_provider_readiness", lambda provider: (True, "ready"))
@@ -971,8 +978,9 @@ async def test_quality_failure_stops_before_tts_and_persists_report(tmp_path, mo
     with pytest.raises(RuntimeError, match="未通过质量门槛"):
         await jobs._podcast("n1", {"source_ids": ["s1"], "minutes": 5}, "job_quality")
     manifest = json.loads((work / "job_quality" / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["version"] == 4
+    assert manifest["version"] == podcast.PODCAST_ENGINE_VERSION
     assert manifest["quality_failure"]["stage"] == "episode"
+    assert "generated" not in manifest and "script_checkpoint" not in manifest
     assert not synthesized
 
 
@@ -1102,7 +1110,7 @@ def test_cliche_gate_ignores_soft_boundary_content_words() -> None:
         "它给出的边界是双值性留下的入口。",
     ]
     for addition, index in zip(soft_additions, (0, 3, 6, 9, 12)):
-        turns[index]["text"] += addition
+        turns[index]["text"] = addition + turns[index]["text"]
     report = _run_quality_gate(turns, _gate_chapters())
     # 软族只统计、不参与判定：正当内容词不应导致失败
     assert report["cliche_family_counts"]["boundary_meta"] == 5
@@ -1161,7 +1169,7 @@ def test_guard_act_density_is_report_only() -> None:
     turns = _gate_ready_turns()
     # 命中集中在首个 Act：整集密度 0.1 与单族 3 都在限内，Act 密度 0.3 只记录不判定
     for index in (0, 1, 2):
-        turns[index]["text"] += "这不意味着机制失效。"
+        turns[index]["text"] = "这不意味着机制失效。" + turns[index]["text"]
     report = _run_quality_gate(turns, _gate_chapters())
     assert report["guard_act_density"][0]["density"] == 0.3
     assert report["guard_density"] == 0.1

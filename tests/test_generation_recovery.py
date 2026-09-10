@@ -177,14 +177,19 @@ async def test_partial_podcast_preserves_metrics_and_remaps_removed_turns(eviden
     monkeypatch.setattr(podcast, "select_podcast_evidence", lambda *args: [])
     monkeypatch.setattr(podcast, "build_evidence_cards", lambda *args: (cards, citations))
     monkeypatch.setattr(podcast, "build_claim_ledger", lambda *args: claims)
-    monkeypatch.setattr(podcast, "podcast_generation_profile", lambda: {"scene_turns": 8, "recent_turns": 4})
+    monkeypatch.setattr(podcast, "podcast_generation_profile", lambda: {"scene_turns": 8, "recent_turns": 4, "max_output_tokens": 4096})
 
     async def plan(*args):
         return {"episode_thesis": "Energy", "chapters": chapters}, False
 
     async def scene(**kwargs):
+        if kwargs["chapter"]["id"] == "core":
+            return [{"speaker": f"HOST_{speaker}", "text": f"资料解释光合作用中的能量转换机制，{key} 阶段 {i}。",
+                     "claim_ids": ["C1", "C2"], "citation_ids": ["E1"], "dialogue_act": "explain",
+                     "source_chapter_id": key, "exchange_id": f"core/{key}", "exchange_start": i == 0}
+                    for key in ["opening", "chapter_1", "chapter_2", "closing"] for i, speaker in enumerate(("A", "B"))], {"passed": True}
         index = len(kwargs["existing_turns"])
-        return [{"speaker": f"HOST_{speaker}", "text": f"资料解释光合作用中的能量转换机制，阶段 {index + i}。", "claim_ids": ["C1"], "citation_ids": ["E1"], "dialogue_act": "explain"} for i, speaker in enumerate(("A", "B"))], {"passed": True, "partial": True}
+        return [{"speaker": f"HOST_{speaker}", "text": f"资料解释光合作用中的能量转换机制，阶段 {index + i}。", "claim_ids": ["C1", "C2"], "citation_ids": ["E1"], "dialogue_act": "explain", "exchange_id": f"deep/{index}", "exchange_start": i == 0} for i, speaker in enumerate(("A", "B", "A", "B"))], {"passed": True, "partial": True}
 
     async def expansion(*args):
         raise RuntimeError("MAIN token 达到任务上限")
@@ -203,7 +208,8 @@ async def test_partial_podcast_preserves_metrics_and_remaps_removed_turns(eviden
     result = await podcast.build_podcast_script("n", {"source_ids": ["s"], "minutes": 5, "language": "zh-CN"}, allow_partial=True)
     assert result["degraded"] and not result["quality"]["passed"]
     assert result["duration"]["target_minutes"] == 5
-    assert len(result["turns"]) == 4
+    assert len(result["turns"]) == 12
+    assert [c["status"] for c in result["chapter_development"]] == ["compact", "expanded", "expanded", "compact"]
     if unsupported == [0]:
         assert result["turns"][0]["quality_issues"]
     assert result["chapters"][-1]["turn_end"] == len(result["turns"]) - 1

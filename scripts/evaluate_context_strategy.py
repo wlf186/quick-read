@@ -12,6 +12,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import httpx
 from pathlib import Path
 import shutil
 import sqlite3
@@ -23,10 +25,50 @@ import time
 ROOT = Path(os.environ.get("QUICK_READ_EVAL_REPOSITORY", Path(__file__).resolve().parents[1])).resolve()
 
 
+def lock_database(name: str, *, timeout: float = 0) -> sqlite3.Connection:
+    """Create the shared lock directory on fresh and isolated checkouts."""
+    directory = ROOT / "runtime/evals"
+    directory.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(directory / name, timeout=timeout)
+
+
 def save(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+class EvaluationFailurePolicy:
+    """Serial batch state: recovered request errors are not failed tasks."""
+    def __init__(self, path: Path):
+        self.path = path
+        self.state = json.loads(path.read_text()) if path.exists() else {
+            "version": 1, "consecutive_requests": 0, "consecutive_tasks": 0,
+            "request_errors": 0, "requests": 0, "tasks": 0, "stop_reason": None}
+
+    def before_request(self) -> None:
+        if self.state["stop_reason"]:
+            raise RuntimeError(f"Evaluation batch stopped: {self.state['stop_reason']}")
+
+    def request(self, success: bool, status: int | None = None) -> None:
+        self.state["requests"] += 1
+        self.state["request_errors"] += int(not success)
+        self.state["consecutive_requests"] = 0 if success else self.state["consecutive_requests"] + 1
+        if status in {401, 403, 429}:
+            self.state["stop_reason"] = "provider_access_or_quota"
+        elif self.state["consecutive_requests"] >= 3:
+            self.state["stop_reason"] = "three_consecutive_provider_failures"
+        save(self.path, self.state)
+
+    def task(self, result: dict) -> None:
+        artifact = result.get("result") or {}
+        artifact = artifact.get("payload", artifact)
+        failed = result.get("status") == "failed" or not artifact or artifact.get("delivery_status") == "draft_only" or artifact.get("narrative_status") == "incomplete"
+        self.state["tasks"] += 1
+        self.state["consecutive_tasks"] = self.state["consecutive_tasks"] + 1 if failed else 0
+        if self.state["consecutive_tasks"] >= 2 and not self.state["stop_reason"]:
+            self.state["stop_reason"] = "two_consecutive_task_failures"
+        save(self.path, self.state)
 
 
 def initialize_instance(path: Path, source: Path) -> None:
@@ -41,9 +83,50 @@ def initialize_instance(path: Path, source: Path) -> None:
     save(path / "source-hashes.json", {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (path / "src").rglob("*.py")})
 
 
+def override_provider(pinned: dict, *, model: str | None = None, context_window: int | None = None,
+                      max_output: int | None = None, reasoning_effort: str | None = None) -> dict:
+    """Clone settings and refresh model-specific limits without saving production state."""
+    from sandevistan_read.context_budget import TokenLimits, validate_token_overrides
+    from sandevistan_read.providers import _catalog_token_limits, _ollama_show_limits
+    result = copy.deepcopy(pinned)
+    if model and model != result.get("model"):
+        with httpx.Client(timeout=20, trust_env=False, follow_redirects=False) as client:
+            if result['kind'] == 'ollama':
+                response = client.post(result['base_url'].rstrip('/') + '/api/show', json={'model': model})
+                response.raise_for_status()
+                selected = response.json()
+            else:
+                response = client.get(result["base_url"].rstrip('/') + '/v1/models',
+                                      headers={"Authorization": "Bearer " + result.get("api_key", "")})
+                response.raise_for_status()
+                selected = next((m for m in response.json().get("data", []) if m.get("id") == model), None)
+        if selected is None:
+            raise ValueError("Requested model is absent from the provider catalog")
+        limits = _ollama_show_limits(selected) if result['kind'] == 'ollama' else _catalog_token_limits(selected)
+        maximum = limits.get("model_context_tokens")
+        if not maximum:
+            raise ValueError("Model override requires a reported context limit")
+        result["model"] = model
+        result["capabilities"] = {"token_limits": {**limits, "effective_context_tokens": maximum,
+                                  "context_source": "provider_metadata"}, "model_metadata": selected}
+        result["config"] = {k:v for k,v in result.get("config", {}).items()
+                            if k not in {"context_window_tokens", "max_output_tokens"}}
+    maximum = TokenLimits.from_provider(result).model_context_tokens or TokenLimits.from_provider(result).effective_context_tokens
+    if context_window is not None and not 1024 <= context_window <= maximum:
+        raise ValueError("Comparison window exceeds the model's reported limit")
+    config = result.setdefault("config", {})
+    for key, value in (("context_window_tokens", context_window), ("max_output_tokens", max_output), ("reasoning_effort", reasoning_effort)):
+        if value is not None:
+            config[key] = value
+    if reasoning_effort:
+        config["thinking"] = "enabled"
+    validate_token_overrides(config)
+    return result
+
+
 async def worker(args) -> int:
     from sandevistan_read.database import DB, json_dump, utc_now
-    from sandevistan_read import providers, services, study, podcast
+    from sandevistan_read import providers, services, study, podcast, jobs
     from sandevistan_read.security import VAULT
     DB.initialize()
     DB.seed("http://100.80.59.126:11434", "gemma4:e4b", args.audio_url)
@@ -53,8 +136,10 @@ async def worker(args) -> int:
     if args.prepare:
         now = utc_now()
         DB.execute("INSERT OR IGNORE INTO notebooks(id,title,created_at,updated_at) VALUES(?,?,?,?)", (notebook,"Context evaluation",now,now))
-        for name in ("bitcoin", "geb", "strange-loop"):
-            supplied=dict(value.split('=',1) for value in args.sample)
+        supplied=dict(value.split('=',1) for value in args.sample)
+        for name in supplied or ("bitcoin", "geb", "strange-loop"):
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+                raise ValueError("Sample names must be simple identifiers")
             sample = Path(supplied[name]).resolve() if name in supplied else next(p for p in (ROOT / ".experiment/samples" / name / "source").iterdir() if p.suffix.lower() in {".pdf", ".epub"})
             checksum = hashlib.sha256(sample.read_bytes()).hexdigest()
             existing=DB.fetchone("SELECT state FROM sources WHERE id=?",(name,))
@@ -77,21 +162,28 @@ async def worker(args) -> int:
     DB.execute("UPDATE provider_profiles SET kind=?,base_url=?,model=?,config_json=?,capabilities_json=?,secret_enc=? WHERE role='main'",
                (pinned["kind"],pinned["base_url"],pinned["model"],json_dump(pinned["config"]),json_dump(pinned.get("capabilities",{})),VAULT.encrypt(pinned.get("api_key", ""))))
     original = providers._chat_once
-    consecutive_failures = 0
+    batch_policy = EvaluationFailurePolicy(args.failure_state) if args.failure_state else None
+    consecutive_failures = batch_policy.state["consecutive_requests"] if batch_policy else 0
+    quota_stopped = False
     async def recorded(provider,messages,**kwargs):
-        nonlocal consecutive_failures
-        if consecutive_failures >= 3:
+        nonlocal consecutive_failures, quota_stopped
+        if batch_policy:
+            batch_policy.before_request()
+        if quota_stopped or consecutive_failures >= 3:
             raise RuntimeError("Evaluation stopped after three consecutive provider failures")
         assert provider["base_url"].rstrip('/')==pinned["base_url"].rstrip('/') and provider["model"]==pinned["model"], "MAIN changed during evaluation"
         started=time.monotonic()
-        event={"at":time.time(),"model":provider["model"],"options":kwargs,"estimated_input_chars":sum(len(str(m.get('content',''))) for m in messages)}
+        from sandevistan_read.context_budget import TokenLimits
+        limits = TokenLimits.from_provider(provider)
+        event={"at":time.time(),"model":provider["model"],"options":kwargs,"estimated_input_chars":sum(len(str(m.get('content',''))) for m in messages),
+               "num_ctx": limits.effective_context_tokens, "num_predict": kwargs.get('max_tokens'), "thinking": False if provider['kind'] == 'ollama' else None}
         key=hashlib.sha256((pinned['base_url']+pinned['model']).encode()).hexdigest()[:16]
         lock = None
         try:
             while lock is None:
                 for slot in range(args.main_concurrency):
                     suffix = '' if slot == 0 else f'-{slot}'
-                    attempt = sqlite3.connect(ROOT / 'runtime/evals' / f'.context-main-{key}{suffix}.sqlite', timeout=0)
+                    attempt = lock_database(f'.context-main-{key}{suffix}.sqlite')
                     try:
                         attempt.execute('BEGIN IMMEDIATE')
                     except sqlite3.OperationalError as exc:
@@ -109,13 +201,20 @@ async def worker(args) -> int:
             result=await original(provider,messages,**kwargs)
             event["inference_seconds"]=round(time.monotonic()-inference_started,3)
             consecutive_failures = 0
+            if batch_policy:
+                batch_policy.request(True)
             event["response"]=vars(result)
             return result
         except Exception as exc:
             consecutive_failures += 1
+            if batch_policy:
+                batch_policy.request(False, getattr(exc, "status", None))
+            if getattr(exc, "status", None) in {401, 403, 429}:
+                quota_stopped = True
             event["error"]=type(exc).__name__
             event["error_code"]=getattr(exc,"code",None)
             event["http_status"]=getattr(exc,"status",None)
+            event["error_message"]=str(exc)[:2000]
             raise
         finally:
             if lock is not None:
@@ -124,6 +223,13 @@ async def worker(args) -> int:
             with (args.output / "main-calls.jsonl").open("a",encoding="utf-8") as handle:
                 handle.write(json.dumps(event,ensure_ascii=False)+"\n")
     providers._chat_once=recorded
+    original_transcribe = jobs.transcribe_audio
+    async def recorded_transcribe(*values, **options):
+        started = time.monotonic()
+        result = await original_transcribe(*values, **options)
+        save(args.output / 'asr-diagnostics.json', {'seconds': time.monotonic() - started, 'result': result})
+        return result
+    jobs.transcribe_audio = recorded_transcribe
     if args.selection == 'conservative':
         # Diagnostic only: old local selection with the candidate's prompt,
         # output target and cumulative budget. This avoids confusing the old
@@ -159,7 +265,7 @@ async def worker(args) -> int:
     result_path=args.output / "results.json"
     results=json.loads(result_path.read_text()) if result_path.exists() else []
     for corpus in args.corpus:
-        ids=[corpus] if corpus!='multi' else ['bitcoin','geb','strange-loop']
+        ids=args.source_ids or ([corpus] if corpus!='multi' else ['bitcoin','geb','strange-loop'])
         for repeat in range(1,args.repeats+1):
             for kind in args.kind:
                 identifier=f"{corpus}-{kind}-{repeat}-{args.language}-{'audio' if args.audio else 'text'}"
@@ -177,6 +283,10 @@ async def worker(args) -> int:
                         from sandevistan_read.schemas import ChatRequest
                         topic='工作量证明与双重支付' if corpus=='bitcoin' else '形式系统、自指与思维' if corpus=='geb' else '自指、层级与系统中的信任'
                         questions=[f'依据选中资料，解释{topic}的核心论点。','这个论点具体依赖哪些条件？','请举出资料中一个具体例子，并解释它的作用。','上面的解释有哪些限制或反例？','对照资料前部与后部，哪些内容补充或修正了前面的论点？','最后归纳这些区别，保留必要限定并给出原文依据。']
+                        if args.questions_file:
+                            questions = json.loads((args.output / 'questions.json').read_text())[args.language]
+                        elif args.language == 'en':
+                            questions = ['Explain the central argument in the selected sources.', 'Which conditions does that argument depend on?', 'Give a specific example from the sources and explain its role.', 'What limits or counterexamples do the sources give?', 'Compare the earlier and later sections: what qualifies the initial argument?', 'Summarize these distinctions with the necessary qualifications and source evidence.']
                         turns=[];conversation=None
                         for question in questions:
                             answer=await ask(notebook,ChatRequest(question=question,source_ids=ids,language=args.language,conversation_id=conversation))
@@ -186,7 +296,7 @@ async def worker(args) -> int:
                         from sandevistan_read.jobs import enqueue,_podcast
                         payload={'source_ids':ids,'language':args.language,'minutes':args.minutes or (5 if corpus=='bitcoin' else 30),'duration_mode':args.duration_mode}
                         job=enqueue('podcast',notebook,payload)
-                        audio_lock=sqlite3.connect(ROOT/'runtime/evals/.context-audio.sqlite',timeout=0)
+                        audio_lock=lock_database('.context-audio.sqlite')
                         try:
                             while True:
                                 try:audio_lock.execute('BEGIN IMMEDIATE');break
@@ -213,8 +323,10 @@ async def worker(args) -> int:
                 results.append(event);save(result_path,results)
                 save(args.output / (identifier+'.json'),event)
                 print(identifier,event['status'],event['seconds'],flush=True)
-                if consecutive_failures >= 3:
-                    save(args.output / 'stopped.json', {'reason':'three_consecutive_provider_failures'})
+                if batch_policy:
+                    batch_policy.task(event)
+                if quota_stopped or consecutive_failures >= 3 or (batch_policy and batch_policy.state['stop_reason']):
+                    save(args.output / 'stopped.json', {'reason':batch_policy.state['stop_reason'] if batch_policy else 'provider_access_or_quota' if quota_stopped else 'three_consecutive_provider_failures'})
                     return 2
     return int(any(item['status']=='failed' for item in results))
 
@@ -225,12 +337,18 @@ def main() -> int:
     parser.add_argument('--source-root',type=Path,default=ROOT)
     parser.add_argument('--fixture',type=Path)
     parser.add_argument('--prepare',action='store_true')
-    parser.add_argument('--sample',action='append',default=[],metavar='NAME=PATH',help='Preparation sample overrides: bitcoin, geb, strange-loop')
+    parser.add_argument('--sample',action='append',default=[],metavar='NAME=PATH',help='Preparation samples with arbitrary simple source identifiers')
     parser.add_argument('--provider-id')
+    parser.add_argument('--main-url', help='Explicit Ollama service address, mutually exclusive with --provider-id')
+    parser.add_argument('--model', help='Isolated model override; refreshes model metadata')
+    parser.add_argument('--max-output-tokens', type=int)
+    parser.add_argument('--reasoning-effort', choices=['low','high','max'])
+    parser.add_argument('--source-ids', nargs='+', help='Explicit source group in the frozen fixture')
+    parser.add_argument('--questions-file', type=Path, help='Frozen JSON mapping language to six questions')
     parser.add_argument('--main-concurrency',type=int,choices=[1,2],default=1,help='At most two independent remote MAIN calls; default serial. Ollama remains serial.')
     parser.add_argument('--selection',choices=['native','conservative'],default='native',help='Diagnostic only: legacy selection with the candidate budget and prompts; requires external audit.')
     parser.add_argument('--strategy',choices=['balanced','conservative'],default='balanced')
-    parser.add_argument('--context-window',type=int,help='Application-side input capacity for same-model comparisons; cannot exceed the configured window.')
+    parser.add_argument('--context-window',type=int,help='Application-side context capacity; cannot exceed a reported model limit.')
     parser.add_argument('--audit-mode',choices=['native','external'],default='native',help='External is an ablation only; results require independent review and cannot qualify native behavior.')
     parser.add_argument('--corpus',nargs='+',choices=['bitcoin','geb','multi'],default=['bitcoin','geb','multi'])
     parser.add_argument('--kind',nargs='+',choices=['summary','chat','quiz','flashcard','podcast'],default=['summary','chat','quiz','flashcard','podcast'])
@@ -240,13 +358,20 @@ def main() -> int:
     parser.add_argument('--count',type=int,help='Quiz or Flashcard item count, validated against the request schema.')
     parser.add_argument('--difficulty',choices=['easy','medium','hard','mixed'],default='mixed')
     parser.add_argument('--duration-mode',choices=['auto','fixed'],default='fixed')
-    parser.add_argument('--minutes',type=int,choices=[5,10,20,30])
+    parser.add_argument('--minutes',type=int,choices=range(5,31),help='Evaluation-only target 5–30 minutes; public API presets remain unchanged.')
     parser.add_argument('--script-file',type=Path,help='Replay a frozen Podcast script through the complete AUDIO job; requires --audio.')
     parser.add_argument('--reference',type=Path,help='Frozen source-backed quality rubric, hashed into the run identity.')
     parser.add_argument('--audio-url',default='http://127.0.0.1:20810')
+    parser.add_argument('--failure-state',type=Path,help='Shared serial batch failure counters; recovered errors do not fail a task.')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
     args=parser.parse_args();args.output=args.output.resolve()
+    if args.failure_state:
+        args.failure_state = args.failure_state.resolve()
+        if args.main_concurrency != 1 or args.prepare or args.kind != ["podcast"]:
+            parser.error("--failure-state requires a serial Podcast evaluation")
+    if args.main_url and args.provider_id:
+        parser.error('--main-url and --provider-id are mutually exclusive')
     if args.script_file and (not args.audio or args.kind != ['podcast']):
         parser.error('--script-file requires --audio --kind podcast')
     if args.count is not None and (not set(args.kind) <= {'quiz','flashcard'} or not 1 <= args.count <= (30 if 'quiz' in args.kind else 50)):
@@ -261,17 +386,20 @@ def main() -> int:
             pinned=provider_by_id(args.provider_id)
             if not pinned or pinned.get('role')!='main':raise ValueError('A configured MAIN provider is required')
         else:
-            pinned={'kind':'ollama','base_url':'http://100.80.59.126:11434','model':'gemma4:e4b','api_key':'','config':{'context_window_tokens':30720,'max_output_tokens':4096},'capabilities':{}}
-        if args.context_window is not None:
-            from sandevistan_read.context_budget import TokenLimits
-            if not 1024 <= args.context_window <= TokenLimits.from_provider(pinned).effective_context_tokens:
-                raise ValueError('Comparison window must be between 1024 and the configured effective window')
+            pinned={'kind':'ollama','base_url':args.main_url or 'http://100.80.59.126:11434','model':'gemma4:e4b','api_key':'','config':{'context_window_tokens':30720,'max_output_tokens':4096},'capabilities':{}}
+        pinned = override_provider(pinned, model=args.model, context_window=args.context_window,
+                                   max_output=args.max_output_tokens, reasoning_effort=args.reasoning_effort)
     if args.output.exists() and not args.resume:raise ValueError('Use a new output directory, or --resume for the same frozen run')
     identity={'source_root':str(args.source_root.resolve()),'provider_id':args.provider_id,'corpus':args.corpus,'kind':args.kind,'repeats':args.repeats,'language':args.language,'audio':args.audio}
     identity['delivery_policy']='rated_v2' if (args.source_root/'src/sandevistan_read/delivery.py').exists() else 'legacy'
+    if args.failure_state:
+        identity['failure_policy']='recovered_requests_v1'
+        identity['failure_state']=str(args.failure_state)
     identity['duration_mode']=args.duration_mode
     identity.update(count=args.count,difficulty=args.difficulty,minutes=args.minutes)
-    identity.update(strategy=args.strategy,context_window=args.context_window,audit_mode=args.audit_mode)
+    identity.update(strategy=args.strategy,context_window=args.context_window,audit_mode=args.audit_mode,source_ids=args.source_ids)
+    if args.questions_file:
+        identity['questions_hash']=hashlib.sha256(args.questions_file.read_bytes()).hexdigest()
     if args.main_concurrency != 1:
         identity['main_concurrency'] = args.main_concurrency
     if args.selection != 'native':
@@ -308,6 +436,8 @@ def main() -> int:
             shutil.copy2(args.script_file,args.output/'fixed-script.json')
         if args.reference:
             shutil.copy2(args.reference,args.output/'quality-reference.json')
+        if args.questions_file:
+            shutil.copy2(args.questions_file,args.output/'questions.json')
         shutil.copy2(Path(__file__),args.output/'evaluator.py')
     instance=args.output/'instance'
     environment={**os.environ,'SANDEVISTAN_PROJECT_ROOT':str(instance),'PYTHONPATH':str(instance/'src'),'QUICK_READ_EVAL_REPOSITORY':str(ROOT),'OMP_NUM_THREADS':'2','TOKENIZERS_PARALLELISM':'false'}

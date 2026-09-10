@@ -1,4 +1,4 @@
-export type EpisodeAudit={status:"complete"|"partial"|"unavailable";coverage_mode:"full"|"sampled";checked_transitions:number;total_transitions:number;reviewed_transitions:number[];reason?:string;repair_unreviewed?:boolean;transition_checks?:Array<{index:number;verdict:"connected"|"broken"|"uncertain";reason:string}>};
+export type EpisodeAudit={status:"complete"|"partial"|"unavailable";coverage_mode:"full"|"sampled";checked_transitions:number;total_transitions:number;reviewed_transitions:number[];requested_transitions?:number[];reason?:string;repair_unreviewed?:boolean;transition_checks?:Array<{index:number;verdict:"connected"|"broken"|"uncertain";reason:string}>};
 export type QualityAssessment={version:1;level:"good"|"fair"|"needs_review"|"unrated";method:string;total_units:number;reviewed_units:number;supported_units:number;issues:Array<{unit?:string;code:string;message:string;severity?:string}>};
 export type DeliveryStatus="full"|"partial"|"script_only"|"draft_only";
 export type Source={id:string;filename:string;state:string;selected:number;page_count:number;parser?:string;error?:string;metadata?:Record<string,any>};
@@ -8,7 +8,9 @@ export type NotebookBatchDeleteResponse={items:NotebookDeleteResult[]};
 export type Citation={id:string;filename:string;locator:Record<string,any>;quote:string;source_id:string};
 export type Job={id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
 export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:number};
-export type Artifact={id:string;type:'summary'|'quiz'|'flashcard'|'podcast';title:string;status:string;payload:Record<string,any>&{quality_assessment?:QualityAssessment;delivery_status?:DeliveryStatus};citations:Citation[];media_url?:string;language:string};
+export type SummaryPoint={claim:string;why_it_matters:string;qualification:string;citations:string[];source_id?:string|null;review_status?:string};
+export type SourceSummary={source_id:string;filename:string;points:SummaryPoint[];covered:boolean};
+export type Artifact={id:string;type:'summary'|'quiz'|'flashcard'|'podcast';title:string;status:string;payload:Record<string,any>&{quality_assessment?:QualityAssessment;delivery_status?:DeliveryStatus;generation_mode?:"complete_short"|"expanded"|"legacy";narrative_status?:"complete"|"incomplete"|"unverified";fact_review?:{status:"complete"|"partial"|"unavailable";total:number;reviewed:number;supported:number;contradicted:number;uncertain:number};chapter_development?:{id:string;status:"compact"|"expanded"|"restored"|"legacy"}[];source_contributions?:{source_id:string;included:boolean;reason:string}[];source_summaries?:SourceSummary[]};citations:Citation[];media_url?:string;language:string};
 export type ProviderRole='main'|'vlm'|'audio'|'tts_only';
 export type ConfigurableProviderRole='main'|'vlm'|'audio';
 export type ProviderKind='ollama'|'openai'|'sandevistan_audio'|'openai_tts';
@@ -73,7 +75,7 @@ export const reviewStudyCard=(id:string,item_id:string,rating:'again'|'hard'|'go
 export const suspendFlashcard=(artifactId:string,cardId:string)=>api<void>(`/artifacts/${artifactId}/flashcards/${cardId}`,{method:'DELETE'});
 export const flashcardsCsvUrl=(artifactId:string)=>`/api/artifacts/${artifactId}/flashcards.csv`;
 export const getProviders=()=>api<Provider[]>('/providers');
-export type ContextPlan={version:string;kind:string;context_tokens:number;output_tokens:number;evidence_tokens:number;batch_evidence_tokens:number;estimated_segments:number;preparation_batches:number;total_token_limit:number;final_reserve_tokens:number;output_items:number;limiting_factor:string;path?:string};
+export type ContextPlan={version:string;kind:string;context_tokens:number;output_tokens:number;evidence_tokens:number;batch_evidence_tokens:number;estimated_segments:number;preparation_batches:number;total_token_limit:number;final_reserve_tokens:number;output_items:number;limiting_factor:string;path?:string;final_evidence_tokens?:number;note_capacity?:number;overview_items?:number;preparation_token_limit?:number;preparation_output_tokens?:number;core_output_tokens?:number;podcast_chapters?:number};
 export type ContextPreview={strategy?:'balanced'|'conservative';strategies?:Record<string,'balanced'|'conservative'>;strategy_reasons?:Record<string,string>;plans:ContextPlan[];saved_plans:ContextPlan[];basis:string;candidate_segments:number|null;material_tokens:number|null;assumptions:string};
 export const previewContext=(body:Record<string,unknown>,signal?:AbortSignal)=>api<ContextPreview>('/providers/context-preview',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body),signal});
 export const getProviderRoles=()=>api<ProviderRoleState[]>('/provider-roles');

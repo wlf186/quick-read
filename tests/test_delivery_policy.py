@@ -41,7 +41,8 @@ async def test_coherence_review_discloses_only_visible_turns(monkeypatch, respon
     result = await podcast._audit_product_episode(turns, [{'turn_start':0,'turn_end':1}], 'Topic', 'en', ContextUsage(), {})
     assert 999 not in result.get('unsupported_turns', [])
     if '"broken_at":1' in response:
-        assert result['broken_at'] == 1
+        assert result['broken_at'] is None and not result['passed']
+        assert result['issues']
     else:
         assert not result['reviewed_indexes']
 

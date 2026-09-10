@@ -60,6 +60,13 @@ def cases(phase: str) -> list[dict]:
     return result
 
 
+def lock_database(name: str, *, timeout: float = 0) -> sqlite3.Connection:
+    """Create the shared lock directory on fresh and isolated checkouts."""
+    directory = ROOT / "runtime/evals"
+    directory.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(directory / name, timeout=timeout)
+
+
 def save(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -75,7 +82,7 @@ def serve(args: argparse.Namespace) -> None:
     DB.seed(args.main_url, args.model, args.audio_url)
     DB.execute("UPDATE provider_profiles SET active=0,selected=0 WHERE role='vlm'")
     DB.execute("UPDATE provider_role_settings SET enabled=0 WHERE role='vlm'")
-    DB.execute("UPDATE provider_profiles SET config_json=? WHERE role='main'", (json_dump({"context_window_tokens": 30720}),))
+    DB.execute("UPDATE provider_profiles SET config_json=? WHERE role='main'", (json_dump({"context_window_tokens": args.context_window, "max_output_tokens": args.max_output_tokens}),))
     DB.execute("UPDATE provider_profiles SET model='qwen3-tts-0.6b',config_json=? WHERE role='audio'", (json_dump({"auto_select": False, "compute_device": "gpu", "allow_device_fallback": True, "host_a": "Vivian", "host_b": "Dylan", "asr_model": "qwen3-asr-0.6b", "asr_auto_select": False, "asr_compute_device": "gpu", "asr_allow_device_fallback": True, "podcast_sequence_tts": True}),))
     original = providers._chat_once
 
@@ -83,7 +90,8 @@ def serve(args: argparse.Namespace) -> None:
         if provider["base_url"].rstrip("/") != args.main_url.rstrip("/") or provider["model"] != args.model:
             raise RuntimeError("Evaluation attempted to use a different MAIN provider")
         event = {"at": time.time(), "model": provider["model"], "messages": messages, "options": kwargs}
-        lock = sqlite3.connect(ROOT / "runtime/evals/.generation-main-lock.sqlite", timeout=0)
+        key = hashlib.sha256((provider["base_url"] + provider["model"]).encode()).hexdigest()[:16]
+        lock = lock_database(f".context-main-{key}.sqlite")
         try:
             while True:
                 try:
@@ -120,7 +128,7 @@ def evaluate(args: argparse.Namespace) -> int:
     output: Path = args.output
     output.mkdir(parents=True, exist_ok=True)
     instance = output / "instance"
-    identity = {"main_url": args.main_url, "model": args.model, "audio_url": args.audio_url, "sample_sha256": hashlib.sha256(args.sample.read_bytes()).hexdigest(), "phase": args.phase}
+    identity = {"main_url": args.main_url, "model": args.model, "audio_url": args.audio_url, "sample_sha256": hashlib.sha256(args.sample.read_bytes()).hexdigest(), "phase": args.phase, "context_window": args.context_window, "max_output_tokens": args.max_output_tokens}
     if args.case:
         identity["cases"] = sorted(set(args.case))
     manifest = output / "manifest.json"
@@ -143,7 +151,7 @@ def evaluate(args: argparse.Namespace) -> int:
         shutil.copy2(Path(__file__), output / "evaluator.py")
         save(output / "source-hashes.json", {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((ROOT / "src").rglob("*.py"))})
     environment = {**os.environ, "SANDEVISTAN_PROJECT_ROOT": str(instance), "PYTHONPATH": str(instance / "src"), "OMP_NUM_THREADS": "2", "TOKENIZERS_PARALLELISM": "false"}
-    command = [sys.executable, str(Path(__file__).resolve()), "--serve", "--output", str(output), "--port", str(args.port), "--main-url", args.main_url, "--model", args.model, "--audio-url", args.audio_url]
+    command = [sys.executable, str(Path(__file__).resolve()), "--serve", "--output", str(output), "--port", str(args.port), "--main-url", args.main_url, "--model", args.model, "--audio-url", args.audio_url, "--context-window", str(args.context_window), "--max-output-tokens", str(args.max_output_tokens)]
     results_path = output / "results.json"
     results = json.loads(results_path.read_text()) if results_path.exists() else []
     with (output / "server.log").open("a") as log, httpx.Client(base_url=f"http://127.0.0.1:{args.port}/api", timeout=1200) as client:
@@ -207,10 +215,10 @@ def evaluate(args: argparse.Namespace) -> int:
                 audio_lock = None
                 try:
                     if case["kind"] == "podcasts":
-                        audio_lock = sqlite3.connect(ROOT / "runtime/evals/.generation-audio-lock.sqlite", timeout=args.job_timeout)
+                        audio_lock = lock_database(".context-audio.sqlite", timeout=args.job_timeout)
                         audio_lock.execute("BEGIN IMMEDIATE")
                     config = {k: v for k, v in case["config"].items() if not k.startswith("_")}
-                    request("PATCH", f"/providers/{main['id']}", json={"config": {"context_window_tokens": 30720, **config}})
+                    request("PATCH", f"/providers/{main['id']}", json={"config": {"context_window_tokens": args.context_window, "max_output_tokens": args.max_output_tokens, **config}})
                     request("PATCH", f"/providers/{audio['id']}", json={"config": {**audio["config"], "auto_select": False, "podcast_sequence_tts": case["config"].get("_sequence", True)}})
                     if case["kind"] == "chat":
                         questions = ["What problem does proof of work solve in this paper?", "Why is it necessary?", "Compare these approaches in this order: 1. proof of work; 2. relying on a trusted third party.", "Explain the second approach more simply.", "Does that mean an attacker can never catch up? Correct that assumption.", "What is the current market price? Is that in the source?"] if case["payload"]["language"] == "en" else ["这份资料中的工作量证明解决什么问题？", "它为什么是必要的？", "请按这个顺序比较两种方式：第一种是工作量证明，第二种是依赖可信第三方。", "把刚才提到的第二种方式讲得更简单些。", "这是否意味着攻击者永远不可能追上？请纠正这个假设。", "现在市场价格是多少？资料里有这个信息吗？"]
@@ -286,6 +294,8 @@ def main() -> None:
     parser.add_argument("--sample", type=Path, default=ROOT / ".experiment/samples/bitcoin/source/bitcoin.pdf")
     parser.add_argument("--main-url", default="http://100.80.59.126:11434")
     parser.add_argument("--model", default="gemma4:e4b")
+    parser.add_argument("--context-window", type=int, default=30720)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--audio-url", default="http://127.0.0.1:20810")
     parser.add_argument("--port", type=int, default=20831)
     parser.add_argument("--phase", choices=("baseline", "matrix", "extras"), default="baseline")
@@ -294,6 +304,10 @@ def main() -> None:
     parser.add_argument("--job-timeout", type=float, default=10800)
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    from sandevistan_read.context_budget import validate_token_overrides
+    validate_token_overrides({'context_window_tokens': args.context_window, 'max_output_tokens': args.max_output_tokens})
+    if args.max_output_tokens >= args.context_window:
+        parser.error('--max-output-tokens must be smaller than --context-window')
     args.output = args.output.resolve()
     if args.serve:
         serve(args)

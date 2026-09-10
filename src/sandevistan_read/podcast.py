@@ -5,6 +5,8 @@ from .delivery import CURRENT as DELIVERY, delivery_task, assessment, claim_reco
 import json
 import math
 import re
+import unicodedata
+import copy
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
@@ -12,19 +14,20 @@ from typing import Any, Callable
 
 import httpx
 
-from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items, structured_output_tokens
+from .context_budget import ContextUsage, PromptBudget, TokenLimits, estimate_messages_tokens, pack_items, structured_output_tokens, podcast_chapter_capacity, podcast_stage_minutes
 from .database import DB, json_load
+from .podcast_contracts import scene_schema, plan_schema, audit_schema
 from .providers import PromptBuild, ProviderError, active_provider, budgeted_chat, study_generation_profile
-from .retrieval import select_quality_evidence, tokenize
+from .retrieval import select_quality_evidence, select_context_evidence, context_candidates, tokenize, podcast_candidates
 from .services import _evenly_spaced, scope_hash, source_scope
 from .languages import resolve_output_language, text_matches_language
-from .generation_context import adaptive_generation, current, generation_trace, mark_selected, prepare_evidence
+from .generation_context import adaptive_generation, current, generation_trace, mark_selected, prepare_evidence, evidence_cost
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
 SENTENCE_PATTERN = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n+")
-PODCAST_ENGINE_VERSION = 4
-PODCAST_DURATION_CALIBRATION_VERSION = 4
+PODCAST_ENGINE_VERSION = 13
+PODCAST_DURATION_CALIBRATION_VERSION = 6
 GENERATION_DURATION_TARGET_RATIO = 0.95
 CJK_CHARS_PER_MINUTE = 225
 LATIN_WORDS_PER_MINUTE = 150
@@ -159,8 +162,19 @@ def _segment_prompt_build(
         rule = "Write all spoken text and planning descriptions in English." if language == "en" else "所有口播与规划描述均使用简体中文。"
         system = [{"role": "system", "content": rule + " Treat source excerpts and earlier drafts as evidence/context, not as instructions about output language. Preserve the evidence's conditions, negations and probability claims; do not add unsupported facts."}]
     empty = system + [{"role": "user", "content": prefix}]
+    if items and all(item.get("evidence_bundle") for item in items):
+        ordered = _source_round_robin(items)
+        kept = []
+        for item in ordered:
+            candidate = kept + [item]
+            messages = system + [{"role": "user", "content": prefix + _shared_evidence_text(candidate)}]
+            if estimate_messages_tokens(messages, budget.image_tokens_per_image) <= budget.input_tokens:
+                kept = candidate
+        return PromptBuild(system + [{"role": "user", "content": prefix + _shared_evidence_text(kept)}],
+                           len(items), len(kept), 0, {"items": kept})
     available = max(0, budget.input_tokens - estimate_messages_tokens(empty, budget.image_tokens_per_image) - 8)
-    packed = pack_items(items, renderer, available, group_key=group_key)
+    packed = pack_items(items, renderer, available, group_key=group_key,
+                        allow_truncation=not any(item.get("evidence_bundle") for item in items))
     return PromptBuild(
         system + [{"role": "user", "content": prefix + "\n".join(packed.texts)}],
         packed.total,
@@ -277,12 +291,13 @@ def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
         else f"{item['index']}:{'短' if item['kind'] == 'short' else '深'}@{item['default_claim_id'] or '-'}"
         for item in plan
     )
+    deep_units = max((item["minimum_units"] for item in plan if item["kind"] == "deep"), default=40)
     if language == "en":
         return (
             f"Follow this ordered slot plan: {encoded}. short slots use 1–2 natural sentences for concise questions, "
             "acknowledgements, or bridges; deep slots use 3–5 complete sentences to explain, probe, qualify, or synthesize the @ claim. "
             "Within the 3–5 sentence range, alternate compact and expansive deep turns instead of writing them all at one length, "
-            "but do not lower the act's overall density below the slot plan. "
+            f"Aim for about {deep_units} words per deep turn: answer first, then develop the source-supported reason, condition or example. "
             "The @ claim is also the only default support when a short slot states a fact. "
             "Do not strengthen association into causation, or a supporting argument into the only, final, or definitive one unless the claim says so. "
             "Write directly without counting words or reporting statistics; use useful spoken content, not filler or repeated summaries."
@@ -290,7 +305,7 @@ def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
     return (
         f"严格执行按轮次排列的槽位计划：{encoded}。短槽用 1–2 个自然句完成简洁追问、回应或承接；"
         "深槽用 3–5 个完整但紧凑的句子解释、追问、辨析或综合 @ 后的主张；在 3–5 句范围内让紧凑轮与展开轮长短交替，"
-        "不要所有深槽写成同一长度，但整 Act 的总篇幅不得低于槽位计划的密度；"
+        f"深槽以约 {deep_units} 个中文等价字符为篇幅参考：先回应问题，再依据原文展开原因、条件或实例；"
         "短槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
         "除非主张本身明说，不得把相关性强化为因果，也不得把支持性论据说成‘唯一、最终、根本、证明’。"
         "直接写正文，不要在思考中逐字计数或输出统计；禁止填充语和重复总结。"
@@ -328,7 +343,59 @@ def _podcast_chunk_quality(row: dict[str, Any]) -> bool:
 
 def select_podcast_evidence(notebook_id: str, source_ids: list[str], focus: str, per_source: int = 20) -> list[dict[str, Any]]:
     limit = min(64, max(32, per_source * max(1, len(source_ids))))
-    return select_quality_evidence(notebook_id, source_ids, limit=limit, focus=focus)
+    state = current()
+    if state:
+        candidates = podcast_candidates(context_candidates([r for r in state.rows if r["source_id"] in source_ids]))
+        groups = _podcast_evidence_groups(candidates)
+        if focus.strip():
+            ranked = select_quality_evidence(notebook_id, source_ids, limit=limit, focus=focus)
+            rank = {r["id"]: i for i, r in enumerate(ranked)}
+            groups.sort(key=lambda r: rank.get(r["id"], len(rank)))
+            selected, charged = [], set()
+            remaining = state.plan.evidence_tokens
+            for group in groups:
+                fresh = {(r['source_id'], r['id']): r for r in group['evidence_rows']
+                         if (r['source_id'], r['id']) not in charged}
+                cost = sum(evidence_cost(r) for r in fresh.values())
+                if cost <= remaining:
+                    selected.append(group)
+                    charged.update(fresh)
+                    remaining -= cost
+        else:
+            selected = select_context_evidence(groups, state.plan.evidence_tokens, dependencies=lambda r: r['evidence_rows'])
+        result: dict[str, dict[str, Any]] = {}
+        for group in selected:
+            for row in group["evidence_rows"]:
+                result.setdefault(row["id"], {**row, "related_chunk_ids": [], "supporting_only": True})
+            result[group["id"]]["related_chunk_ids"] = [r["id"] for r in group["evidence_rows"]]
+            result[group["id"]]["supporting_only"] = False
+        values = list(result.values())
+        mark_selected(values)
+        return values
+    return podcast_candidates(select_quality_evidence(notebook_id, source_ids, limit=limit, focus=focus))
+
+
+def _podcast_evidence_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Charge adjacent qualifying context together with its original passage."""
+    positions = {(r["source_id"], r.get("ordinal")): r for r in rows if isinstance(r.get("ordinal"), int)}
+    continuation = re.compile(r"^(?:however\b|as such\b|unless\b|provided\b|this (?:means|requires)\b|but\b|然而|但是|仅当|前提|因此)", re.I)
+    groups = []
+    for row in rows:
+        pieces = [row]
+        ordinal = row.get("ordinal")
+        if isinstance(ordinal, int):
+            previous = positions.get((row["source_id"], ordinal - 1))
+            following = positions.get((row["source_id"], ordinal + 1))
+            if previous and (continuation.search(row["content"].lstrip()) or re.match(r"^[a-z]", row["content"].lstrip())):
+                pieces.insert(0, previous)
+            if following and (continuation.search(following["content"].lstrip()) or re.match(r"^[a-z]", following["content"].lstrip())):
+                pieces.append(following)
+        groups.append({**row, "content": "\n".join(p["content"] for p in pieces), "evidence_rows": pieces})
+    unique = {}
+    for group in groups:
+        key = tuple(sorted((r['source_id'], r['id']) for r in group['evidence_rows']))
+        unique.setdefault(key, group)
+    return list(unique.values())
 
 
 def build_evidence_cards(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -345,6 +412,9 @@ def build_evidence_cards(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any
             "filename": source_names.get(row["source_id"], "未知来源"),
             "locator": row.get("locator") or {},
             "content": content,
+            "ordinal": row.get("ordinal", index - 1),
+            "related_chunk_ids": row.get("related_chunk_ids", []),
+            "supporting_only": row.get("supporting_only", False),
         }
         cards.append(card)
         citations.append(
@@ -372,11 +442,24 @@ def _extract_json(raw: str) -> dict[str, Any]:
         return {}
 
 
+def _ordered_records(value: Any) -> list[Any] | None:
+    """Accept an array or an unambiguous contiguous numeric-key object."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict) and value:
+        for start in (0, 1):
+            keys = [str(i) for i in range(start, start + len(value))]
+            if set(value) == set(keys):
+                return [value[key] for key in keys]
+    return None
+
+
 def _extract_array(raw: str, key: str) -> list[Any] | None:
     """Recover only complete objects from a possibly truncated JSON list."""
     parsed = _extract_json(raw)
-    if isinstance(parsed.get(key), list):
-        return parsed[key]
+    values = _ordered_records(parsed.get(key))
+    if values is not None:
+        return values
     match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', raw)
     if not match:
         return None
@@ -399,10 +482,25 @@ def _extract_array(raw: str, key: str) -> list[Any] | None:
     return recovered or None
 
 
+def _spoken_question(text: str) -> bool:
+    """Use spoken syntax, never an advisory model label, to detect questions."""
+    ending = str(text or "").strip().rstrip('’\'”"')
+    if ending.endswith(("?", "？")):
+        return True
+    if ending.endswith(("。", ".", "!", "！")):
+        return False
+    last = re.split(r"[。!?！？]\s*", ending)[-1].strip()
+    return bool(re.search(r"(?:吗|呢)$", last) or re.match(
+        r"^(?:为什么|怎么|如何|是否|能否|难道|(?:so,?\s+)?(?:why|how|when|where|what)\s+(?:is|are|do|does|did|can|could|would|should|will)\b)",
+        last, re.I))
+
+
 def _coerce_dialogue_act(value: Any, text: str, claim_ids: Any) -> str:
     """Map compact act codes; tolerate small-model drift such as slot-plan tokens (短@C1/deep@C2)."""
     raw = str(value or "").split("@", 1)[0].strip()
     mapped = COMPACT_ACT_CODES.get(raw.upper())
+    if (mapped or raw.lower()) == "question" and not _spoken_question(text) and re.search(r"[。.!！][’'”\"]?$", str(text).strip()):
+        return "explain"
     if mapped:
         return mapped
     if raw.lower() in ALLOWED_DIALOGUE_ACTS:
@@ -418,7 +516,115 @@ def _coerce_dialogue_act(value: Any, text: str, claim_ids: Any) -> str:
 
 
 def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
+    mapped = _extract_json(raw) if '"chapter_bodies"' in raw else None
+    if isinstance(mapped, dict) and "chapter_bodies" in mapped:
+        bodies = mapped.get("chapter_bodies")
+        if not isinstance(bodies, dict) or not bodies:
+            return None
+        sections = [("opening", mapped.get("opening")), *bodies.items(), ("closing", mapped.get("closing"))]
+        complete = []
+        for key, values in sections:
+            if not isinstance(values, list) or not 2 <= len(values) <= 4:
+                return None
+            group = _extract_turns(json.dumps({"turns": values}, ensure_ascii=False)) or []
+            if len(group) != len(values) or (key != "opening" and _is_question_turn(group[-1])):
+                return None
+            for i, turn in enumerate(group):
+                turn.update(source_chapter_id=key, exchange_id=f"section/{key}", exchange_start=i == 0)
+            complete.extend(group)
+        return complete
+    parsed_core = _extract_json(raw) if '"opening"' in raw else None
+    if isinstance(parsed_core, dict) and any(key in parsed_core for key in ("opening", "body", "closing")):
+        sections = [parsed_core.get(key) for key in ("opening", "body", "closing")]
+        if not all(isinstance(section, list) and 2 <= len(section) <= 4 for section in sections):
+            return None
+        # These are narrative sections, not independently removable exchanges:
+        # an opening question may be answered by the first turn of the body.
+        complete = []
+        for index, section in enumerate(sections):
+            group = _extract_turns(json.dumps({"turns": section}, ensure_ascii=False)) or []
+            if len(group) != len(section):
+                return None
+            for position, turn in enumerate(group):
+                turn.update(exchange_id=f"exchange_{index + 1}", exchange_start=position == 0)
+            complete.extend(group)
+        if not complete or _is_question_turn(complete[-1]):
+            return None
+        return complete
+    if re.search(r'"exchanges"\s*:', raw):
+        exchanges = _extract_array(raw, "exchanges") or []
+        complete = []
+        pending: list[dict[str, Any]] = []
+        gap = False
+        for index, exchange in enumerate(exchanges):
+            if not isinstance(exchange, dict):
+                pending = []
+                gap = True
+                continue
+            values = _ordered_records(exchange.get('turns'))
+            if values is None:
+                pending = []
+                gap = True
+                continue
+            group = _extract_turns(json.dumps({"turns": values}, ensure_ascii=False)) or []
+            if len(group) != len(values) or any(
+                not isinstance(t.get("text"), str) or not t["text"].strip()
+                or t.get("speaker") not in {"HOST_A", "HOST_B"} for t in group
+            ):
+                pending = []
+                gap = True
+                continue
+            if len(pending) >= 2:
+                supports = {cid for t in pending for cid in t.get("claim_ids", [])}
+                if (_is_question_turn(pending[-1]) and group and not _is_question_turn(group[0])
+                        and pending[-1]["speaker"] != group[0]["speaker"]
+                        and (not supports or supports & set(group[0].get("claim_ids", [])))
+                        and len(pending) + len(group) <= 8):
+                    # A question need not cite a claim. Retain the adjacent
+                    # answer without inventing support for either turn.
+                    group = pending + group
+                    pending = []
+                    gap = False
+                else:
+                    pending = []
+                    gap = True
+            if gap and group and re.match(r"^(?:并不是|不是的|确实|没错|正是|因此|所以|也就是说|这|no\b|not really\b|yes\b|exactly\b|indeed\b|therefore\b|that\b)", group[0]["text"].lstrip(), re.I):
+                continue
+            gap = False
+            if len(group) == 1:
+                # Some providers put each turn in its own exchange object.
+                # Join only adjacent alternating turns on the same evidence,
+                # or a question and its following statement. Never bridge a
+                # malformed object or alter the provider's spoken text.
+                previous = pending[0] if pending else None
+                if previous and previous.get("speaker") != group[0].get("speaker") and (
+                    _is_question_turn(previous)
+                    or set(previous.get("claim_ids") or []) & set(group[0].get("claim_ids") or [])
+                ) and not _is_question_turn(group[0]):
+                    group = pending + group
+                    pending = []
+                else:
+                    pending = group
+                    continue
+            else:
+                pending = []
+            if not 2 <= len(group) <= 8:
+                pending = []
+                gap = True
+                continue
+            if _is_question_turn(group[-1]):
+                pending = group
+                continue
+            if not re.search(r"[。.!！][’'”\"]?$", str(group[-1].get("text") or "").strip()):
+                gap = True
+                continue
+            for position, turn in enumerate(group):
+                turn.update(exchange_id=f"exchange_{index + 1}", exchange_start=position == 0)
+            complete.extend(group)
+        return complete or None
     values = _extract_array(raw, "turns")
+    if values is None:
+        values = _ordered_records(_extract_json(raw))
     if values is None:
         return None
     turns: list[dict[str, Any]] = []
@@ -429,14 +635,32 @@ def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
             )
             if act:
                 value = {**value, "dialogue_act": act}
+            if str(value.get("speaker")).upper() in {"A", "B"}:
+                value = {**value, "speaker": "HOST_" + value["speaker"].upper()}
             turns.append(value)
             continue
+        if isinstance(value, list) and len(value) > 4 and all(
+            isinstance(identifier, str) and re.fullmatch(r"C\d+(?:[_|]E\d+)?", identifier)
+            for identifier in value[3:]
+        ):
+            # Compact models sometimes spread citation IDs into extra tuple
+            # fields. This is unambiguous only for recognized ID syntax.
+            value = value[:3] + [value[3:]]
         if not isinstance(value, list) or len(value) not in {3, 4}:
             if DELIVERY.get():
                 break
             continue
         speaker, act_code, text = value[:3]
         claim_ids = value[3] if len(value) == 4 else []
+        # A common compact variant omits act_code, not claim_ids. Preserve its
+        # actual prose instead of turning the reference array into spoken text.
+        if len(value) == 3 and isinstance(value[1], str) and isinstance(value[2], list):
+            speaker, text, claim_ids = value
+            act_code = "question" if text.rstrip().endswith(("?", "？")) else "explain"
+        if not isinstance(text, str):
+            if DELIVERY.get():
+                break
+            continue
         act = _coerce_dialogue_act(act_code, str(text or ""), claim_ids)
         if not act:
             continue
@@ -503,7 +727,7 @@ async def create_podcast_outline(cards: list[dict[str, Any]], language: str, foc
         if title and evidence_ids:
             chapters.append(
                 {
-                    "id": f"chapter_{len(chapters) + 1}",
+                    "id": f"chapter_{original_index}",
                     "title": title[:120],
                     "purpose": str(item.get("purpose") or title)[:300],
                     "evidence_ids": list(dict.fromkeys(evidence_ids))[:8],
@@ -545,7 +769,7 @@ async def create_podcast_outline(cards: list[dict[str, Any]], language: str, foc
 
 
 def _normalize_text(value: str) -> str:
-    value = re.sub(r"\[(?:E|S)\d+\]", "", value)
+    value = re.sub(r"\[[CES]\d+(?:\s*[,|，;]\s*[CES]\d+)*\]", "", value)
     value = re.sub(r"^(?:HOST_)?[AB]\s*[:：]\s*", "", value.strip(), flags=re.I)
     return re.sub(r"\s+", " ", value).strip(" -—")
 
@@ -835,34 +1059,81 @@ async def create_chapter_turns(
 
 
 def build_claim_ledger(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Create compact, source-addressable claims without asking the model to invent facts."""
+    """Keep source-addressable arguments intact, including their qualifications."""
     claims: list[dict[str, Any]] = []
+    by_chunk = {c.get("chunk_id"): c for c in cards if c.get("chunk_id")}
+    seen: set[tuple[str, tuple[str, ...]]] = set()
     for card in cards:
-        candidates = []
-        for sentence in _sentences(card["content"]):
-            text = re.sub(r"\s+", " ", sentence).strip()
-            latin = re.findall(r"[A-Za-z]", text)
-            starts_with_fragment = bool(latin) and len(latin) >= len(text.replace(" ", "")) * 0.6 and text[:1].islower()
-            if 24 <= len(text) <= 320 and not starts_with_fragment and not text.lower().startswith(("references ", "bibliography ")):
-                candidates.append(text)
-            if len(candidates) >= 2:
-                break
-        if not candidates and card["content"]:
-            candidates = [str(card["content"])[:260]]
-        for text in candidates:
-            claims.append(
-                {
-                    "id": f"C{len(claims) + 1}",
-                    "text": text,
-                    "evidence_ids": [card["id"]],
-                    "source_id": card["source_id"],
-                    "filename": card["filename"],
-                    "locator": card.get("locator") or {},
-                }
-            )
-            if not current() and len(claims) >= 64:
-                return claims
+        if card.get("supporting_only"):
+            continue
+        linked = [by_chunk[key] for key in card.get("related_chunk_ids", []) if key in by_chunk]
+        if not linked:
+            linked = [card]
+        original = "\n".join(c["content"] for c in linked)
+        identity = (card["source_id"], tuple(sorted(c["id"] for c in linked)))
+        if not identity[1] or identity in seen:
+            continue
+        seen.add(identity)
+        claims.append({"id": f"C{len(claims) + 1}", "text": card["content"],
+                       "evidence_ids": [c["id"] for c in linked], "source_id": card["source_id"],
+                       "filename": card["filename"], "locator": card.get("locator") or {},
+                       "qualification": "Read the complete original for its conditions; do not infer unconditional claims.",
+                       "original": original, "attribution": card["filename"],
+                       "statement_kind": "source_excerpt", "evidence_bundle": True, "preparation_notes": [],
+                       "ordinal": card.get("ordinal", len(claims)),
+                       "evidence_passages": [{k: c.get(k, "") for k in ("id", "chunk_id", "source_id", "filename", "content")} for c in linked]})
     return claims
+
+
+def _source_round_robin(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        buckets.setdefault(item["source_id"], []).append(item)
+    return [values[i] for i in range(max(map(len, buckets.values()), default=0)) for values in buckets.values() if i < len(values)]
+
+
+def _shared_evidence_payload(claims: list[dict[str, Any]]) -> dict[str, Any]:
+    passages, records = {}, {}
+    for claim in claims:
+        if claim.get("evidence_passages"):
+            for passage in claim["evidence_passages"]:
+                passages[passage["id"]] = {k: passage[k] for k in ("source_id", "filename", "content")}
+            records[claim["id"]] = {"evidence_ids": claim["evidence_ids"], "reading_hints": claim.get("preparation_notes", [])}
+        else:
+            records[claim["id"]] = {key: claim.get(key, "") for key in ("text", "filename", "qualification", "statement_kind", "original")}
+    return {"passages": passages, "claims": records}
+
+
+def _shared_evidence_text(claims: list[dict[str, Any]]) -> str:
+    return "\nRead each claim's referenced passages together, including all conditions. Shared passages appear once:\n" + json.dumps(_shared_evidence_payload(claims), ensure_ascii=False)
+
+
+def merge_prepared_claims(claims: list[dict[str, Any]], cards: list[dict[str, Any]],
+                          notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Notes guide reading; they never replace the source's remaining argument."""
+    result = copy.deepcopy(claims)
+    by_chunk = {c.get("chunk_id"): c["id"] for c in cards}
+    for note in notes:
+        evidence_id = by_chunk.get(note.get("chunk_id"))
+        for claim in result:
+            if evidence_id not in claim["evidence_ids"]:
+                continue
+            quote = re.sub(r"\s+", " ", str(note.get("quote") or "")).strip()
+            if not quote or quote not in re.sub(r"\s+", " ", claim["original"]):
+                continue
+            hint = {key: str(note.get(key) or "") for key in ("claim", "qualification", "statement_kind", "quote")}
+            hints = claim.setdefault("preparation_notes", [])
+            if hint not in hints:
+                hints.append(hint)
+    return result
+
+
+def _render_claim_bundle(claim: dict[str, Any]) -> str:
+    if claim.get("evidence_bundle"):
+        return (f"[{claim['id']}|{claim['filename']}] Source passage (interpret all sentences together):\n"
+                + claim["original"] + "\nReading hints, not additional evidence: "
+                + json.dumps(claim.get("preparation_notes", []), ensure_ascii=False))
+    return f"[{claim['id']}|{claim['filename']}] {claim['text']} Conditions: {claim.get('qualification', '')} Type: {claim.get('statement_kind', 'source_excerpt')}"
 
 
 def _fallback_episode_plan(claims: list[dict[str, Any]], language: str, act_count: int | None = None) -> dict[str, Any]:
@@ -894,6 +1165,67 @@ def _fallback_episode_plan(claims: list[dict[str, Any]], language: str, act_coun
     return {"episode_thesis": thesis, "chapters": chapters, "fallback": True}
 
 
+def _fit_episode_chapters(chapters: list[dict[str, Any]], target: int, language: str) -> list[dict[str, Any]]:
+    """Keep usable editorial structure and split long acts locally to fit output capacity."""
+    if DELIVERY.get():
+        # Reusing a claim for a different mechanism or qualification is legitimate.
+        seen = set()
+        unique = []
+        for chapter in chapters:
+            identity = (_review_text(chapter.get("new_information") or chapter.get("purpose", "")), tuple(sorted(chapter["claim_ids"])))
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(chapter)
+        return unique[:target]
+    if len(chapters) >= target:
+        return chapters[:target]
+    result = []
+    for index, chapter in enumerate(chapters):
+        parts = target // len(chapters) + int(index < target % len(chapters))
+        for part in range(parts):
+            item = {**chapter, "id": f"chapter_{len(result) + 1}"}
+            if parts > 1:
+                suffix = (f" Part {part + 1}/{parts}: develop the same argument using the actual preceding dialogue; do not repeat the introduction."
+                          if language == "en" else f" 第 {part + 1}/{parts} 段：依据真实前文继续展开同一论证，不重复开场。")
+                item["purpose"] = chapter["purpose"] + suffix
+            result.append(item)
+    return result
+
+
+def _ensure_plan_coverage(plan: dict[str, Any], visible: list[dict[str, Any]],
+                          assignments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Assign bounded core units locally when an outline omits a source topic."""
+    plan = copy.deepcopy(plan)
+    chapters = plan["chapters"]
+    by_id = {c["id"]: c for c in visible}
+    core = _source_round_robin(visible)[:2 * len(chapters)]
+    assignments = assignments if isinstance(assignments, dict) else {}
+    mapped, repaired = {}, []
+    for chapter in chapters:
+        chapter["required_unit_ids"] = []
+    for unit in core:
+        cid = unit["id"]
+        proposed = assignments.get(cid)
+        existing = next((i for i,c in enumerate(chapters) if cid in c["claim_ids"]), None)
+        index = proposed - 1 if type(proposed) is int and 1 <= proposed <= len(chapters) else existing
+        if index is None:
+            def rank(i: int) -> tuple[float, float, int, int]:
+                peers = [by_id[k] for k in chapters[i]["claim_ids"] if k in by_id and by_id[k]["source_id"] == unit["source_id"]]
+                distance = abs(float(unit.get("ordinal", 0)) - sum(float(c.get("ordinal", 0)) for c in peers) / len(peers)) if peers else 0
+                return (0 if peers else 1, distance, len(chapters[i]["claim_ids"]), i)
+            index = min(range(len(chapters)), key=rank)
+            repaired.append(cid)
+        chapter = chapters[index]
+        chapter["required_unit_ids"].append(cid)
+        if cid not in chapter["claim_ids"]:
+            chapter["claim_ids"].append(cid)
+        mapped[cid] = chapter["id"]
+    plan["coverage"] = {"provided_unit_ids": list(by_id), "required_unit_ids": [u["id"] for u in core],
+                        "assignments": mapped, "locally_assigned_unit_ids": repaired,
+                        "unassigned_unit_ids": [], "meaning": "Chapter assignment is not verified explanation coverage."}
+    return plan
+
+
 async def create_episode_plan(
     claims: list[dict[str, Any]], language: str, focus: str, trace: ContextUsage | None = None, act_count: int | None = None
 ) -> tuple[dict[str, Any], bool]:
@@ -905,6 +1237,18 @@ async def create_episode_plan(
 用户关注：{focus or '整体深度解读'}
 可用主张：
 """
+    if language == "en":
+        prompt_prefix = f"""Plan a source-grounded two-host knowledge podcast in English. Return exactly {target} connected acts, building one central argument. Do not write dialogue or invent facts.
+Alternate the lead host across acts. Use each claim only where relevant. The opening introduces the source and central question before details. Each act reaches a supported conclusion; the final act closes the central question without new facts.
+Return JSON with episode_thesis and chapters. Every chapter has title, purpose, tension, lead_host (HOST_A or HOST_B), claim_ids (allowed C IDs), bridge_in, bridge_out. Bridges describe future intentions, not dialogue that already occurred.
+Focus: {focus or 'Explain the central argument and its qualifications'}
+Available claims:
+"""
+    if DELIVERY.get():
+        prompt_prefix += "\nAlso return answer_path: how the central question reaches its answer. Each chapter includes new_information: the mechanism, source example or qualification it adds. Merge synonymous claims; do not allocate several acts to paraphrases. Preserve each author's distinct view. Do not invent a relation between unrelated sources. Each chapter also returns question, mechanism, required_conditions and optional_example, all grounded in its claim_ids. Keep these descriptions brief. Cover the main explanatory topics across the supplied passages: definitions, how it works, conditions and practical limits; do not crowd independent topics into a final catch-all chapter. The chapter bodies develop the argument; a separate opening and closing will be supplied.\n"
+    required_units = [c["id"] for c in _source_round_robin(claims)[:2 * target]]
+    if DELIVERY.get():
+        prompt_prefix += "\nReturn assignments mapping EVERY core unit ID to its main chapter number (1-based): " + json.dumps(required_units) + ". Each assigned unit's mechanism and essential conditions must be explained there, not merely cited. Reuse in other chapters is background, not a new topic. Cover all topics in a supplied unit, including its definitions and practical limitations.\n"
     try:
         generated = await budgeted_chat(
             lambda budget: _segment_prompt_build(
@@ -912,10 +1256,11 @@ async def create_episode_plan(
                 language=language,
                 prefix=prompt_prefix,
                 items=claims,
-                renderer=lambda claim: f"[{claim['id']}|{claim['filename']}] {claim['text']}",
+                renderer=_render_claim_bundle,
                 group_key=lambda claim: str(claim["source_id"]),
             ),
             json_mode=True,
+            **({"response_schema": plan_schema(target, required_units)} if DELIVERY.get() else {}),
             max_tokens=structured_output_tokens(1800),
             minimum_output_tokens=384,
             temperature=0.15,
@@ -925,19 +1270,17 @@ async def create_episode_plan(
         parsed = _extract_json(generated.content)
         available = {claim["id"] for claim in generated.build.metadata["items"]}
         chapters = []
-        used: set[str] = set()
-        for item in _extract_array(generated.content, "chapters") or []:
+        for original_index, item in enumerate(_extract_array(generated.content, "chapters") or [], start=1):
             if not isinstance(item, dict):
                 continue
-            claim_ids = [str(value) for value in item.get("claim_ids") or [] if str(value) in available and str(value) not in used]
+            claim_ids = [str(value) for value in item.get("claim_ids") or [] if str(value) in available]
             title = str(item.get("title") or "").strip()
             purpose = str(item.get("purpose") or "").strip()
             if not title or not purpose or not claim_ids:
                 continue
-            used.update(claim_ids)
             chapters.append(
                 {
-                    "id": f"chapter_{len(chapters) + 1}",
+                    "id": f"chapter_{original_index}",
                     "title": title[:120],
                     "purpose": purpose[:300],
                     "claim_ids": claim_ids[:10],
@@ -945,18 +1288,38 @@ async def create_episode_plan(
                     "bridge_out": str(item.get("bridge_out") or "")[:220],
                     "lead_host": "HOST_B" if str(item.get("lead_host") or "").upper() == "HOST_B" else "HOST_A",
                     "tension": str(item.get("tension") or "")[:260],
+                    "new_information": str(item.get("new_information") or purpose)[:400],
+                    **{key: str(item.get(key) or "")[:400] for key in ("question", "mechanism", "required_conditions", "optional_example")},
                 }
             )
-            if len(chapters) >= 8:
+            if len(chapters) >= target:
                 break
         thesis = str(parsed.get("episode_thesis") or "").strip()
-        if len(chapters) == target and thesis:
-            return {"episode_thesis": thesis[:400], "chapters": chapters, "fallback": False}, False
+        if chapters and thesis:
+            adjusted = len(chapters) != target and not DELIVERY.get()
+            if len(chapters) < target and not DELIVERY.get():
+                used = {claim_id for chapter in chapters for claim_id in chapter["claim_ids"]}
+                remaining = [claim for claim in generated.build.metadata["items"] if claim["id"] not in used]
+                if remaining:
+                    # An incomplete outline is not permission to repeat its
+                    # opening for the whole episode. Keep it and cover unused
+                    # evidence locally, without another planning request.
+                    chapters.extend(_fallback_episode_plan(remaining, language, target - len(chapters))["chapters"])
+                chapters = [{**chapter, "id": f"chapter_{index + 1}"} for index, chapter in enumerate(chapters)]
+            expanded = _fit_episode_chapters(chapters, target, language)
+            plan = {"episode_thesis": thesis[:400], "answer_path": str(parsed.get("answer_path") or "")[:600], "chapters": expanded, "fallback": False}
+            if DELIVERY.get():
+                assignments = parsed.get("assignments")
+                positions = {chapter["id"]: i for i, chapter in enumerate(expanded, start=1)}
+                remapped = {cid: positions.get(f"chapter_{number}") for cid, number in assignments.items()} if isinstance(assignments, dict) else {}
+                plan = _ensure_plan_coverage(plan, generated.build.metadata["items"], remapped)
+            return plan, adjusted
     except Exception:
         pass
     if trace:
         trace.mark_fallback()
-    return _fallback_episode_plan(claims, language, target), True
+    fallback = _fallback_episode_plan(claims, language, target)
+    return (_ensure_plan_coverage(fallback, claims) if DELIVERY.get() else fallback), True
 
 
 def podcast_generation_profile() -> dict[str, Any]:
@@ -996,7 +1359,7 @@ def _is_duplicate(text: str, turns: list[dict[str, Any]]) -> bool:
 
 
 def _is_question_turn(turn: dict[str, Any]) -> bool:
-    return turn.get("dialogue_act") == "question" or str(turn.get("text") or "").rstrip().endswith(("?", "？"))
+    return _spoken_question(str(turn.get("text") or ""))
 
 
 def _question_count_rule(target: int) -> str:
@@ -1075,13 +1438,19 @@ def validate_scene_turns(
                 break
             continue
         supplied_speaker = _speaker(source.get("speaker"))
-        text = _normalize_text(str(source.get("text") or ""))
+        raw_text = source.get("text")
+        if not isinstance(raw_text, str):
+            issues.append(f"第 {index + 1} 轮口播不是文本")
+            if allow_style_degradation:
+                break
+            continue
+        text = _normalize_text(raw_text)
         if not text:
             issues.append(f"第 {index + 1} 轮为空")
             if allow_style_degradation:
                 break
             continue
-        act = str(source.get("dialogue_act") or "").lower()
+        act = _coerce_dialogue_act(source.get("dialogue_act"), text, source.get("claim_ids"))
         raw_claim_ids = source.get("claim_ids") or []
         raw_claim_ids = [raw_claim_ids] if isinstance(raw_claim_ids, str) else raw_claim_ids
         claim_ids = list(dict.fromkeys(label for value in raw_claim_ids for label in re.findall(r"(?<![A-Z0-9])C\d+(?!\d)", str(value).upper()) if label in claims_by_id))
@@ -1100,7 +1469,7 @@ def validate_scene_turns(
         if not allow_style_degradation and ((scene_kind == "intro" and act == "outro") or (scene_kind in {"chapter", "boundary_repair"} and act in {"intro", "outro"})):
             issues.append(f"第 {index + 1} 轮 dialogue_act 不适合 {scene_kind}")
             continue
-        candidate_is_question = act == "question" or text.rstrip().endswith(("?", "？"))
+        candidate_is_question = _is_question_turn({"text": text})
         if candidate_is_question and question_run >= 2:
             issues.append(f"第 {index + 1} 轮造成跨 Act 连续问句过多")
             if not allow_style_degradation:
@@ -1144,7 +1513,9 @@ def validate_scene_turns(
             if default_claim_id in claims_by_id:
                 claim_ids = [str(default_claim_id)]
                 claim_id_source = "slot"
-        factual = act in FACTUAL_ACTS or bool(claim_ids) or bool(NUMBER_PATTERN.search(text))
+        factual = provisional_factual or bool(claim_ids)
+        if factual and not claim_ids and allow_style_degradation:
+            issues.append(f"第 {index + 1} 轮事实引用待核实，保留完整对话")
         if factual and not claim_ids and not allow_style_degradation:
             issues.append(f"第 {index + 1} 轮包含事实但没有 claim_id")
             continue
@@ -1172,6 +1543,10 @@ def validate_scene_turns(
                 "claim_id_inferred": claim_id_source in {"lexical", "slot"},
                 "claim_id_source": claim_id_source,
                 "safe": False,
+                "example_kind": source.get("example_kind") if source.get("example_kind") in {"source", "illustrative"} else "none",
+                **({"source_chapter_id": source["source_chapter_id"]} if source.get("source_chapter_id") else {}),
+                **({"exchange_id": source["exchange_id"], "exchange_start": bool(source.get("exchange_start"))}
+                   if source.get("exchange_id") else {}),
             }
         )
         previous = speaker
@@ -1238,7 +1613,10 @@ async def _draft_scene(
 ) -> SceneDraftResult:
     language_rule = "只输出自然的简体中文口语" if language != "en" else "Use natural spoken English only"
     start_speaker = "HOST_B" if memory.last_speaker == "HOST_A" else "HOST_A"
-    memory_json = json.dumps(memory.prompt_payload(profile["recent_turns"]), ensure_ascii=False)
+    memory_payload = memory.prompt_payload(profile["recent_turns"])
+    if profile.get("chapter_replacement"):
+        memory_payload["previously_cited_not_necessarily_explained"] = memory_payload.pop("covered_claim_ids")
+    memory_json = json.dumps(memory_payload, ensure_ascii=False)
     feedback = "；".join(repair_feedback or [])
     slot_plan = _turn_slot_plan(
         target,
@@ -1270,19 +1648,102 @@ async def _draft_scene(
 {f'上次草稿问题，必须修复：{feedback}' if feedback else ''}
 允许使用的主张：
 """
+    exchange_rule = (
+        "Write connected exchanges: a question must be directly answered or explicitly clarified in the very next turn before any new question. Both hosts may explain. Keep an answer with its question on the same claim; choose another allowed claim when a slot's suggested claim is irrelevant. End this act with a complete supported statement, not an unanswered question."
+        if language == "en" else
+        "按完整交流编写：提出问题后，紧接的下一轮必须先直接回答或明确澄清，之后才能提出新问题。双方都可以解释。同一问答使用相关的同一主张；槽位建议的主张不相关时改用允许列表内真正支持回答的主张。每个 Act 以完整且有依据的陈述收束，不留下未回答的问题。"
+    )
+    if language == "en":
+        opening = ("Continue from the ACTUAL recent dialogue. Answer any real unresolved closing question first; planned bridges are only future intentions."
+                   if memory.last_turns else "This is the episode opening. Introduce the source and central question. There is no earlier conversation; do not say 'as we discussed' or use missing antecedents.")
+        prompt_prefix = f"""Write a source-grounded two-host knowledge podcast in natural spoken English. All spoken text must be English even when evidence is in another language.
+{_scene_instruction(scene_kind, language)} {_delivery_instruction(language)}
+Generate exactly {target} turns, starting with {start_speaker}, strictly alternating speakers. The lead host for this act is {chapter.get('lead_host') or 'HOST_A'}; both hosts contribute substantive explanations and judgments.
+{exchange_rule}
+Use no more than {max(1, math.floor(target * .35))} questions in this act, regardless of act code. Most turns should explain rather than ask.
+{duration_rule} {_slot_plan_instruction(slot_plan, language)}
+Use varied sentence lengths. Explain premises, mechanisms and implications, preserving qualifications and uncertainty. Do not add outside facts, numbers, anecdotes or analogies. Do not read claim IDs or planning language aloud. Avoid repetitive reminders about what cannot be concluded.
+Return ONE JSON object with key turns. Each turn MUST be a four-element array: [speaker, act_code, text, claim_ids]. Speaker MUST be A or B. act_code MUST be I/F/B/Q/A/X/E/M/C/S/O. claim_ids MUST be an array of allowed C IDs. Fact-bearing turns need directly supporting claim IDs; purely conversational questions or bridges may use an empty array. Q turns end with a question mark. Do not nest arrays beyond claim_ids, output statistics, or add other fields.
+Actual episode memory: {memory_json}
+Act title: {chapter.get('title')}; purpose: {chapter.get('purpose')}; organizing tension (never read aloud): {chapter.get('tension')}; planned next topic: {chapter.get('bridge_out')}.
+{opening}
+Repair feedback: {feedback or 'None'}
+Allowed claims:
+"""
+    else:
+        prompt_prefix = exchange_rule + "\n" + prompt_prefix
+    if profile.get("allow_partial"):
+        exchange_count = max(1, math.ceil(target / 3))
+        units = int((duration_budget or {}).get("minimum_units") or target * (55 if language == "en" else 110))
+        per_exchange = math.ceil(units / exchange_count)
+        if language == "en":
+            prompt_prefix = f"""Write {exchange_count} self-contained exchanges for a source-grounded two-host podcast in natural English.
+Each exchange has 2–4 alternating turns. Both hosts explain; at most one question per exchange, directly answered by the next turn using the same relevant evidence. Answer the exact mechanism asked about, not just its purpose or a different mechanism. An explanation and its qualification belong together.
+Start each exchange by naming its topic so it remains understandable without the previous exchange. Do not start with pronouns or assume earlier dialogue. End each exchange with a complete supported statement. Do not repeat covered explanations, introductions or conclusions. No invented facts, analogies, numbers or spoken citation IDs.
+Write about {per_exchange} spoken words per exchange, distributed across the turns. Develop the source's mechanism, example and conditions rather than repeating the claim. If evidence cannot sustain this length, keep the complete shorter exchange.
+Act: {chapter.get('title')}; purpose: {chapter.get('purpose')}. Previously discussed: {memory_json}.
+Return JSON {{"exchanges":[{{"turns":[["A","X","spoken text",["C1"]],["B","X","spoken text",["C1"]]]}}]}}. The structure is an example, not text to repeat. Use A/B speakers, allowed act codes I/F/B/Q/A/X/E/M/C/S/O, and only actual allowed C IDs supporting each factual turn. Start with {start_speaker}. Keep original conditions, attribution and uncertainty.
+Allowed evidence:
+"""
+        else:
+            prompt_prefix = f"""用自然简体中文写 {exchange_count} 个可独立理解的双人播客交流单元。每单元2至4轮，两人交替且都能解释，每单元最多一个问句，紧接下一轮必须回答所问的具体机制，不能拿目的或另一机制代替答案。问答依据同一组相关主张，解释与必要限定一起讲清。
+每个单元开头点明具体主题，不用缺少前文的“这、因此、刚才”等指代；结尾为完整且有依据的陈述。不要重复讲过的介绍和结论，不增加外部事实、数字、类比，不念引用编号。
+每单元约 {per_exchange} 个汉字的口播，分配到各轮，用原文机制、例证与条件展开，不反复重述同一句主张。证据不足以支撑长度时保留完整短版。
+本章：{chapter.get('title')}；目的：{chapter.get('purpose')}。已经讨论过：{memory_json}。
+返回JSON {{"exchanges":[{{"turns":[["A","X","口播文本",["C1"]],["B","X","口播文本",["C1"]]]}}]}}。这是格式示意，不要照抄内容。说话人A/B，act_code为I/F/B/Q/A/X/E/M/C/S/O，事实轮只填真正支持内容的允许C编号，从{start_speaker}开始。保留原文的前提、作者及不确定性。
+允许证据：
+"""
+    role = profile.get("complete_role")
+    if role:
+        if language == "en":
+            task = ("This is a COMPLETE short episode, not its first chapter. Use three or more exchanges: introduce the source and central question, explain the answer with evidence, then close that SAME question. The last exchange is the episode conclusion; its last turn uses O. No teasers or promises of later explanation."
+                    if role == "core" else
+                    "This is OPTIONAL additional depth inserted before an existing conclusion. Explain a new mechanism, example or qualification, not the core explanation again. It must not change the existing conclusion or introduce an unanswered question. Do not say this is the first or final chapter.")
+        else:
+            task = ("本次要写的是一集完整短播客，不是第一章。至少三个交流单元：介绍资料和核心问题、依据原文解释答案、最后回答同一个核心问题并结束节目。最后单元是整集结论，最后一轮使用O。不要预告稍后再解释，不留下悬念。"
+                    if role == "core" else
+                    "本次是插入已有结论之前的可选深度展开：提供尚未解释的机制、案例或限定，不复述核心介绍。不能改变已有结论，不留下未答问题，不自称第一章或最后一章。")
+        prompt_prefix = task + "\n" + prompt_prefix
+    if role:
+        if profile.get("chapter_replacement"):
+            task = "Develop the current chapter in its narrative position. It replaces a short placeholder that the listener has NOT heard."
+            per_exchange = max(30, round(float((duration_budget or {}).get("minimum_units") or 300) / max(2, math.ceil(target / 3))))
+        contract = scene_schema(role, [c["id"] for c in claims], profile.get("core_chapter_ids"), max(2, math.ceil(target / 3)))
+        shape = ('{"opening":[turn,turn],"body":[turn,turn],"closing":[turn,turn]}' if role == "core"
+                 else '{"exchanges":[{"turns":[turn,turn]}]}')
+        prompt_prefix = f"""Write a source-grounded two-host learning podcast in {'natural English' if language == 'en' else '自然简体中文口语'}.
+{task}
+Use this JSON shape: {shape}. Each turn is an object with speaker (A/B), act_code (I/F/B/Q/A/X/E/M/C/S/O), text, claim_ids (array of allowed C IDs), example_kind (none/source/illustrative). Each group has 2–4 alternating turns. Start with {start_speaker}. No extra fields.
+Keep each question together with its direct answer. End each group with a complete supported statement, not a question. The core closing must answer the opening and end with act_code O.
+Aim for {max(2, math.ceil(target / 3)) if role != "core" else 3} groups. Write approximately {per_exchange} {'words' if language == 'en' else 'Chinese characters'} per group, but prefer a complete shorter explanation over padding.
+Build one continuous explanation: use the actual prior dialogue to connect ideas; do not restart the source introduction at every group. Both hosts contribute. Preserve qualifications, probability, and attribution to the source author. A hypothesis or philosophical position is not established fact. Prefer source examples. You may use a simple hypothetical analogy explicitly introduced as "打个比方" or "imagine"; mark example_kind illustrative. It illustrates the supported mechanism, not new evidence. Do not invent historical facts, figures or scientific conclusions. Preserve the limits of the analogy. Avoid repeated agreement and paraphrase: the other host probes a mechanism, challenges an inference, or applies it. Do not read IDs aloud.
+Chapter explanation contract: {json.dumps({key: chapter.get(key, "") for key in ("question", "mechanism", "required_conditions", "optional_example", "required_unit_ids")}, ensure_ascii=False)}
+The contract is a reading guide, not evidence. Verify it against the original, retaining probability and attribution even in a short answer.
+Episode question: {memory.thesis}
+Part: {chapter.get('title')}; purpose: {chapter.get('purpose')}; new information: {chapter.get('new_information') or chapter.get('purpose')}.
+Already explained (do not paraphrase again): {memory_json}
+Specific structural errors to fix: {feedback or 'None'}. Return the complete corrected structure; retain valid explanation and conclusion.
+Allowed evidence, author and conditions:
+"""
+    if profile.get("core_chapter_ids"):
+        prompt_prefix += "\nCORE MAP CONTRACT OVERRIDES THE EXAMPLE SHAPE: Return opening (2 turns), chapter_bodies (object with exactly these keys, 2 turns each), closing (2 turns). Keys in narrative order: " + json.dumps(profile["core_chapter_ids"]) + ". Each body explains its own chapter question, mechanism and required conditions using its full evidence bundle; Allocate the available output to a complete mechanism and its necessary conditions in each body before optional examples. Do not discard qualifications to meet an arbitrary body length. The opening establishes the question without summarizing the answers. Closing answers that question. Each body ends with a statement, so it remains usable if deeper writing fails.\nChapter purposes and allowed claims: " + json.dumps(profile["core_chapter_plan"], ensure_ascii=False)
+    if profile.get("chapter_replacement") and not profile.get("core_chapter_ids"):
+        prompt_prefix += "\nThis is the actual body of this chapter, replacing its compact placeholder, not an appendix to a finished explanation. Explain the mechanism step by step, use an example when useful, and keep necessary qualifications. Only the supplied preceding dialogue has already been spoken. No repeated source introduction, no final episode signoff. Complete the current reasoning. Part assignment: " + str(profile.get("part_assignment", ""))
+    output_limit = int(profile.get("stage_output_tokens") or round(_act_output_tokens(duration_budget, target, language) * output_boost))
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
-            budget,
+            replace(budget, input_tokens=min(budget.input_tokens, output_limit * 3)) if role and not (profile.get("chapter_replacement") or profile.get("core_chapter_ids")) else budget,
             language=language,
             prefix=prompt_prefix,
             items=claims,
-            renderer=lambda claim: f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
+            renderer=lambda claim: _render_claim_bundle(claim) if claim.get("evidence_bundle") else f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}\nAuthor/source: {claim.get('filename', '')}; type: {claim.get('statement_kind', 'unspecified')}; conditions: {claim.get('qualification', '')}\n" + _claim_evidence_text([claim["id"]], {claim["id"]: claim}, cards_by_id),
             group_key=lambda claim: str(claim["source_id"]),
         ),
         json_mode=True,
+        **({"response_schema": contract} if role else {}),
         timeout=420,
-        max_tokens=round(_act_output_tokens(duration_budget, target, language) * output_boost),
-        minimum_output_tokens=min(3600, max(700, target * 130)),
+        max_tokens=output_limit,
+        minimum_output_tokens=min(output_limit, 1200) if role else min(3600, max(700, target * 130)),
         temperature=0.45,
         trace=trace,
         stage="act_draft" if not repair_feedback else "targeted_repair",
@@ -1290,6 +1751,8 @@ async def _draft_scene(
     available_claims = {claim["id"]: claim for claim in generated.build.metadata["items"]}
     raw_turns = _extract_turns(generated.content)
     finish_reason = getattr(generated, "finish_reason", None)
+    if profile.get("core_chapter_ids") and raw_turns and {t.get("source_chapter_id") for t in raw_turns} != {"opening", "closing", *profile["core_chapter_ids"]}:
+        return SceneDraftResult([], ["Core map is missing or adds chapter IDs; return every requested section."], finish_reason)
     if not isinstance(raw_turns, list):
         reason = f"（结束原因：{finish_reason}）" if finish_reason else ""
         return SceneDraftResult([], [f"模型没有返回可解析的 turns 数组{reason}"], finish_reason)
@@ -1300,11 +1763,18 @@ async def _draft_scene(
         last_speaker=memory.last_speaker,
         existing_turns=existing_turns,
         language=language,
-        expected_count=target,
+        expected_count=max(target, len(raw_turns)) if profile.get("allow_partial") else target,
         scene_kind=scene_kind,
         default_claim_ids=[item["default_claim_id"] for item in slot_plan],
         allow_style_degradation=bool(profile.get("allow_partial")),
     )
+    if profile.get("allow_partial") and any(t.get("exchange_id") for t in raw_turns):
+        counts = Counter(t.get("exchange_id") for t in raw_turns)
+        valid_counts = Counter(t.get("exchange_id") for t in validated)
+        validated = [t for t in validated if valid_counts[t.get("exchange_id")] == counts[t.get("exchange_id")]]
+        for turn in validated:
+            if turn.get("exchange_id"):
+                turn["exchange_id"] = f"{chapter['id']}/{turn['exchange_id']}"
     return SceneDraftResult(validated, issues, finish_reason)
 
 
@@ -1406,7 +1876,7 @@ async def _continue_scene(
             language=language,
             prefix=prompt_prefix,
             items=claims,
-            renderer=lambda claim: f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
+            renderer=lambda claim: _render_claim_bundle(claim) if claim.get("evidence_bundle") else f"[{claim['id']}|{','.join(claim['evidence_ids'])}] {claim['text']}",
             group_key=lambda claim: str(claim["source_id"]),
         ),
         json_mode=True,
@@ -1518,6 +1988,7 @@ async def create_linked_scene(
                 profile=profile,
                 trace=trace,
                 duration_budget=duration_budget,
+                repair_feedback=deterministic_issues + (["Preserve this valid dialogue: " + json.dumps(draft, ensure_ascii=False)] if draft else []),
                 output_boost=2.0,
             ))
             draft, deterministic_issues, finish_reason = result.turns, result.issues, result.finish_reason
@@ -2030,7 +2501,9 @@ def _update_memory(memory: EpisodeMemory, turns: list[dict[str, Any]], chapter: 
     substantive = [turn["text"] for turn in turns if turn["claim_ids"]]
     if substantive:
         memory.chapter_summaries.append({"title": str(chapter.get("title") or ""), "summary": " ".join(substantive[-2:])[:360]})
-    memory.open_hook = str(chapter.get("bridge_out") or "")
+    # Planned bridges are intentions, not statements that have been spoken.
+    # Carry only a real unanswered closing question into the next act.
+    memory.open_hook = turns[-1]["text"] if turns and _is_question_turn(turns[-1]) else ""
     memory.last_turns = (memory.last_turns + turns)[-recent_limit:]
     memory.last_speaker = turns[-1]["speaker"] if turns else memory.last_speaker
 
@@ -2463,6 +2936,309 @@ async def repair_measured_duration(
     return revised
 
 
+def _complete_core_parts(turns: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep the complete closing exchange intact when adding optional depth."""
+    if not turns:
+        return [], []
+    last_id = turns[-1].get("exchange_id")
+    split = len(turns) - 2
+    if last_id:
+        split = next(i for i, turn in enumerate(turns) if turn.get("exchange_id") == last_id)
+    return turns[:max(0, split)], turns[max(0, split):]
+
+
+def _assemble_complete_episode(core: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    body, closing = _complete_core_parts(core)
+    turns: list[dict[str, Any]] = []
+    chapters = []
+    for identifier, title, values, optional in [("core_body", "核心解释 / Core", body, False),
+            *[(b["id"], b["title"], b["turns"], True) for b in blocks],
+            ("core_closing", "结论 / Conclusion", closing, False)]:
+        if not values:
+            continue
+        start = len(turns)
+        turns.extend(copy.deepcopy(values))
+        chapters.append({"id": identifier, "title": title, "turn_start": start, "turn_end": len(turns)-1,
+                         "optional": optional, "claim_ids": list(dict.fromkeys(c for t in values for c in t.get("claim_ids", [])))})
+    return turns, chapters
+
+
+def _drop_repeated_exchanges(turns: list[dict[str, Any]], prior: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop only complete repeated groups, retaining new groups from the same draft."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for index, turn in enumerate(turns):
+        groups.setdefault(str(turn.get("exchange_id") or f"legacy_{index}"), []).append(turn)
+    kept: list[dict[str, Any]] = []
+    history = [_review_text(t["text"]) for t in prior]
+    for group in groups.values():
+        values = [_review_text(t["text"]) for t in group]
+        repeated = len(group) >= 2 and any(history[i:i + len(values)] == values for i in range(len(history) - len(values) + 1))
+        if not repeated:
+            kept.extend(group)
+            history.extend(values)
+    return kept
+
+
+def _assemble_chapter_versions(core: list[dict[str, Any]], plan: dict[str, Any],
+                               replacements: dict[str, list[dict[str, Any]]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Replace complete chapter bodies in place; compact and deep prose never stack."""
+    turns, chapters = [], []
+    for key, title in [("opening", "Opening"), *[(c["id"], c["title"]) for c in plan["chapters"]], ("closing", "Conclusion")]:
+        fallback = [t for t in core if t.get("source_chapter_id") == key]
+        values = copy.deepcopy(replacements.get(key, fallback))
+        start = len(turns)
+        for i, turn in enumerate(values):
+            turn.update(exchange_id=f"{'optional' if key in replacements else 'core'}/{key}", exchange_start=i == 0)
+        turns.extend(values)
+        chapters.append({"id": key, "title": title, "turn_start": start, "turn_end": len(turns)-1,
+                         "optional": key in replacements, "development": "expanded" if key in replacements else "compact",
+                         "claim_ids": list(dict.fromkeys(c for t in values for c in t.get("claim_ids", []))),
+                         "fallback_turns": copy.deepcopy(fallback)})
+    return turns, chapters
+
+
+def _restore_reviewed_chapters(turns: list[dict[str, Any]], chapters: list[dict[str, Any]],
+                               audit: dict[str, Any], warnings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    breaks = set(audit.get("breaks") or []) | set(_local_dialogue_breaks(turns))
+    if type(audit.get("broken_at")) is int:
+        breaks.add(audit["broken_at"])
+    duplicates = {v.get("exchange_id") for v in audit.get("duplicates", [])}
+    restore = {c["id"] for c in chapters if c.get("development") == "expanded" and
+               (any(c["turn_start"] <= i <= c["turn_end"] + 1 for i in breaks if type(i) is int)
+                or f"optional/{c['id']}" in duplicates)}
+    if not restore:
+        return turns, chapters, "draft_only" if breaks else "full"
+    result, updated, mapping = [], [], {}
+    for chapter in chapters:
+        start = len(result)
+        replaced = chapter["id"] in restore
+        values = copy.deepcopy(chapter["fallback_turns"] if replaced else turns[chapter["turn_start"]:chapter["turn_end"]+1])
+        for j, turn in enumerate(values):
+            if replaced:
+                turn.update(exchange_id=f"core/{chapter['id']}", exchange_start=j == 0)
+            else:
+                mapping[chapter["turn_start"]+j] = start+j
+        result.extend(values)
+        updated.append({**chapter, "turn_start": start, "turn_end": len(result)-1,
+                        "development": "restored" if replaced else chapter["development"],
+                        "optional": False if replaced else chapter["optional"],
+                        "claim_ids": list(dict.fromkeys(c for t in values for c in t.get("claim_ids", [])))})
+    # New compact text was not part of the final audit. Never inherit its verdict.
+    adjacent = {i for i in mapping if i+1 in mapping and mapping[i+1] == mapping[i]+1}
+    for key in ("reviewed_indexes", "requested_facts", "unsupported_turns"):
+        audit[key] = [mapping[i] for i in audit.get(key, []) if i in mapping]
+    for key in ("requested_transitions", "reviewed_transitions"):
+        audit[key] = [mapping[i] for i in audit.get(key, []) if type(i) is int and i in adjacent]
+    audit["facts"] = [{**f, "index": mapping[f["index"]]} for f in audit.get("facts", []) if f.get("index") in mapping]
+    audit["transition_checks"] = [{**f, "index": mapping[f["index"]]} for f in audit.get("transition_checks", []) if f.get("index") in adjacent]
+    audit.update(passed=False, restored_chapters=sorted(restore), original_breaks=sorted(breaks), breaks=[], broken_at=None,
+                 closure={**audit.get("closure", {}), "verdict": "uncertain", "reason": "Chapter fallback changed the audited context."})
+    warnings.append({"code": "chapter_restored", "stage": "script", "message": "部分深入章节未通过衔接检查，已原位恢复短章；恢复后的衔接尚未核实，不增加审校调用。"})
+    return result, updated, "draft_only" if _local_dialogue_breaks(result) or any(i in mapping and i-1 in mapping for i in breaks if type(i) is int) else "partial"
+
+
+async def _generate_chapter_replacement(
+    plan: dict[str, Any], claims: list[dict[str, Any]], cards: dict[str, dict[str, Any]],
+    language: str, target_minutes: float, profile: dict[str, Any], trace: ContextUsage,
+    state: EpisodeGenerationState, check_cancelled: Callable[[], None],
+    checkpoint_ready: Callable[[dict[str, Any]], None] | None = None,
+    resume: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    resume = resume or {}
+    if resume and resume.get("version") != PODCAST_ENGINE_VERSION:
+        raise ValueError("Podcast checkpoint version changed; start a new generation.")
+    core = copy.deepcopy(resume.get("core_turns") or [])
+    replacements = copy.deepcopy(resume.get("chapter_versions") or {})
+    drafts = copy.deepcopy(resume.get("chapter_drafts") or {})
+    attempted = set(resume.get("attempted_parts") or [])
+    warnings, audits = list(resume.get("warnings") or []), list(resume.get("audits") or [])
+    output = min(profile["max_output_tokens"], current().plan.output_tokens if current() else 6000)
+    if resume.get("recovery_used") and DELIVERY.get():
+        claim_recovery()
+    by_id = {c["id"]: c for c in claims}
+    ids = [c["id"] for c in plan["chapters"]]
+
+    def save() -> None:
+        if checkpoint_ready:
+            checkpoint_ready(copy.deepcopy({"version": PODCAST_ENGINE_VERSION, "episode_plan": plan,
+                "claims": claims, "cards": list(cards.values()), "core_turns": core,
+                "chapter_versions": replacements, "chapter_drafts": drafts, "attempted_parts": sorted(attempted),
+                "warnings": warnings, "audits": audits, "recovery_used": bool(DELIVERY.get() and DELIVERY.get().recoveries)}))
+
+    if not core:
+        selected_ids = list(dict.fromkeys(cid for c in plan["chapters"] for cid in c["claim_ids"]))
+        check_cancelled()
+        core, audit = await create_linked_scene(scene_kind="act", chapter={"id": "core", "title": plan["episode_thesis"], "purpose": "A concise complete chapter map", "claim_ids": selected_ids},
+            claims=[by_id[c] for c in selected_ids if c in by_id], cards_by_id=cards,
+            memory=EpisodeMemory(plan["episode_thesis"]), existing_turns=[], target=4+2*len(ids), language=language,
+            profile={**profile, "allow_partial": True, "complete_role": "core", "stage_output_tokens": min(6000, output),
+                     "core_chapter_ids": ids, "core_chapter_plan": plan["chapters"]}, trace=trace,
+            duration_budget=_scene_duration_budget(language, min(3.0, target_minutes*.3), 4+2*len(ids), 0), generation_state=state)
+        if {t.get("source_chapter_id") for t in core} != {"opening", "closing", *ids}:
+            raise PodcastQualityError("核心稿没有完整对应章节", {"stage": "core_structure"})
+        audits.append(audit)
+        check_cancelled()
+        save()
+    boundary_minutes = _content_minutes([t for t in core if t.get("source_chapter_id") in {"opening", "closing"}])
+    minutes_per_chapter = max(.3, (target_minutes - boundary_minutes) / max(1, len(ids)))
+    parts = max(1, math.ceil(minutes_per_chapter / podcast_stage_minutes(output, language)))
+    for chapter in plan["chapters"]:
+        key = chapter["id"]
+        if key in replacements:
+            continue
+        existing_parts = drafts.setdefault(key, {})
+        for part in range(parts):
+            check_cancelled()
+            part_id = f"{key}/{part}"
+            if str(part) in existing_parts:
+                continue
+            if part_id in attempted:
+                break
+            if trace.total_token_limit and trace.total_token_limit - trace.accounted_tokens < trace.episode_audit_reserve_tokens + output*2:
+                warnings.append({"code": "optional_budget", "stage": "script", "message": "已保留终审预算，未完成章节沿用完整短版。"})
+                break
+            assembled, positions = _assemble_chapter_versions(core, plan, replacements)
+            preceding = assembled[:next(c["turn_start"] for c in positions if c["id"] == key)] + [t for j in range(part) for t in existing_parts.get(str(j), [])]
+            memory = EpisodeMemory(plan["episode_thesis"])
+            _update_memory(memory, preceding, {"title": "Actual preceding dialogue"}, profile["recent_turns"])
+            assignment = "Mechanism and premises" if part == 0 and parts > 1 else "Source example, implications and necessary qualifications" if part == parts-1 and parts > 1 else "Mechanism, useful example and necessary qualifications"
+            stage_minutes = minutes_per_chapter / parts
+            target = max(4, min(18, math.ceil(stage_minutes*3)))
+            attempted.add(part_id)
+            try:
+                extra, audit = await create_linked_scene(scene_kind="act", chapter={**chapter, "id": part_id},
+                    claims=[by_id[c] for c in chapter["claim_ids"] if c in by_id], cards_by_id=cards,
+                    memory=memory, existing_turns=preceding, target=target, language=language,
+                    profile={**profile, "allow_partial": True, "complete_role": "expansion", "stage_output_tokens": output,
+                             "chapter_replacement": True, "part_assignment": f"{part+1}/{parts}: {assignment}"}, trace=trace,
+                    duration_budget=_scene_duration_budget(language, stage_minutes, target, 0), generation_state=state)
+                extra = _drop_repeated_exchanges(extra, preceding)
+                if len(extra) < 2 or _is_question_turn(extra[-1]):
+                    raise PodcastQualityError("章节分段没有完整收束", {"stage": "chapter_structure"})
+                existing_parts[str(part)] = extra
+                audits.append(audit)
+            except PodcastQualityError as exc:
+                warnings.append({"code": "chapter_compact", "stage": "script", "message": f"{chapter['title']} 深入生成未完成，保留对应短章：{exc}"})
+            check_cancelled()
+            save()
+            if str(part) not in existing_parts:
+                break
+        if all(str(i) in existing_parts for i in range(parts)):
+            replacements[key] = [t for i in range(parts) for t in existing_parts[str(i)]]
+            save()
+    turns, chapters = _assemble_chapter_versions(core, plan, replacements)
+    return turns, chapters, audits, warnings, {"strategy": "chapter_replacement", "version": PODCAST_DURATION_CALIBRATION_VERSION,
+        "core_minutes": _content_minutes(core), "accepted_blocks": len(replacements), "attempted_blocks": len(attempted),
+        "core_texts": [t["text"] for t in core if t.get("source_chapter_id") in {"opening", "closing"}],
+        "expansion": {"used": False}, "compression": {"used": False}}
+
+
+async def _generate_complete_first(
+    plan: dict[str, Any], claims: list[dict[str, Any]], cards: dict[str, dict[str, Any]],
+    language: str, target_minutes: float, profile: dict[str, Any], trace: ContextUsage,
+    state: EpisodeGenerationState, check_cancelled: Callable[[], None],
+    checkpoint_ready: Callable[[dict[str, Any]], None] | None = None,
+    resume: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    if plan.get("chapter_replacement"):
+        return await _generate_chapter_replacement(plan, claims, cards, language, target_minutes, profile, trace, state, check_cancelled, checkpoint_ready, resume)
+    resume = resume or {}
+    output = min(6000, (current().plan.core_output_tokens if current() else 0) or profile["max_output_tokens"])
+    core_minutes = min(target_minutes, 5.0, max(1.0, output / 1200))
+    core = copy.deepcopy(resume.get("core_turns") or [])
+    blocks = copy.deepcopy(resume.get("blocks") or [])
+    completed = set(resume.get("attempted_blocks") or [])
+    warnings = list(resume.get("warnings") or [])
+    audits = list(resume.get("audits") or [])
+    if resume.get("recovery_used") and DELIVERY.get():
+        claim_recovery()
+    by_id = {c["id"]: c for c in claims}
+
+    def save() -> None:
+        if checkpoint_ready:
+            checkpoint_ready(copy.deepcopy({"version": PODCAST_ENGINE_VERSION, "episode_plan": plan,
+                "claims": claims, "cards": list(cards.values()), "core_turns": core, "blocks": blocks,
+                "attempted_blocks": sorted(completed), "warnings": warnings, "audits": audits,
+                "recovery_used": bool(DELIVERY.get() and DELIVERY.get().recoveries)}))
+
+    if not core:
+        # One central claim from each planned chapter, source-balanced, instead of an arbitrary prefix.
+        selected = []
+        for chapter in plan["chapters"]:
+            candidate = next((by_id[c] for c in chapter["claim_ids"] if c in by_id), None)
+            if candidate and candidate not in selected:
+                selected.append(candidate)
+        for source in dict.fromkeys(c["source_id"] for c in claims):
+            if not any(c["source_id"] == source for c in selected):
+                selected.append(next(c for c in claims if c["source_id"] == source))
+        selected = selected or claims[:2]
+        chapter = {"id": "core", "title": plan["episode_thesis"], "purpose": "Complete episode: opening, explanation, resolved conclusion", "claim_ids": [c["id"] for c in selected]}
+        check_cancelled()
+        core, audit = await create_linked_scene(scene_kind="act", chapter=chapter, claims=selected,
+            cards_by_id=cards, memory=EpisodeMemory(plan["episode_thesis"]), existing_turns=[], target=9,
+            language=language, profile={**profile, "allow_partial": True, "complete_role": "core", "stage_output_tokens": output},
+            trace=trace, duration_budget=_scene_duration_budget(language, core_minutes, 9, 0), generation_state=state)
+        body, closing = _complete_core_parts(core)
+        if len(body) < 2 or len(closing) < 2 or _is_question_turn(closing[-1]):
+            raise PodcastQualityError("完整短稿缺少可保留的展开或结论", {"stage": "core_structure", "accepted_turns": len(core)})
+        audits.append(audit)
+        check_cancelled()
+        save()
+
+    used = {cid for t in core for cid in t.get("claim_ids", [])}
+    used.update(cid for b in blocks for t in b["turns"] for cid in t.get("claim_ids", []))
+    for index, chapter in enumerate(plan["chapters"]):
+        check_cancelled()
+        if chapter["id"] in completed:
+            continue
+        turns, _ = _assemble_complete_episode(core, blocks)
+        if _content_minutes(turns) >= target_minutes * .95:
+            break
+        # Keep a full review plus one stage's output before accepting more optional work.
+        if trace.total_token_limit and trace.total_token_limit - trace.accounted_tokens < trace.episode_audit_reserve_tokens + output * 2:
+            warnings.append({"code": "optional_budget", "stage": "script", "message": "展开预算已用尽，保留完整短版及已完成内容。"})
+            break
+        fresh = [by_id[c] for c in chapter["claim_ids"] if c in by_id and c not in used]
+        if not fresh:
+            completed.add(chapter["id"])
+            save()
+            continue
+        body, _ = _complete_core_parts(core)
+        preceding = body + [t for b in blocks for t in b["turns"]]
+        memory = EpisodeMemory(plan["episode_thesis"])
+        _update_memory(memory, preceding, chapter, profile["recent_turns"])
+        minutes = min(3.0, target_minutes - _content_minutes(turns), max(1.0, output / 1600))
+        completed.add(chapter["id"])
+        try:
+            extra, audit = await create_linked_scene(scene_kind="act", chapter=chapter, claims=fresh,
+                cards_by_id=cards, memory=memory, existing_turns=turns, target=6, language=language,
+                profile={**profile, "allow_partial": True, "complete_role": "expansion", "stage_output_tokens": output},
+                trace=trace, duration_budget=_scene_duration_budget(language, minutes, 6, 0), generation_state=state)
+            unique = _drop_repeated_exchanges(extra, turns)
+            if len(unique) != len(extra):
+                warnings.append({"code": "repeated_exchange_removed", "stage": "script", "message": "已移除原样重复的完整交流，保留同一展开中的新内容。"})
+            extra = unique
+            text = " ".join(t["text"] for t in extra)
+            prior = [" ".join(t["text"] for t in b["turns"]) for b in blocks] + [" ".join(t["text"] for t in core)]
+            if len(extra) >= 2 and not _is_question_turn(extra[-1]) and not any(_similar(text, old) > .72 for old in prior):
+                # One optional block is one removal unit; never leave half its explanation behind.
+                for i, t in enumerate(extra):
+                    t.update(exchange_id=f"optional/{chapter['id']}", exchange_start=i == 0)
+                blocks.append({"id": chapter["id"], "title": chapter["title"], "turns": extra})
+                used.update(cid for t in extra for cid in t.get("claim_ids", []))
+                audits.append(audit)
+            else:
+                warnings.append({"code": "optional_discarded", "stage": "script", "message": "已舍弃重复或未完整收束的可选展开。"})
+        except PodcastQualityError as exc:
+            warnings.append({"code": "optional_failed", "stage": "script", "message": f"可选展开未完成，基础短稿仍保留：{exc}"})
+        check_cancelled()
+        save()
+    turns, chapters = _assemble_complete_episode(core, blocks)
+    return turns, chapters, audits, warnings, {"strategy": "complete_first", "version": PODCAST_DURATION_CALIBRATION_VERSION,
+        "core_minutes": _content_minutes(core), "accepted_blocks": len(blocks), "attempted_blocks": len(completed),
+        "core_texts": [t["text"] for t in core], "expansion": {"used": False}, "compression": {"used": False}}
+
+
 @adaptive_generation("podcast")
 async def build_podcast_script(
     notebook_id: str,
@@ -2472,6 +3248,8 @@ async def build_podcast_script(
     act_ready: Callable[[dict[str, Any]], None] | None = None,
     allow_partial: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    checkpoint_ready: Callable[[dict[str, Any]], None] | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     def check_cancelled() -> None:
         if cancel_check and cancel_check():
@@ -2487,6 +3265,7 @@ async def build_podcast_script(
         progress("构建全篇证据地图", 0.08)
     requested_hint = int(payload.get("minutes") or 0)
     evidence_per_source = max(20, math.ceil(max(5, requested_hint) * 2 / max(1, len(ids))))
+    resume_checkpoint = resume_checkpoint or {}
     rows = select_podcast_evidence(notebook_id, ids, focus, evidence_per_source)
     cards, all_citations = build_evidence_cards(rows)
     if len(cards) < 2:
@@ -2494,18 +3273,15 @@ async def build_podcast_script(
     if progress:
         progress("提取可引用主张", 0.12)
     context_usage = generation_trace()
-    if current() and current().plan.preparation_batches:
+    if current() and current().plan.preparation_batches and not resume_checkpoint:
         await prepare_evidence(rows, language)
         check_cancelled()
     claims = build_claim_ledger(cards)
     if current() and current().notes:
-        card_by_chunk = {card["chunk_id"]: card for card in cards}
-        claims = [{"id": f"C{index + 1}", "text": note["claim"] + " " + note["qualification"],
-                   "evidence_ids": [card_by_chunk[note["chunk_id"]]["id"]],
-                   "source_id": card_by_chunk[note["chunk_id"]]["source_id"],
-                   "filename": card_by_chunk[note["chunk_id"]]["filename"],
-                   "locator": card_by_chunk[note["chunk_id"]]["locator"]}
-                  for index, note in enumerate(current().notes)]
+        claims = merge_prepared_claims(claims, cards, current().notes)
+    if resume_checkpoint:
+        claims = copy.deepcopy(resume_checkpoint["claims"])
+        cards = copy.deepcopy(resume_checkpoint["cards"])
     if len(claims) < 2:
         raise ValueError("资料中缺少足够的可验证主张")
     duration_mode = payload.get("duration_mode") or ("fixed" if payload.get("minutes") else "auto")
@@ -2516,7 +3292,8 @@ async def build_podcast_script(
     profile = podcast_generation_profile()
     if allow_partial:
         # Output capacity, not just the context window, determines a safe Act size.
-        profile = {**profile, "scene_turns": min(profile["scene_turns"], max(2, (int(profile.get("max_output_tokens") or 4096) - 512) // 400))}
+        output_capacity = TokenLimits.from_provider(active_provider("main") or {}).max_output_tokens
+        profile = {**profile, "scene_turns": min(profile["scene_turns"], max(3, (output_capacity - 768) // 500))}
     act_count = max(2, math.ceil(total_target / profile["scene_turns"]))
     context_usage.request_limit = act_count + 4
     if not current():
@@ -2526,7 +3303,12 @@ async def build_podcast_script(
         reserve_podcast_audit(context_usage, TokenLimits.from_provider(active_provider("main") or {}))
     if progress:
         progress("规划递进式剧集结构", 0.16)
-    episode_plan, outline_degraded = await create_episode_plan(claims, language, focus, context_usage, act_count)
+    if resume_checkpoint:
+        episode_plan, outline_degraded = copy.deepcopy(resume_checkpoint["episode_plan"]), False
+    else:
+        episode_plan, outline_degraded = await create_episode_plan(claims, language, focus, context_usage, podcast_chapter_capacity(min(6000, current().plan.output_tokens if current() else profile["max_output_tokens"]), target_minutes) if allow_partial else act_count)
+    if allow_partial:
+        episode_plan["chapter_replacement"] = True
     chapters = episode_plan["chapters"]
     chapter_targets = [total_target // len(chapters) for _ in chapters]
     for index in range(total_target % len(chapters)):
@@ -2550,59 +3332,64 @@ async def build_podcast_script(
         "target_estimated_minutes": round(duration_goal, 2),
         "acts": [],
     }
-    for chapter_index, chapter in enumerate(chapters):
-        check_cancelled()
-        if progress:
-            progress(f"连贯续写 Act {chapter_index + 1}/{len(chapters)}", 0.20 + 0.34 * chapter_index / max(1, len(chapters)))
-        start_index = len(turns)
-        chapter_claims = [claims_by_id[value] for value in chapter["claim_ids"] if value in claims_by_id]
-        if chapter_index == 0:
-            chapter = {**chapter, "bridge_in": "", "purpose": f"{episode_plan['episode_thesis']}；{chapter['purpose']}" if language != "en" else f"Open the central question: {episode_plan['episode_thesis']}. {chapter['purpose']}"}
-        if chapter_index == len(chapters) - 1:
-            chapter = {**chapter, "bridge_out": "", "purpose": f"{chapter['purpose']}；只用已讨论主张回扣核心问题" if language != "en" else f"{chapter['purpose']}; resolve the central question using only discussed claims"}
-        current_minutes = _content_minutes(turns)
-        duration_budget = _remaining_scene_duration_budget(
-            language,
-            duration_goal,
-            current_minutes,
-            total_target,
-            chapter_targets,
-            chapter_index,
-        )
-        try:
-            scene_turns, scene_audit = await create_linked_scene(
-                scene_kind="act", chapter=chapter, claims=chapter_claims, cards_by_id=cards_by_id, memory=memory,
-                existing_turns=turns, target=chapter_targets[chapter_index], language=language, profile=profile, trace=context_usage,
-                duration_budget=duration_budget, generation_state=generation_state,
+    if allow_partial:
+        turns, chapter_payloads, scene_audits, warnings, duration_calibration = await _generate_complete_first(
+            episode_plan, claims, cards_by_id, language, target_minutes, profile, context_usage,
+            generation_state, check_cancelled, checkpoint_ready, resume_checkpoint)
+    else:
+        for chapter_index, chapter in enumerate(chapters):
+            check_cancelled()
+            if progress:
+                progress(f"连贯续写 Act {chapter_index + 1}/{len(chapters)}", 0.20 + 0.34 * chapter_index / max(1, len(chapters)))
+            start_index = len(turns)
+            chapter_claims = [claims_by_id[value] for value in chapter["claim_ids"] if value in claims_by_id]
+            if chapter_index == 0:
+                chapter = {**chapter, "bridge_in": "", "purpose": f"{episode_plan['episode_thesis']}；{chapter['purpose']}" if language != "en" else f"Open the central question: {episode_plan['episode_thesis']}. {chapter['purpose']}"}
+            if chapter_index == len(chapters) - 1:
+                chapter = {**chapter, "bridge_out": "", "purpose": f"{chapter['purpose']}；只用已讨论主张回扣核心问题" if language != "en" else f"{chapter['purpose']}; resolve the central question using only discussed claims"}
+            current_minutes = _content_minutes(turns)
+            duration_budget = _remaining_scene_duration_budget(
+                language,
+                duration_goal,
+                current_minutes,
+                total_target,
+                chapter_targets,
+                chapter_index,
             )
-        except PodcastQualityError as exc:
-            exc.report.update({
-                "chapter_id": chapter.get("id"),
-                "chapter_index": chapter_index,
-                "completed_acts": list(duration_calibration["acts"]),
-                "current_duration_budget": duration_budget,
-                "continuation_used": generation_state.continuation_used,
-                "context_usage": context_usage.as_dict(),
-            })
-            if not allow_partial:
-                raise
-            warnings.append({"code": "act_incomplete", "stage": "script", "message": f"{chapter.get('title') or chapter_index}: {exc}"})
-            break
-        check_cancelled()
-        turns.extend(scene_turns)
-        if act_ready and not allow_partial:
-            act_ready({
-                "chapter_index": chapter_index,
-                "start_index": start_index,
-                "language": language,
-                "turns": [dict(turn) for turn in scene_turns],
-            })
-        scene_audits.append(scene_audit)
-        if allow_partial and (scene_audit.get("partial") or not scene_audit.get("passed", True)):
-            warnings.append({"code": "act_partial", "stage": "script", "message": f"{chapter.get('title') or chapter_index} 保留了有效对话；部分轮次或风格要求未达到。"})
-        duration_calibration["acts"].append({"chapter_id": chapter["id"], **scene_audit.get("duration", duration_budget)})
-        _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
-        chapter_payloads.append({**chapter, "turn_start": start_index, "turn_end": len(turns) - 1})
+            try:
+                scene_turns, scene_audit = await create_linked_scene(
+                    scene_kind="act", chapter=chapter, claims=chapter_claims, cards_by_id=cards_by_id, memory=memory,
+                    existing_turns=turns, target=chapter_targets[chapter_index], language=language, profile=profile, trace=context_usage,
+                    duration_budget=duration_budget, generation_state=generation_state,
+                )
+            except PodcastQualityError as exc:
+                exc.report.update({
+                    "chapter_id": chapter.get("id"),
+                    "chapter_index": chapter_index,
+                    "completed_acts": list(duration_calibration["acts"]),
+                    "current_duration_budget": duration_budget,
+                    "continuation_used": generation_state.continuation_used,
+                    "context_usage": context_usage.as_dict(),
+                })
+                if not allow_partial:
+                    raise
+                warnings.append({"code": "act_incomplete", "stage": "script", "message": f"{chapter.get('title') or chapter_index}: {exc}"})
+                break
+            check_cancelled()
+            turns.extend(scene_turns)
+            if act_ready and not allow_partial:
+                act_ready({
+                    "chapter_index": chapter_index,
+                    "start_index": start_index,
+                    "language": language,
+                    "turns": [dict(turn) for turn in scene_turns],
+                })
+            scene_audits.append(scene_audit)
+            if allow_partial and (scene_audit.get("partial") or not scene_audit.get("passed", True)):
+                warnings.append({"code": "act_partial", "stage": "script", "message": f"{chapter.get('title') or chapter_index} 保留了有效对话；部分轮次或风格要求未达到。"})
+            duration_calibration["acts"].append({"chapter_id": chapter["id"], **scene_audit.get("duration", duration_budget)})
+            _update_memory(memory, scene_turns, chapter, profile["recent_turns"])
+            chapter_payloads.append({**chapter, "turn_start": start_index, "turn_end": len(turns) - 1})
     if not turns or not any(turn.get("citation_ids") for turn in turns) or len({turn["speaker"] for turn in turns}) < 2:
         raise PodcastQualityError("没有足够的有依据双人对话可交付", {"passed": False, "warnings": warnings, "context_usage": context_usage.as_dict()})
     check_cancelled()
@@ -2640,7 +3427,7 @@ async def build_podcast_script(
         expansion_report = {
             "used": False,
             "skipped": True,
-            "reason": "release_duration_gate_already_met",
+            "reason": "partial_delivery_no_duration_retry" if allow_partial and current_episode_minutes < release_minimum_minutes else "release_duration_gate_already_met",
             "estimated_minutes": round(current_episode_minutes, 3),
             "release_minimum_minutes": round(release_minimum_minutes, 3),
         }
@@ -2702,7 +3489,8 @@ async def build_podcast_script(
         warnings.extend({"code": "script_quality", "stage": "script", "message": reason} for reason in preflight["deterministic_failure_reasons"])
     if progress:
         progress("执行整集连贯性审校", 0.58)
-    episode_audit = await (_audit_product_episode if allow_partial else _audit_episode)(turns, chapter_payloads, episode_plan["episode_thesis"], language, context_usage, claims_by_id)
+    audit_claims = {cid: {**claim, "original": _claim_evidence_text([cid], claims_by_id, cards_by_id)} for cid, claim in claims_by_id.items()} if allow_partial else claims_by_id
+    episode_audit = await (_audit_product_episode if allow_partial else _audit_episode)(turns, chapter_payloads, episode_plan["episode_thesis"], language, context_usage, audit_claims)
     check_cancelled()
     unsupported = set(episode_audit.get("unsupported_turns") or [])
     low_grounding = 0 < int((episode_audit.get("scores") or {}).get("grounding") or 0) < 4
@@ -2712,26 +3500,51 @@ async def build_podcast_script(
         # from the middle of an otherwise connected conversation.
         for index in unsupported:
             if 0 <= index < len(turns):
-                turns[index]["quality_issues"] = [{"code": "evidence_unconfirmed", "severity": "suspect", "message": "该轮内容的原文支持待核实。"}]
-        broken = episode_audit.get("broken_at")
-        if type(broken) is int and 0 <= broken < len(turns):
-            prefix_turns = turns[:broken]
-            while prefix_turns and (_is_question_turn(prefix_turns[-1]) or not re.search(r"[。.!！][’'”\"]?$", prefix_turns[-1]["text"].strip())):
-                prefix_turns.pop()
-            if len(prefix_turns) >= 2 and len({t["speaker"] for t in prefix_turns}) == 2:
-                turns = prefix_turns
-                chapter_payloads = [{**c, "turn_end": min(c["turn_end"], len(turns) - 1)} for c in chapter_payloads if c["turn_start"] < len(turns)]
-                delivery_status = "partial"
-                warnings.append({"code": "coherent_short_version", "stage": "script", "message": "发现未解决的衔接问题，仅保留连续且句子完整的短版；自动检查不保证语义完整。"})
-            else:
-                delivery_status = "draft_only"
-                warnings.append({"code": "coherence_draft", "stage": "script", "message": "连贯性问题尚未解决，保留脚本草稿，不合成音频。"})
+                turns[index]["quality_issues"] = [{"code": "evidence_unconfirmed", "severity": "suspect",
+                    "message": fact.get("reason") or "该轮内容的原文支持待核实。", "claim_id": fact.get("claim_id"),
+                    "source_quote": fact.get("source_quote")} for fact in episode_audit.get("facts", []) if fact["index"] == index and fact["verdict"] != "supported"] or [{"code": "evidence_unconfirmed", "message": "该轮内容的原文支持待核实。"}]
+        if duration_calibration.get("strategy") == "chapter_replacement":
+            turns, chapter_payloads, delivery_status = _restore_reviewed_chapters(turns, chapter_payloads, episode_audit, warnings)
+        elif any(t.get("exchange_id") for t in turns):
+            turns, chapter_payloads, delivery_status = retain_product_exchanges(turns, chapter_payloads, episode_audit, warnings)
+        else:
+            broken = episode_audit.get("broken_at")
+            if type(broken) is int and 0 <= broken < len(turns):
+                prefix_turns = turns[:broken]
+                while prefix_turns and (_is_question_turn(prefix_turns[-1]) or not re.search(r"[。.!！][’'”\"]?$", prefix_turns[-1]["text"].strip())):
+                    prefix_turns.pop()
+                if len(prefix_turns) >= 2 and len({t["speaker"] for t in prefix_turns}) == 2:
+                    turns = prefix_turns
+                    chapter_payloads = [{**c, "turn_end": min(c["turn_end"], len(turns) - 1)} for c in chapter_payloads if c["turn_start"] < len(turns)]
+                    delivery_status = "partial"
+                    warnings.append({"code": "coherent_short_version", "stage": "script", "message": "发现未解决的衔接问题，仅保留连续且句子完整的短版；自动检查不保证语义完整。"})
+                else:
+                    delivery_status = "draft_only"
+                    warnings.append({"code": "coherence_draft", "stage": "script", "message": "连贯性问题尚未解决，保留脚本草稿，不合成音频。"})
         turns, chapter_payloads, delivery_status = finish_product_script(turns, chapter_payloads, delivery_status, target_minutes, language, warnings)
     if allow_partial:
         _refresh_episode_review(episode_audit, len(turns))
         if episode_audit["status"] != "complete":
             warnings.append({"code": "coherence_unverified", "stage": "script", "message":
                 f"连贯性未完整验证：已检查 {episode_audit['checked_transitions']}/{episode_audit['total_transitions']} 处相邻对话；未检查部分不代表通过。"})
+    if episode_plan.get("coverage"):
+        episode_plan["coverage"]["cited_unit_ids"] = list(dict.fromkeys(cid for t in turns for cid in t.get("claim_ids", [])))
+        if current():
+            current().audit["planning"] = copy.deepcopy(episode_plan["coverage"])
+    narrative_status = "unverified"
+    if allow_partial:
+        retained_texts = {turn["text"] for turn in turns}
+        core_intact = all(text in retained_texts for text in duration_calibration.get("core_texts", []))
+        closure = episode_audit.get("closure", {})
+        if not core_intact or closure.get("verdict") == "broken":
+            delivery_status = "draft_only"
+            narrative_status = "incomplete"
+            warnings.append({"code": "incomplete_ending", "stage": "script", "message": "基础短稿的完整性未保留，仅保存草稿。"})
+        elif closure.get("verdict") == "connected":
+            narrative_status = "complete"
+        else:
+            warnings.append({"code": "ending_unverified", "stage": "script", "message": "已保留短稿结论，语义收束仍待核实。"})
+        duration_calibration.pop("core_texts", None)
     coherence_degraded = any(w.get("code") in {"coherent_short_version", "coherence_draft", "incomplete_ending", "ending_short_version"} for w in warnings)
     used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     used_citations = [citation for citation in all_citations if citation["id"] in used_evidence]
@@ -2763,9 +3576,27 @@ async def build_podcast_script(
     if outline_degraded:
         context_usage.mark_fallback()
     script = "\n".join(f"{turn['speaker']}: {turn['text']} {' '.join(f'[{value}]' for value in turn['citation_ids'])}" for turn in turns)
+    unsupported = {f["index"] for f in episode_audit.get("facts", []) if f["verdict"] != "supported"}
+    fact_targets = {(i, cid) for i, turn in enumerate(turns) for cid in turn.get("claim_ids", [])}
+    facts = [f for f in episode_audit.get("facts", []) if (f["index"], f["claim_id"]) in fact_targets]
+    reviewed_facts = {(f["index"], f["claim_id"]) for f in facts}
+    fact_review = {"version": 1, "total": len(fact_targets), "reviewed": len(reviewed_facts),
+                   "supported": sum(f["verdict"] == "supported" for f in facts),
+                   "contradicted": sum(f["verdict"] == "contradicted" for f in facts),
+                   "uncertain": sum(f["verdict"] == "uncertain" for f in facts), "checks": facts,
+                   "status": "complete" if fact_targets and reviewed_facts == fact_targets and all(f["verdict"] == "supported" for f in facts) else "partial" if facts else "unavailable"}
+    cited_sources = {citation["source_id"] for citation in citations}
+    source_contributions = [{"source_id": source, "included": source in cited_sources,
+                             "reason": "本集已引用" if source in cited_sources else "本集未涵盖"} for source in ids]
+    for chapter in chapter_payloads:
+        chapter.pop("fallback_turns", None)
     return {
+        "fact_review": fact_review, "source_contributions": source_contributions,
+        "chapter_development": [{"id": c["id"], "status": c.get("development", "legacy")} for c in chapter_payloads],
+        "generation_mode": "expanded" if duration_calibration.get("accepted_blocks") else "complete_short" if allow_partial else "legacy",
+        "narrative_status": narrative_status,
         "delivery_status": delivery_status,
-        "quality_assessment": assessment(len(turns), len(episode_audit.get("reviewed_indexes") or []),
+        "quality_assessment": assessment(len(turns), len({f["index"] for f in facts}),
             [{"unit": f"turn_{i + 1}", "severity": "suspect", "code": "evidence_unconfirmed", "message": "原文支持待核实。"} for i in unsupported if type(i) is int and 0 <= i < len(turns)]
             + ([{"unit": "episode", "severity": "suspect", "code": "coherence_issue", "message": "发现连贯性问题，已保留短版或草稿；请核对完整性。"}] if coherence_degraded else [])
             + [{"unit": "episode", "code": w["code"], "message": w["message"]} for w in warnings if w.get("code") in {"output_language", "product_duration"}]
@@ -2773,7 +3604,7 @@ async def build_podcast_script(
         "version": PODCAST_ENGINE_VERSION,
         "engine": {
             **profile,
-            "strategy": "editorial_acts",
+            "strategy": duration_calibration.get("strategy", "complete_first") if allow_partial else "editorial_acts",
             "version": PODCAST_ENGINE_VERSION,
             "duration_calibration_version": PODCAST_DURATION_CALIBRATION_VERSION,
         },
@@ -2795,23 +3626,109 @@ async def build_podcast_script(
     }
 
 
+def retain_product_exchanges(
+    turns: list[dict[str, Any]], chapters: list[dict[str, Any]], audit: dict[str, Any],
+    warnings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Remove whole broken exchanges and keep independent subsequent material."""
+    breaks = set(audit.get("breaks") or []) | set(_local_dialogue_breaks(turns))
+    if type(audit.get("broken_at")) is int:
+        breaks.add(audit["broken_at"])
+    removed: set[str] = set()
+    groups: dict[str, list[int]] = {}
+    for index, turn in enumerate(turns):
+        groups.setdefault(turn.get("exchange_id") or f"legacy_{index}", []).append(index)
+    for index in breaks:
+        if type(index) is int and 0 <= index < len(turns):
+            removed.add(turns[index].get("exchange_id") or f"legacy_{index}")
+            if index and _is_question_turn(turns[index - 1]):
+                removed.add(turns[index - 1].get("exchange_id") or f"legacy_{index - 1}")
+    removed.update(item["exchange_id"] for item in audit.get("duplicates", []) if str(item.get("exchange_id", "")).startswith("optional/"))
+    seen = set()
+    for key, indexes in groups.items():
+        text = _review_text(" ".join(turns[i]["text"] for i in indexes))
+        if text in seen:
+            removed.add(key)
+        seen.add(text)
+    if not removed:
+        return turns, chapters, "full"
+    retained = []
+    gap = False
+    for key, indexes in groups.items():
+        first = turns[indexes[0]]
+        dependent = bool(re.match(r"(?:this\b|that\b|therefore\b|so\b|it\b|they\b|as we|这|那|因此|所以|刚才|接着)", first["text"].strip(), re.I))
+        if key in removed or (gap and not str(key).startswith("core/") and (not first.get("exchange_start") or dependent)):
+            removed.add(key)
+            gap = True
+            continue
+        retained.extend(indexes)
+        gap = False
+    audit["discarded_exchanges"] = [{"exchange_id": key, "turns": [dict(turns[i]) for i in indexes]}
+                                     for key, indexes in groups.items() if key in removed]
+    mapping = {old: new for new, old in enumerate(retained)}
+    adjacent = {i for i in retained if i + 1 in mapping and mapping[i + 1] == mapping[i] + 1}
+    audit["reviewed_indexes"] = [mapping[i] for i in audit.get("reviewed_indexes", []) if i in mapping]
+    audit["reviewed_transitions"] = [mapping[i] for i in audit.get("reviewed_transitions", []) if type(i) is int and i in adjacent]
+    audit["transition_checks"] = [{**check, "index": mapping[check["index"]]}
+                                  for check in audit.get("transition_checks", []) if check.get("index") in adjacent]
+    audit["requested_transitions"] = [mapping[i] for i in audit.get("requested_transitions", []) if i in adjacent]
+    audit["facts"] = [{**fact, "index": mapping[fact["index"]]} for fact in audit.get("facts", []) if fact.get("index") in mapping]
+    audit["unsupported_turns"] = [mapping[i] for i in audit.get("unsupported_turns", []) if i in mapping]
+    audit["requested_facts"] = [mapping[i] for i in audit.get("requested_facts", []) if i in mapping]
+    audit["original_breaks"] = sorted(breaks)
+    audit.update(breaks=[], broken_at=None, passed=False)
+    updated = []
+    for chapter in chapters:
+        indexes = [mapping[i] for i in retained if chapter["turn_start"] <= i <= chapter["turn_end"]]
+        if indexes:
+            updated.append({**chapter, "turn_start": min(indexes), "turn_end": max(indexes)})
+    warnings.append({"code": "coherent_short_version", "stage": "script",
+                     "message": f"已移除 {len(removed)} 个不完整、断裂或重复的交流单元；保留可独立理解的后续内容，新衔接未独立复核。"})
+    result = [turns[i] for i in retained]
+    if len(result) < 2 or len({t['speaker'] for t in result}) < 2:
+        # Keep the original as a draft when no playable exchange survives.
+        return turns, chapters, "draft_only"
+    return result, updated, "partial"
+
+
+def _review_text(text: str) -> str:
+    """Normalize typography, never words, negations, or numbers."""
+    normalized = unicodedata.normalize("NFC", text).translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
+    return " ".join(normalized.split())
+
+
+def _review_edges(turns: list[dict[str, Any]], chapters: list[dict[str, Any]]) -> list[int]:
+    """Prioritize known problems and boundaries before evenly spread questions."""
+    questions = [i for i in range(len(turns) - 1) if _is_question_turn(turns[i])]
+    spread = _evenly_spaced(questions, min(8, len(questions))) if questions else []
+    values = _local_dialogue_breaks(turns) + [0, len(turns) - 2] + [c["turn_start"] - 1 for c in chapters[1:]] + spread + questions
+    return list(dict.fromkeys(i for i in values if 0 <= i < len(turns) - 1))
+
+
 def _product_audit_prompt(budget: PromptBudget, turns: list[dict[str, Any]], chapters: list[dict[str, Any]],
                           prefix: str, claims: dict[str, Any]) -> PromptBuild:
     """Pack whole adjacent turns; gaps are sampling gaps, never dialogue breaks."""
     def build(indexes: set[int]) -> PromptBuild:
         items = [{"index": i, "speaker": turns[i]["speaker"], "text": turns[i]["text"],
-                  "claim_ids": turns[i].get("claim_ids", []),
-                  "gap_before": i > 0 and i - 1 not in indexes} for i in sorted(indexes)]
+                  "claim_ids": turns[i].get("claim_ids", []), "example_kind": turns[i].get("example_kind", "none"),
+                  "exchange_id": turns[i].get("exchange_id"), "gap_before": i > 0 and i - 1 not in indexes} for i in sorted(indexes)]
         ids = {c for item in items for c in item["claim_ids"] if c in claims}
-        sources = {c: claims[c]["text"] for c in sorted(ids)}
-        messages = [{"role": "user", "content": prefix + json.dumps({"turns": items, "claims": sources}, ensure_ascii=False)}]
-        return PromptBuild(messages, len(turns), len(items), 0, {"items": items})
+        sources = _shared_evidence_payload([claims[c] for c in sorted(ids)])
+        edges = _review_edges(turns, chapters)
+        requested = [i for i in edges if i in indexes and i + 1 in indexes][:min(12, max(1, (budget.output_tokens - 768) // 400))]
+        core = [i for c in chapters if not c.get("optional", False) for i in range(c["turn_start"], c["turn_end"] + 1)]
+        risk = re.compile(r"必然|保证|无法|不可能|必须|概率|[0-9]|always|never|must|cannot|probabil|guarantee", re.I)
+        by_chapter = [[i for i in range(c["turn_start"], c["turn_end"] + 1) if i in indexes and turns[i].get("claim_ids") and risk.search(turns[i]["text"])] for c in chapters]
+        prioritized = [values[j] for j in range(max(map(len, by_chapter), default=0)) for values in by_chapter if j < len(values)]
+        factual = [i for i in dict.fromkeys(prioritized + core + sorted(indexes)) if i in indexes and turns[i].get("claim_ids")]
+        requested_facts = factual[:min(12, max(1, (budget.output_tokens - 768) // 400))]
+        messages = [{"role": "user", "content": prefix + "\nCheck these adjacent transitions (i means i to i+1): " + json.dumps(requested) + "\nCheck these fact-bearing turns first: " + json.dumps(requested_facts) + "\n" + json.dumps({"turns": items, "evidence": sources}, ensure_ascii=False)}]
+        return PromptBuild(messages, len(turns), len(items), 0, {"items": items, "requested_transitions": requested, "requested_facts": requested_facts})
 
     full = build(set(range(len(turns))))
     if estimate_messages_tokens(full.messages, budget.image_tokens_per_image) <= budget.input_tokens:
         return full
-    edges = [0, len(turns) - 2]
-    edges += [c["turn_start"] - 1 for c in chapters[1:]]
+    edges = _review_edges(turns, chapters)
     groups = [list(range(c["turn_start"], min(c["turn_end"], len(turns) - 1))) for c in chapters]
     edges += [group[i] for i in range(max(map(len, groups), default=0)) for group in groups if i < len(group)]
     selected: set[int] = set()
@@ -2839,6 +3756,12 @@ def _refresh_episode_review(audit: dict[str, Any], turn_count: int) -> None:
                     if type(i) is int and 0 <= i < turn_count - 1 and i in reviewed and i + 1 in reviewed})
     audit.update(reviewed_indexes=sorted(reviewed), reviewed_transitions=edges,
                  total_transitions=max(0, turn_count - 1), checked_transitions=len(edges))
+    if "transition_checks" in audit:
+        audit["transition_checks"] = [check for check in audit["transition_checks"]
+                                      if isinstance(check, dict) and type(check.get("index")) is int and check["index"] in edges]
+    if "requested_transitions" in audit:
+        audit["requested_transitions"] = [i for i in audit["requested_transitions"]
+                                          if type(i) is int and 0 <= i < turn_count - 1]
     audit["status"] = "complete" if turn_count > 1 and len(reviewed) == turn_count and len(edges) == turn_count - 1 else "partial" if reviewed else "unavailable"
     if audit["status"] == "unavailable":
         audit["passed"] = False
@@ -2864,24 +3787,69 @@ def _local_dialogue_breaks(turns: list[dict[str, Any]]) -> list[int]:
     return sorted(set(broken))
 
 
+def _validated_content_review(parsed: dict[str, Any], turns: list[dict[str, Any]], visible: set[int],
+                              claims: dict[str, Any]) -> dict[str, Any]:
+    def anchored(quote: Any, text: str) -> bool:
+        return isinstance(quote, str) and 8 <= len(quote.strip()) <= 160 and _review_text(quote) in _review_text(text)
+
+    facts = []
+    seen = set()
+    for item in parsed.get("facts", []) if isinstance(parsed.get("facts"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        i, cid = item.get("index"), item.get("claim_id")
+        if type(i) is not int or i not in visible or not isinstance(cid, str) or cid not in turns[i].get("claim_ids", []):
+            continue
+        if (i, cid) in seen or item.get("verdict") not in {"supported", "contradicted", "uncertain"}:
+            continue
+        source = claims.get(cid, {}).get("original", "")
+        if not anchored(item.get("script_quote"), turns[i]["text"]) or not anchored(item.get("source_quote"), source):
+            continue
+        seen.add((i, cid))
+        facts.append({**item, "reason": str(item.get("reason") or "")[:300]})
+    duplicates = []
+    for item in parsed.get("duplicates", []) if isinstance(parsed.get("duplicates"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        i, prior = item.get("index"), item.get("prior_index")
+        if type(i) is not int or type(prior) is not int or i not in visible or prior not in visible or prior >= i:
+            continue
+        key = str(turns[i].get("exchange_id") or "")
+        if not key.startswith("optional/") or any(t.get("exchange_id") == key for t in turns[:i]):
+            continue
+        if anchored(item.get("quote"), turns[i]["text"]) and anchored(item.get("prior_quote"), turns[prior]["text"]):
+            duplicates.append({**item, "exchange_id": key})
+    return {"facts": facts, "duplicates": duplicates}
+
+
 async def _audit_product_episode(turns, chapters, thesis, language, trace, claims_by_id=None):
     from .context_budget import reserve_podcast_audit
     reserve_podcast_audit(trace, TokenLimits.from_provider(active_provider("main") or {}))
     known_breaks = _local_dialogue_breaks(turns)
-    priority = list(dict.fromkeys([i for i in range(len(turns)-1) if _is_question_turn(turns[i])] +
-                                 [c["turn_start"]-1 for c in chapters[1:]] + [0, len(turns)-2]))[:12]
     prompt = ("检查双人对话的连贯性。只检查实际给出的相邻轮次，抽样间隔不是语义断裂。"
+              "同时检查结尾是否回答开场核心问题而不是重新提问或预告；返回closure对象，含opening_quote、closing_quote（逐字8至60字符）、verdict（connected|broken|uncertain）、reason。"
+              "必须保留作者归属和原文条件，不把假设变成已证事实、不把概率小变成不可能；仅在facts中记录有原文可核对的判断，不改写。"
               "重点判断前一轮问的具体问题是否被下一轮直接回答。重复问题、重述背景、转谈同主题另一机制都不等于回答；不确定就填uncertain。"
               "例如问温度为何上升，下一轮谈传感器存储数据，属于broken。时长、措辞、主持人比例不影响连贯性判断。"
               "开场不能假装存在更早的对话。每项判断必须引用两轮中的逐字短语，各取8至60字符，不要省略号，理由最多60字符。"
-              "先检查这些索引（i表示i到i+1）：" + json.dumps(priority[:8]) + "，最多返回8项检查。"
-              "只返回JSON，格式：{\"checks\":[{\"index\":0,\"question_quote\":\"前一轮原文短语\",\"answer_quote\":\"后一轮原文短语\",\"verdict\":\"connected|broken|uncertain\",\"reason\":\"具体理由\"}],"
+              "按附带的检查索引顺序检查，不要跳过；输出空间不足时只保留完整检查项。"
+              "只返回JSON，格式：{\"closure\":{\"opening_quote\":\"开场逐字短语\",\"closing_quote\":\"结尾逐字短语\",\"verdict\":\"connected|broken|uncertain\",\"reason\":\"是否回答核心问题\"},\"unsupported_turns\":[],\"checks\":[{\"index\":0,\"question_quote\":\"前一轮原文短语\",\"answer_quote\":\"后一轮原文短语\",\"verdict\":\"connected|broken|uncertain\",\"reason\":\"具体理由\"}],"
               "\"breaks\":[],\"broken_at\":null,\"repairs\":[]}。breaks列确定断裂的轮次，broken_at填最早断裂轮次或null。"
-              "只允许在同一回复提出一处最多连续6轮的局部修复：repairs=[{index:0,text:完整替换文字}]；只重述原有主张，禁止新增事实数字引用。"
+              "只报告判断，不改写口播，repairs必须为空数组。"
               "系统发现缺少前文或连续三个问题未获回答的索引：" + json.dumps(known_breaks) + "。主题：" + thesis + "\n")
+    prompt = prompt[:prompt.index("只返回JSON，格式：")] + (
+        "只返回JSON：" + json.dumps(audit_schema(), ensure_ascii=False) + "\n"
+        "先做closure，再按requested fact indexes检查facts，最后做checks和duplicates；不得超出请求数量。"
+        "facts每项含index、claim_id、script_quote、source_quote、verdict(supported|contradicted|uncertain)、reason。"
+        "两个quote均逐字8至60字符，分别来自该轮口播及对应原文。supported要求保留原文所有必要条件及作者归属；"
+        "概率不能变保证，多数算力不能变多数节点，作者哲学假说不能变成确定事实。证据不足用uncertain。"
+        "标记illustrative的类比必须在口播中表明是假设；假设情境不当作原文事实，但机制映射与推论仍必须有依据，不能因标记而免检。"
+        "duplicates只报告整块没有新增机制、例证、限定的可选交流（exchange_id以optional/开始）；结论合理复述不算重复。"
+        "index和prior_index分别为可选交流第一轮与前文轮次，quote/prior_quote是两处逐字8至60字符，reason最多60字符。"
+        "只作判断，不改写，不用缺失引用的事实或抽样间隔判断断裂。主题：" + thesis + "\n")
     try:
         result = await budgeted_chat(lambda budget: _product_audit_prompt(budget, turns, chapters, prompt, claims_by_id or {}),
-            json_mode=True, max_tokens=4096, trace=trace, stage="episode_audit")
+            json_mode=True, response_schema=audit_schema(), max_tokens=4096, trace=trace, stage="episode_audit")
         parsed = _extract_json(result.content)
         if result.finish_reason in {"length", "max_tokens"} or not isinstance(parsed, dict):
             raise ValueError("审校回复不完整")
@@ -2889,55 +3857,61 @@ async def _audit_product_episode(turns, chapters, thesis, language, trace, claim
         if result.build.truncated_segments:
             visible = set()  # Cannot certify a clipped transcript.
         checks = []
+        closure = parsed.get("closure") or {}
+        if not (isinstance(closure, dict) and closure.get("verdict") in {"connected", "broken", "uncertain"}
+                and isinstance(closure.get("opening_quote"), str) and isinstance(closure.get("closing_quote"), str)
+                and min(len(closure["opening_quote"].strip()), len(closure["closing_quote"].strip())) >= 8
+                and any(i in visible and _review_text(closure["opening_quote"]) in _review_text(t["text"]) for i, t in enumerate(turns[:2]))
+                and any(i in visible and _review_text(closure["closing_quote"]) in _review_text(turns[i]["text"]) for i in range(max(0, len(turns)-2), len(turns)))):
+            closure = {"verdict": "uncertain", "reason": "收束检查没有可核对的开场与结尾原文。"}
         raw_checks = parsed.get("checks", parsed.get("transition_checks", parsed.get("reviewed_transitions", [])))
         for check in raw_checks if isinstance(raw_checks, list) else []:
             if not isinstance(check, dict):
                 continue
-            i = check.get("index")
-            if type(i) is not int or i not in visible or i+1 not in visible:
-                continue
             quote_a, quote_b = check.get("question_quote"), check.get("answer_quote")
             if (not isinstance(quote_a,str) or not isinstance(quote_b,str) or min(len(quote_a.strip()),len(quote_b.strip())) < 8
-                    or quote_a not in turns[i]["text"] or quote_b not in turns[i+1]["text"]
                     or check.get("verdict") not in {"connected","broken","uncertain"}
-                    or not isinstance(check.get("reason"),str) or len(check["reason"].strip()) < 8):
+                    or not isinstance(check.get("reason"),str) or not check["reason"].strip()):
                 continue
-            checks.append(check)
+            matches = [i for i in sorted(visible) if i + 1 in visible
+                       and _review_text(quote_a) in _review_text(turns[i]["text"])
+                       and _review_text(quote_b) in _review_text(turns[i+1]["text"])]
+            i = check.get("index")
+            if type(i) is not int or i not in matches:
+                if len(matches) != 1:
+                    continue  # Ambiguous quotations cannot relocate a verdict.
+                i = matches[0]
+            if any(existing["index"] == i for existing in checks):
+                continue
+            anchored = {**check, "index": i}
+            if anchored["verdict"] == "broken" and not _is_question_turn(turns[i]):
+                # A resolved statement followed by another topic is not an
+                # unanswered question. Keep the suspicion visible, but do not
+                # let topic changes delete a complete core or its conclusion.
+                anchored["verdict"] = "uncertain"
+                anchored["reason"] = "已完成陈述后的主题变化不构成未答问题；衔接待核实。原判断：" + anchored["reason"]
+            checks.append(anchored)
+            if len(checks) >= max(1, (result.budget.output_tokens - 512) // 160):
+                break
         reviewed = sorted({i for check in checks for i in (check["index"],check["index"]+1)})
-        broken = parsed.get("broken_at")
-        breaks = {i for i in parsed.get("breaks", []) if type(i) is int and i in visible}
-        breaks.update(known_breaks)
+        # Only anchored adjacent quotations or deterministic local checks may
+        # truncate dialogue. Models sometimes number questions instead of turns.
+        breaks = set(known_breaks)
         breaks.update(check["index"]+1 for check in checks if check["verdict"] == "broken")
-        if type(broken) is int and broken in visible:
-            breaks.add(broken)
-        repairs = parsed.get("repairs") or []
-        # Repairs are suggestions only unless original wording/claims survive.
-        # Conservative local acceptance prevents the audit from inserting facts.
+        raw_breaks = parsed.get("breaks", [])
+        unanchored = bool(raw_breaks or parsed.get("broken_at") is not None) and not breaks
+        # Audits classify existing text only. Suggested prose is never an independently grounded repair.
         applied = False
         repaired_indexes = []
         repair_suspect = False
-        if isinstance(repairs, list) and 0 < len(repairs) <= 6:
-            ids = [r.get("index") for r in repairs if isinstance(r, dict)]
-            if len(ids) == len(repairs) and all(type(i) is int and i in visible for i in ids) and ids == list(range(min(ids), max(ids) + 1)):
-                replacements = [str(r.get("text") or "").strip() for r in repairs]
-                original = " ".join(turns[i]["text"] for i in ids)
-                allowed_numbers = set(NUMBER_PATTERN.findall(original))
-                valid = all(text and len(text) <= max(400, len(turns[i]["text"]) * 2)
-                            and set(NUMBER_PATTERN.findall(text)) <= allowed_numbers
-                            and not re.search(r"\[[A-Z]\d+\]", text)
-                            for i, text in zip(ids, replacements))
-                if valid and breaks.intersection(ids) and ids[0] <= min(breaks) <= ids[-1]:
-                    repaired_indexes = ids
-                    for i, text in zip(ids, replacements):
-                        turns[i]["text"] = text
-                    # A repair cannot leave the same known missing antecedent.
-                    fixed = {i for i in ids if i not in _local_dialogue_breaks(turns)}
-                    applied = bool(breaks & fixed)
-                    breaks -= fixed
-                    repair_suspect = True  # No independent reaudit of this single-pass repair.
         broken = min(breaks) if breaks else None
-        audit = {"passed": broken is None and bool(reviewed), "scores": {}, "invalid_boundaries": [], "issues": [],
-                 "unsupported_turns": [i for i in parsed.get("unsupported_turns", []) if type(i) is int and i in visible],
+        content_review = _validated_content_review(parsed, turns, visible, claims_by_id or {})
+        audit = {"passed": broken is None and not unanchored and bool(checks) and all(c["verdict"] == "connected" for c in checks),
+                 "closure": closure, **content_review,
+                 "requested_facts": result.build.metadata.get("requested_facts", []),
+                 "requested_transitions": result.build.metadata.get("requested_transitions", []), "scores": {}, "invalid_boundaries": [],
+                 "issues": ["断裂索引缺少相邻原文依据，未据此截断对话。"] if unanchored else [],
+                 "unsupported_turns": sorted({f["index"] for f in content_review["facts"] if f["verdict"] != "supported"}),
                  "broken_at": broken, "breaks": sorted(breaks),
                  "reviewed_indexes": reviewed, "reviewed_transitions": [check["index"] for check in checks], "transition_checks": checks,
                  "repaired_indexes": repaired_indexes, "local_repair_applied": applied, "repair_unreviewed": repair_suspect,

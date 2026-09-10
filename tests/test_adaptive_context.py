@@ -5,7 +5,7 @@ import json
 import pytest
 
 from sandevistan_read import providers, retrieval
-from sandevistan_read.context_budget import ContextUsage, TokenLimits, plan_context
+from sandevistan_read.context_budget import ContextUsage, TokenLimits, plan_context, task_token_ceiling
 from sandevistan_read.generation_context import CURRENT, GenerationContext, mark_sent, region, report
 
 
@@ -18,7 +18,7 @@ def provider(context=256000, output=100000):
 def test_plan_respects_window_and_total_budget(context, output, kind):
     plan = plan_context(TokenLimits.from_provider(provider(context, output)), kind, material_tokens=1_000_000)
     assert plan.evidence_tokens <= plan.total_token_limit - plan.final_reserve_tokens
-    assert plan.total_token_limit <= 300000
+    assert plan.total_token_limit <= task_token_ceiling(context, kind)
     assert plan.final_reserve_tokens >= plan.total_token_limit * .25
     assert plan.output_tokens <= output
     assert plan.preparation_batches <= 4
@@ -131,7 +131,7 @@ def test_revision_scope_stays_pinned_when_live_selection_changes(monkeypatch):
 def test_long_duration_keeps_evidence_budget(minutes):
     plan = plan_context(TokenLimits.from_provider(provider()), 'podcast', material_tokens=1000000, minutes=minutes)
     assert plan.evidence_tokens >= 1000
-    assert plan.total_token_limit <= 300000
+    assert plan.total_token_limit <= task_token_ceiling(256000, "podcast")
 
 
 @pytest.mark.asyncio

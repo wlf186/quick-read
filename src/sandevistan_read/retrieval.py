@@ -4,7 +4,7 @@ import hashlib
 import math
 import re
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -122,6 +122,23 @@ def is_quality_chunk(row: dict[str, Any], *, minimum_chars: int = 120) -> bool:
     return not bool(LOW_VALUE_PATTERN.search(section))
 
 
+def podcast_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude high-confidence non-narrative material without rejecting formulas."""
+    result = []
+    for row in rows:
+        text = str(row.get("content") or "")
+        locator = row.get("locator") or json_load(row.get("locator_json"), {})
+        location = " ".join(str(locator.get(k) or "") for k in ("section", "href"))
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        index_like = (len(lines) >= 8 and sum(len(line) < 100 for line in lines) / len(lines) > .8
+                      and text.count(";") >= 4 and sum(bool(re.search(r"[.!?。！？]$", line)) for line in lines) / len(lines) < .2)
+        corrupt = text.count("\ufffd") > max(5, len(text) * .03)
+        if index_like or corrupt or re.search(r"(?:^|[/_\s-])(?:index|bibliography|contents)(?:[._\s/-]|$)", location, re.I):
+            continue
+        result.append(row)
+    return result
+
+
 def is_context_chunk(row: dict[str, Any]) -> bool:
     """Keep short definitions and qualifications; only exclude obvious metadata."""
     text = str(row.get("content") or "").strip()
@@ -144,7 +161,8 @@ def context_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             (row['source_id'], (row.get('locator') or json_load(row.get('locator_json'), {})).get('page')) not in metadata_pages]
 
 
-def select_context_evidence(rows: list[dict[str, Any]], token_budget: int) -> list[dict[str, Any]]:
+def select_context_evidence(rows: list[dict[str, Any]], token_budget: int, *,
+                            dependencies: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None) -> list[dict[str, Any]]:
     """Stable source/region round robin, with central and qualifying passages."""
     groups: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for row in rows:
@@ -175,12 +193,17 @@ def select_context_evidence(rows: list[dict[str, Any]], token_budget: int) -> li
     ordered = [values[index] for index in range(max(map(len, queues.values()), default=0))
                for values in queues.values() if index < len(values)]
     selected = []
+    charged: set[tuple[str, str]] = set()
     for row in ordered:
-        cost = evidence_cost(row)
+        parts = dependencies(row) if dependencies else [row]
+        fresh = {(part['source_id'], part['id']): part for part in parts
+                 if (part['source_id'], part['id']) not in charged}
+        cost = sum(evidence_cost(part) for part in fresh.values())
         # A stable prefix means a larger budget cannot displace existing evidence.
         if cost > token_budget:
             break
         selected.append(row)
+        charged.update(fresh)
         token_budget -= cost
     if not selected and ordered:
         # Let the prompt packer clip one oversized passage and report it as

@@ -23,6 +23,8 @@ libreoffice = ""
 
 [development]
 # MAIN window/output overrides are stored in Provider settings, not this TOML.
+# Optional Provider config.reasoning_effort is passed to OpenAI-compatible MAIN
+# requests only when set; use values supported by that model (K3: low/high/max).
 # Provider config.context_strategy="balanced" opts into experimental adaptive selection.
 # Unset currently defaults to "conservative"; automatic balanced selection
 # requires per-feature quality qualification.

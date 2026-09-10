@@ -293,8 +293,9 @@ def run_generation_regressions(browser: Browser) -> None:
         fixture.messages = [{"id": "answer", "role": "assistant", "content": "保留有依据的中文回答。", "metadata": {"degraded": True, "warnings": [{"code": "source_formula_unreadable", "stage": "answer", "message": "公式提取不完整，请核对原文件。"}]}}]
         fixture.artifact = {"id": "cards", "type": "podcast", "title": "降级播客", "status": "partial", "media_url": "", "citations": [],
                             "payload": {"version": 4, "degraded": True, "turns": [], "chapters": [], "duration": {"target_minutes": 5, "actual_seconds": 240},
-                                        "quality": {"passed": False}, "audio_quality": {"passed": asr_ok, "metric": "cer", "error_rate": 0.02 if asr_ok else 0.12, "speaker_alignment": 0.90, "silence_outliers": 1, "duration": {"passed": False}},
+                                        "fact_review": {"status":"partial","total":10,"reviewed":3,"supported":2,"contradicted":1,"uncertain":0}, "source_contributions":[{"source_id":"omitted","included":False,"reason":"本集未涵盖"}], "quality": {"passed": False}, "audio_quality": {"passed": asr_ok, "speaker_method":"word_speaker","speaker_coverage":1.0, "metric": "cer", "error_rate": 0.02 if asr_ok else 0.12, "speaker_alignment": 0.90, "silence_outliers": 1, "duration": {"passed": False}},
                                         "warnings": [{"code": "audio_duration", "stage": "audio", "message": "目标 5 分钟，实际 4 分钟。"}]}}
+        coverage['stages']={'act_draft':{'sent_segments':18,'source_tokens':9000},'targeted_repair':{'sent_segments':5,'source_tokens':2000}}
         fixture.artifact['payload']['context_usage']={'coverage':coverage}
         page.goto(BASE_URL)
         expect(page.get_by_label("向已选资料提问")).to_be_enabled()
@@ -304,11 +305,15 @@ def run_generation_regressions(browser: Browser) -> None:
         page.locator(".artifact").filter(has_text="降级播客").click()
         drawer = page.get_by_role("dialog", name="降级播客")
         expect(drawer.get_by_label("生成结果说明")).to_contain_text("目标 5 分钟，实际 4 分钟")
-        expect(drawer.locator(".podcast-meta")).to_contain_text("UNVERIFIED")
+        expect(drawer.locator(".podcast-meta span").filter(has_text="AUDIO").locator("b")).to_have_text("VERIFIED" if asr_ok else "UNVERIFIED")
+        expect(drawer.locator(".podcast-meta")).to_contain_text("偏离目标，仅作提示")
         expect(drawer.locator(".podcast-meta")).to_contain_text("2.0%" if asr_ok else "12.0%")
         expect(drawer.locator(".podcast-meta")).not_to_contain_text("PASSED")
+        expect(drawer).to_contain_text("原文核验 3/10 项")
+        expect(drawer).to_contain_text("本集未涵盖 1 份已选资料")
         drawer.locator('.coverage-details > summary').click()
         expect(drawer.locator('.coverage-details')).to_contain_text('成功调用完整送入 20 段')
+        expect(drawer.locator('.coverage-details')).to_contain_text('章节写作 18 段 · 技术恢复 5 段')
         drawer.locator('.coverage-details details > summary').click()
         expect(drawer.locator('.coverage-details')).to_contain_text('页区间：91–100')
         assert_layout(page)
@@ -330,13 +335,30 @@ def run_context_regressions(browser: Browser) -> None:
         page.get_by_role('button',name='编辑',exact=True).click()
         panel=page.get_by_label('上下文容量预估')
         expect(panel.locator('tbody tr')).to_have_count(5)
+        expect(panel).to_contain_text('分批选材后综合')
+        expect(panel).to_contain_text('先完成短稿，再逐章深化')
+        expect(panel).to_contain_text('个核心章节')
+        if width == 390:
+            expect(panel.get_by_text('左右滑动查看完整容量对照')).to_be_visible()
+            table_region = panel.get_by_role('region', name='功能容量对照表，可横向滚动')
+            assert table_region.evaluate('(element) => element.scrollWidth > element.clientWidth')
+            assert panel.locator('tbody tr').first.locator('td').nth(2).evaluate('(element) => element.clientWidth >= 160')
+            table_region.focus()
+            page.keyboard.press('ArrowRight')
+            expect(table_region).to_be_focused()
+            page.wait_for_function('document.querySelector(".context-capacity-table").scrollLeft > 0')
+            table_region.evaluate('(element) => element.scrollLeft = 0')
         expect(panel).to_contain_text('当前使用保守策略')
         original=panel.locator('tbody tr').first.text_content()
         expect(panel).to_contain_text('当前 Provider、配置与功能尚无匹配的质量资格')
         page.get_by_label('上下文窗口覆盖（tokens）').fill('1000000')
         page.get_by_label('最大输出覆盖（tokens）').fill('384000')
         expect(panel.locator('tbody tr').first).not_to_have_text(original)
-        expect(panel).to_contain_text('300,000')
+        expect(panel.locator('tbody tr').first).to_contain_text('1,250,000')
+        expect(panel).not_to_contain_text('长任务最高 30 万')
+        expect(panel.locator('tbody tr').first).to_contain_text('分区预读后综合')
+        expect(panel.locator('tbody tr').first).to_contain_text('条笔记')
+        expect(panel.locator('tbody tr').first).to_contain_text('摘要容量约')
         page.get_by_label('上下文窗口覆盖（tokens）').fill('30720')
         page.get_by_label('最大输出覆盖（tokens）').fill('4096')
         expect(panel.locator('tbody tr').first).to_have_text(original)
@@ -350,6 +372,9 @@ def run_context_regressions(browser: Browser) -> None:
         assert_layout(page)
         panel.scroll_into_view_if_needed()
         page.screenshot(path=f'/tmp/quick-read-context-capacity-{width}.png')
+        if width == 390:
+            panel.locator('.context-capacity-table').evaluate('(element) => element.scrollLeft = 300')
+            page.screenshot(path='/tmp/quick-read-context-capacity-390-details.png')
         assert not fixture.errors and not fixture.console_errors
         assert not any(method=='PATCH' for method,_,_ in fixture.requests)
         context.close()
@@ -437,6 +462,7 @@ def run_delivery_regressions(browser: Browser) -> None:
             'payload':{'version':4,'delivery_status':'script_only','quality_assessment':quality,'duration':{'target_minutes':5},
                        'turns':[{'id':'turn_1','speaker':'HOST_A','text':'这是保留的脚本。','quality_issues':quality['issues']}],'chapters':[]}}
         if review_status:
+            fixture.artifact["payload"].update(generation_mode="expanded" if review_status=="complete" else "complete_short", narrative_status="complete" if review_status=="complete" else "incomplete" if review_status=="partial" else "unverified")
             fixture.artifact['payload']['quality_report'] = {'episode_audit': {'status':review_status,'coverage_mode':'sampled' if review_status!='complete' else 'full','checked_transitions':2 if review_status=='complete' else 1 if review_status=='partial' else 0,'total_transitions':2,'reviewed_transitions':[]}}
         page.goto(BASE_URL)
         rating = page.locator('.messages details').filter(has_text='质量：待核实')
@@ -450,6 +476,9 @@ def run_delivery_regressions(browser: Browser) -> None:
         expect(drawer).to_contain_text('质量：待核实 · 仅脚本')
         expect(drawer.locator('audio')).to_have_count(0)
         expect(drawer.get_by_label('播客连贯性检查')).to_contain_text({'complete':'连贯性检查已完成','partial':'连贯性已部分检查'}.get(review_status,'连贯性未验证'))
+        if review_status:
+            expect(drawer).to_contain_text('展开版' if review_status=='complete' else '完整短版')
+            expect(drawer).to_contain_text({'complete':'收尾检查通过','partial':'完整性不足，仅草稿','unavailable':'收尾待核实'}[review_status])
         expect(drawer).to_contain_text('这是保留的脚本。')
         expect(drawer).to_contain_text('该轮原文支持待核实。')
         assert_layout(page)

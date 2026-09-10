@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from sandevistan_read import providers, retrieval, services, context_qualification
-from sandevistan_read.context_budget import ContextUsage, TokenLimits, context_strategy, plan_context
+from sandevistan_read.context_budget import ContextUsage, TokenLimits, context_strategy, plan_context, task_token_ceiling
 from sandevistan_read.generation_context import CURRENT, GenerationContext, evidence_cost, mark_sent, report
 
 
@@ -15,10 +15,10 @@ def model(window=256000):
 
 def test_direct_capacity_exceeds_old_stage_ceiling_without_exceeding_task_budget():
     p = plan_context(TokenLimits.from_provider(model()), 'summary', material_tokens=150000)
-    assert p.path == 'direct' and p.evidence_tokens == 150000 and p.preparation_batches == 0
-    assert p.evidence_tokens + p.output_tokens + p.final_reserve_tokens <= p.total_token_limit <= 300000
+    assert p.path == 'prepared' and p.evidence_tokens == 150000 and p.preparation_batches == 4
+    assert p.evidence_tokens + p.output_tokens + p.final_reserve_tokens <= p.total_token_limit <= task_token_ceiling(256000, "summary")
     large = plan_context(TokenLimits.from_provider(model(1000000)), 'summary', material_tokens=900000)
-    assert 64000 < large.evidence_tokens < 300000 and large.path == 'structured'
+    assert 700000 < large.evidence_tokens < 800000 and large.path == 'prepared'
     assert large.output_tokens == p.output_tokens
 
 
@@ -191,8 +191,8 @@ def test_larger_windows_never_reduce_evidence_at_the_task_ceiling(kind):
     windows = [30720, 64000, 128000, 256000, 280000, 300000, 320000, 512000, 1000000, 2000000, 4194304]
     plans = [plan_context(TokenLimits.from_provider(model(window)), kind, material_tokens=2000000) for window in windows]
     assert [p.evidence_tokens for p in plans] == sorted(p.evidence_tokens for p in plans)
-    assert all(p.total_token_limit <= 300000 for p in plans)
-    assert plans[-1].evidence_tokens == plans[-2].evidence_tokens
+    assert all(p.total_token_limit <= task_token_ceiling(p.context_tokens, kind) for p in plans)
+    assert plans[-1].evidence_tokens >= plans[-2].evidence_tokens
 
 
 def test_source_coverage_can_add_a_source_outside_both_ranked_pools(monkeypatch):

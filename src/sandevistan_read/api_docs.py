@@ -161,11 +161,17 @@ ARTIFACT_SCHEMA = _object({
     "id": {"type": "string"}, "notebook_id": {"type": "string"},
     "type": {"type": "string"}, "title": {"type": "string"},
     "language": {"type": "string"}, "status": {"type": "string", "description": "ready/partial 表示产物交付状态，不保证全部质量通过；ready 也可能伴随 degraded 或 warnings。任务 complete 仅表示处理结束。"},
-    "payload": _object({"quality_assessment": _object({}, "自动质量评级：level good/fair/needs_review/unrated，实际 reviewed_units/total_units 与逐项 issues；未评级不视为正确。"), "delivery_status": {"type": "string", "enum": ["full", "partial", "script_only", "draft_only"]}, "performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA,
+    "payload": _object({"generation_mode": {"type": "string", "enum": ["complete_short", "expanded", "legacy"]}, "narrative_status": {"type": "string", "enum": ["complete", "incomplete", "unverified"], "description": "整集收束检查状态，不代表事实全部核验通过。"}, "source_summaries": _array(_object({"source_id": {"type": "string"}, "filename": {"type": "string"}, "points": _array(_object({})), "covered": {"type": "boolean"}}), "摘要分资料要点；旧产物可缺省，covered仅指产生要点，不保证事实完整。"), "turns": _array(_object({"exchange_id": {"type": "string"}, "exchange_start": {"type": "boolean"}}), "Podcast扁平轮次保留原字段；新产物附带完整交流单元标识。"), "quality_assessment": _object({}, "自动质量评级：level good/fair/needs_review/unrated，实际 reviewed_units/total_units 与逐项 issues；未评级不视为正确。"), "delivery_status": {"type": "string", "enum": ["full", "partial", "script_only", "draft_only"]}, "performance": PERFORMANCE_SCHEMA, "provider": TTS_EXECUTION_SCHEMA,
                         "degraded": {"type": "boolean", "description": "生成使用了回退或保留部分内容；应与 status、warnings 和质量报告一起查看。"},
                         "quality": _object({"passed": {"type": "boolean"}}, "Podcast 原始脚本质量结果；部分交付不改写 passed。"),
-                        "quality_report": _object({"episode_audit": _object({"status": {"type": "string", "enum": ["complete", "partial", "unavailable"]}, "coverage_mode": {"type": "string", "enum": ["full", "sampled"]}, "checked_transitions": {"type": "integer"}, "total_transitions": {"type": "integer"}, "reviewed_transitions": {"type": "array", "items": {"type": "integer"}}, "reason": {"type": "string"}}, "连贯性审校完成状态和实际检查的相邻对话；不等于事实认证。")}),
+                        "quality_report": _object({"episode_audit": _object({"status": {"type": "string", "enum": ["complete", "partial", "unavailable"]}, "coverage_mode": {"type": "string", "enum": ["full", "sampled"]}, "checked_transitions": {"type": "integer"}, "total_transitions": {"type": "integer"}, "reviewed_transitions": {"type": "array", "items": {"type": "integer"}}, "requested_transitions": {"type": "array", "items": {"type": "integer"}}, "reason": {"type": "string"}}, "连贯性审校完成状态和实际检查的相邻对话；不等于事实认证。")}),
+                        "fact_review": _object({"status": {"type": "string"}, "total": {"type": "integer"}, "reviewed": {"type": "integer"}, "supported": {"type": "integer"}, "contradicted": {"type": "integer"}, "uncertain": {"type": "integer"}}, "绑定原文引用的事实抽查；未核验不算通过。"),
+                        "chapter_development": _array(_object({"id": {"type": "string"}, "status": {"type": "string", "enum": ["compact", "expanded", "restored", "legacy"]}}), "章节深化或回退状态，不是语义覆盖证明。"),
+                        "source_contributions": _array(_object({"source_id": {"type": "string"}, "included": {"type": "boolean"}, "reason": {"type": "string"}}), "每份已选资料是否进入最终引用，不代表完整覆盖。"),
                         "audio_quality": _object({
+                            "assessment_version": {"type": "integer"},
+                            "speaker_method": {"type": "string"}, "speaker_coverage": {"type": "number"},
+                            "speaker_issues": _array(_object({"turn": {"type": "integer"}, "start_seconds": {"type": "number"}, "end_seconds": {"type": "number"}, "mismatched_seconds": {"type": "number"}})),
                             "passed": {"type": "boolean", "description": "ASR 验收结果，不包含独立的实际时长结论。"},
                             "duration": _object({"passed": {"type": "boolean"}}, "实际音频时长验收，旧产物可能缺省。"),
                         }, "包含错误率、说话人对齐等原始指标；ASR 不可用时部分字段缺省，不应视为零错误。"),
@@ -208,7 +214,7 @@ CONTEXT_PREVIEW_RESPONSES = json_response(_object({
     "strategy": {"type": "string", "enum": ["balanced", "conservative"]},
     "strategies": _object({}, "各功能实际生效策略；与执行使用同一资格清单及显式配置优先级。"),
     "strategy_reasons": _object({}, "各功能实际策略的资格或显式配置原因。"),
-    "plans": _array(_object({})), "saved_plans": _array(_object({})),
+    "plans": _array(_object({"preparation_batches": {"type": "integer"}, "preparation_token_limit": {"type": "integer"}, "preparation_output_tokens": {"type": "integer"}, "core_output_tokens": {"type": "integer"}, "podcast_chapters": {"type": "integer"}, "note_capacity": {"type": "integer"}, "output_items": {"type": "integer"}, "overview_items": {"type": "integer"}, "final_evidence_tokens": {"type": "integer"}}, "与执行共用规划器；选材、预读与输出容量均为上限估算。")), "saved_plans": _array(_object({})),
     "basis": {"type": "string"}, "assumptions": {"type": "string"},
 }), "仅在本地估算选材、分批和任务预算；不承诺质量。实际 context_usage.coverage 分别记录选材、成功调用原文及最终引用，旧产物可缺省。Quiz 作答前不公开逐来源覆盖明细。")
 
