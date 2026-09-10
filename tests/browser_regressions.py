@@ -73,7 +73,7 @@ class Fixture:
         elif path == "/settings/image-processing":
             result = {"mode": "process", "processors": ["ocr"]}
         elif path == "/status":
-            result = {"providers": {}}
+            result = {"version": "9.8.7-fixture", "providers": {}}
         elif path == "/jobs":
             result = {"items": [job] if self.show_job else [], "page": 1, "page_size": 100, "total": int(self.show_job), "pages": 1}
         elif path == "/jobs/ingest/cancel":
@@ -155,6 +155,7 @@ def run_core_regressions(browser: Browser):
         fixture = Fixture(page)
         page.goto(BASE_URL)
         expect(page.get_by_label("向已选资料提问")).to_be_enabled()
+        expect(page.locator("footer")).to_contain_text("BUILD 9.8.7-fixture")
         send(page, fixture, "question A")
         select_notebook(page, "b")
         fixture.reply(0, "OLD ANSWER A", "conversation-a")
