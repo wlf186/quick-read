@@ -21,6 +21,10 @@ PROVIDER_CONFIG_DOCS = {
             "type": "string", "enum": ["balanced", "conservative"],
             "description": "MAIN 上下文策略；缺省按 Provider、配置与功能匹配质量资格，无匹配时 conservative。balanced 按有效窗口、输出预算和资料量动态规划；conservative 保留原有选材策略，供对照和回退。",
         },
+        "reasoning_effort": {
+            "type": "string",
+            "description": "OpenAI-compatible 聊天请求的推理强度，支持值由服务决定。显式 high/xhigh/max 启用 MAIN 结构化生成的高推理预算保护；未指定时不发送，应用不推断服务默认强度。此项不修改 thinking 或上下文策略；更新 config 时需保留其余键。",
+        },
         "thinking": {
             "type": "string",
             "enum": ["auto", "disabled", "enabled"],

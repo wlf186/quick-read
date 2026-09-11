@@ -1246,6 +1246,12 @@ async def budgeted_chat(
         trace = state.trace
     provider = state.provider if state else provider_override or (DELIVERY.get().provider if role == "main" and DELIVERY.get() and DELIVERY.get().provider else _chat_provider(role))
     limits = TokenLimits.from_provider(provider)
+    from .context_budget import high_reasoning
+    delivery = DELIVERY.get() if role == "main" else None
+    requested_output = max_tokens
+    if delivery and json_mode:
+        max_tokens = max(max_tokens, 8192 if high_reasoning(provider) else 0,
+                         delivery.stage_output_tokens.get(stage, 0))
     last_error: ContextOverflowError | None = None
     escalated = False
     for attempt, scale in enumerate(RETRY_SCALES, start=1):
@@ -1257,10 +1263,22 @@ async def budgeted_chat(
         if role == "main" and DELIVERY.get() and trace and trace.episode_audit_reserve_tokens and trace.total_token_limit is not None:
             held = 0 if stage == "episode_audit" else trace.episode_audit_reserve_tokens
             available = max(0, trace.total_token_limit - trace.accounted_tokens - held)
-            budget = replace(budget, output_tokens=min(budget.output_tokens, max(1, available // 3)))
+            # Leave a minimum input allowance, without starving the final audit
+            # simply because reasoning and visible JSON share one output limit.
+            budget = replace(budget, output_tokens=min(budget.output_tokens, max(1, available - 1024)))
             budget = replace(budget, input_tokens=min(budget.input_tokens, max(0, available - budget.output_tokens)))
-        build = builder(budget)
+        # Extra reasoning headroom must not ask the builder for more notes,
+        # facts or dialogue than the original visible-content target.
+        build = builder(replace(budget, output_tokens=requested_output) if budget.output_tokens > requested_output else budget)
         estimated = estimate_messages_tokens(build.messages, budget.image_tokens_per_image)
+        if (estimated > budget.input_tokens and build.metadata.get("preserve_evidence")
+                and (not limits.max_input_tokens or estimated <= limits.max_input_tokens)):
+            # A chapter replacement may need the original chapter's complete
+            # evidence. Borrow output headroom before dropping that evidence;
+            # this is local planning, not another provider attempt.
+            output = budget.input_tokens + budget.output_tokens - estimated
+            if output >= max(minimum_output_tokens, min(requested_output, 4096)):
+                budget = replace(budget, input_tokens=estimated, output_tokens=min(budget.output_tokens, output))
         if estimated > budget.input_tokens:
             raise ContextOverflowError(
                 f"提示构建结果 {estimated} tokens 超过安全预算 {budget.input_tokens}", code="local_context_budget", status=422
@@ -1279,7 +1297,7 @@ async def budgeted_chat(
                     trace.begin_request(estimated_tokens=estimated + output_tokens)
                 try:
                     result = await _chat_once(provider, build.messages, json_mode=json_mode,
-                                             timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state else timeout,
+                                             timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state or (json_mode and high_reasoning(provider)) else timeout,
                                              max_tokens=output_tokens, temperature=temperature,
                                              **({"response_schema": response_schema} if response_schema is not None and provider.get("kind") == "ollama" else {}))
                 except Exception:
@@ -1311,12 +1329,13 @@ async def budgeted_chat(
                 if product_audit or not claim_recovery():
                     raise
                 completion = await invoke(budget.output_tokens)
-            if not product_audit and not escalated and _needs_output_escalation(completion) and claim_recovery():
+            if not product_audit and not escalated and _needs_output_escalation(completion):
                 # 推理模型把预算烧在隐藏思考上：同一 scale 下翻倍输出预算重试一次，不消耗溢出降档
                 escalated = True
                 escalated_output = _escalated_output(limits, budget, estimated, scale)
                 if escalated_output > budget.output_tokens:
-                    if not trace or trace.total_token_limit is None or trace.accounted_tokens + estimated + escalated_output <= trace.total_token_limit:
+                    held = trace.episode_audit_reserve_tokens if trace else 0
+                    if (not trace or trace.total_token_limit is None or trace.accounted_tokens + estimated + escalated_output <= trace.total_token_limit - held) and claim_recovery():
                         try:
                             replacement = await invoke(escalated_output)
                         except (ProviderError, httpx.RequestError, RuntimeError) as exc:
@@ -1338,6 +1357,8 @@ async def budgeted_chat(
                 trace.overflow_retries += 1
             last_error = exc
             continue
+        if delivery and completion.content.strip() and completion.finish_reason == "stop":
+            delivery.stage_output_tokens[stage] = max(delivery.stage_output_tokens.get(stage, 0), budget.output_tokens)
         return BudgetedCompletion(completion.content, build, budget, completion.finish_reason)
     raise last_error or ContextOverflowError("Provider 上下文窗口不足", code="context_window_exceeded", status=422)
 

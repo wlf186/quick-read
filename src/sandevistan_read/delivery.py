@@ -1,7 +1,7 @@
 """Product delivery policy, independent of evidence selection and qualification."""
 from __future__ import annotations
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import inspect
 import copy
@@ -12,6 +12,7 @@ class DeliveryBudget:
     audits: int = 0
     recoveries: int = 0
     provider: dict[str, Any] | None = None
+    stage_output_tokens: dict[str, int] = field(default_factory=dict)
 
 CURRENT: ContextVar[DeliveryBudget | None] = ContextVar("delivery_budget", default=None)
 

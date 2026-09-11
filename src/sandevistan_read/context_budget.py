@@ -44,6 +44,10 @@ def structured_output_tokens(visible_target: int) -> int:
     return visible + max(1024, min(4096, visible))
 
 
+def high_reasoning(provider: dict[str, Any]) -> bool:
+    return (provider.get("config") or {}).get("reasoning_effort") in {"high", "xhigh", "max"}
+
+
 def positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -196,7 +200,7 @@ def prompt_budget(limits: TokenLimits, requested_output: int, minimum_output: in
     return PromptBudget(limits.effective_context_tokens, input_tokens, output, limits.image_tokens_per_image, scale)
 
 
-CONTEXT_STRATEGY_VERSION = "evidence_v6"
+CONTEXT_STRATEGY_VERSION = "evidence_v7"
 TASK_TOKEN_CEILING = 300_000
 PODCAST_TASK_TOKEN_CEILING = TASK_TOKEN_CEILING * 5 // 4
 
@@ -546,9 +550,10 @@ def is_context_error(status: int | None, code: str, message: str) -> bool:
     )
 
 
-def reserve_podcast_audit(trace: ContextUsage, limits: TokenLimits) -> None:
+def reserve_podcast_audit(trace: ContextUsage, limits: TokenLimits, *, reasoning: bool = False) -> None:
     """Protect one final review inside the existing task and model limits."""
-    budget = prompt_budget(limits, 4096, 128, 1.0)
+    budget = prompt_budget(limits, 8192 if reasoning else 4096, 128, 1.0)
     trace.episode_audit_reserve_tokens = min(
-        (trace.total_token_limit or 0) // 4, budget.input_tokens + budget.output_tokens
+        (trace.total_token_limit or 0) // (2 if reasoning else 4),
+        min(budget.input_tokens, 8192) + budget.output_tokens if reasoning else budget.input_tokens + budget.output_tokens
     )

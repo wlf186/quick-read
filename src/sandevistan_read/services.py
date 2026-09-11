@@ -671,6 +671,32 @@ def allocate_summary_points(
     return retained
 
 
+def summary_point_values(parsed: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Unwrap one accidental points envelope; never interpret diagnostic text."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("points"), list):
+        return [], False
+    values, normalized = [], False
+    for value in parsed["points"][:128]:
+        if len(values) >= 128:
+            break
+        if not isinstance(value, dict):
+            continue
+        claim = value.get("claim") or value.get("text")
+        if not isinstance(claim, str) or not claim.strip():
+            nested = value.get("points")
+            if isinstance(nested, list):
+                normalized = True
+                for item in nested[:128 - len(values)]:
+                    if isinstance(item, dict) and isinstance(item.get("claim") or item.get("text"), str):
+                        values.append({**item, "claim": item.get("claim") or item.get("text")})
+            continue
+        normalized = normalized or not value.get("claim")
+        values.append({**value, "claim": claim})
+        if len(values) >= 128:
+            break
+    return values, normalized
+
+
 @delivery_task
 @adaptive_generation("summary")
 async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str, reporter: Reporter | None = None) -> dict[str, Any]:
@@ -696,8 +722,10 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     overview_count = current().plan.overview_items if current() else 6
     quotas = summary_point_quotas(ids, target_points, overview_count)
     filenames = {row['source_id']: row.get('filename', row['source_id']) for row in original_representatives}
+    format_normalized = False
 
     def parse_points(raw: str, valid_labels: set[str]) -> list[dict[str, Any]]:
+        nonlocal format_normalized
         try:
             parsed = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
         except (ValueError, json.JSONDecodeError):
@@ -713,11 +741,11 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
                 values.append(value)
                 tail = tail.lstrip()[end:].lstrip().removeprefix(",")
             parsed = {"points": values}
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("points"), list):
-            return []
+        values, normalized = summary_point_values(parsed)
+        format_normalized = format_normalized or normalized
         points: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for value in parsed.get("points") or []:
+        for value in values:
             if not isinstance(value, dict):
                 continue
             claim = re.sub(r"\s+", " ", str(value.get("claim") or "")).strip()
@@ -831,6 +859,8 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     used_labels = list(dict.fromkeys(label for point in points for label in point["citations"]))
     output_citations = [citations_by_id[label] for label in used_labels if label in citations_by_id]
     warnings = [{"code": "summary_partial", "stage": "summary", "message": "摘要综合未完整完成，已保留有效要点或可核验的原文摘录。"}] if degraded else []
+    if format_normalized:
+        warnings.append({"code": "summary_format_normalized", "stage": "summary", "message": "已在本地规范化摘要结构，内容仍按原文核验。"})
     if any(not item['covered'] for item in source_summaries):
         degraded = True
         warnings.append({'code': 'source_summary_incomplete', 'stage': 'summary', 'message': '部分资料尚无独立要点，已保留其他内容。'})

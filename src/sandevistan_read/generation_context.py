@@ -190,7 +190,11 @@ async def prepare_evidence(rows: list[dict[str, Any]], language: str) -> list[di
     for batch in batches[:state.plan.preparation_batches]:
         if state.cancel_check and state.cancel_check():
             raise RuntimeError("任务已取消")
-        if state.trace.request_limit is not None and state.trace.requests >= state.trace.request_limit - 3:
+        from .delivery import CURRENT as DELIVERY
+        delivery = DELIVERY.get()
+        reserved_calls = 2 + int(delivery is None or not delivery.recoveries)
+        if state.trace.request_limit is not None and state.trace.requests >= state.trace.request_limit - reserved_calls:
+            state.preparation["stop_reason"] = "request_limit"
             break
         output = state.plan.preparation_output_tokens or state.plan.output_tokens
         remaining = state.plan.preparation_token_limit - (state.trace.accounted_tokens - preparation_start)
@@ -381,8 +385,8 @@ def adaptive_generation(kind: str) -> Callable:
             trace = ContextUsage(total_token_limit=plan.total_token_limit, request_limit=80)
             from .delivery import CURRENT as DELIVERY
             if actual_kind == "podcast" and DELIVERY.get():
-                from .context_budget import reserve_podcast_audit
-                reserve_podcast_audit(trace, TokenLimits.from_provider(provider))
+                from .context_budget import reserve_podcast_audit, high_reasoning
+                reserve_podcast_audit(trace, TokenLimits.from_provider(provider), reasoning=high_reasoning(provider))
             state = GenerationContext(copy.deepcopy(provider), plan, rows, sources, trace)
             state.cancel_check = values.get("cancel_check")
             if values.get("job_id"):
