@@ -275,7 +275,7 @@ def main() -> None:
         page.keyboard.press("Escape")
         assert study_create.count() == 0
 
-        page.locator(".studio-cards button").filter(has_text="双人音频").click()
+        page.locator(".studio-cards button").filter(has_text="双人Podcast").click()
         podcast_create = page.get_by_role("dialog", name="生成双人深度播客")
         assert podcast_create.is_visible()
         assert podcast_create.get_by_text("PODCAST V4 // EDITORIAL ACTS", exact=True).is_visible()
@@ -329,30 +329,38 @@ def main() -> None:
         authenticate(guard_page)
         select_qa_notebook(guard_page)
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
-        guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人音频")
-        assert guarded_podcast.is_disabled()
+        guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人Podcast")
+        assert guarded_podcast.is_enabled()
+        assert guard_page.get_by_text("音频服务离线 · 双人Podcast将仅生成文本", exact=True).is_visible()
         assert guard_page.get_by_text("请先配置并启用 AUDIO Provider", exact=True).is_visible()
         assert guard_page.locator(".studio-cards button").filter(has_text="Quiz 题库").is_enabled()
+        guarded_podcast.click()
+        degraded_dialog = guard_page.get_by_role("dialog", name="生成双人深度播客")
+        assert degraded_dialog.is_visible()
+        assert degraded_dialog.get_by_text(re.compile("仍可生成双人对话脚本")).is_visible()
+        assert degraded_dialog.get_by_role("button", name="仅生成对话脚本").is_enabled()
+        guard_page.screenshot(path="/tmp/sandevistan-read-podcast-script-only-desktop.png")
+        guard_page.keyboard.press("Escape")
+        assert degraded_dialog.count() == 0
         guard_page.get_by_role("button", name="配置 AUDIO Provider").click()
         assert guard_page.get_by_role("dialog", name="Provider 配置").is_visible()
         assert guard_page.get_by_role("dialog", name="生成双人深度播客").count() == 0
-        guard_page.screenshot(path="/tmp/sandevistan-read-podcast-disabled-desktop.png")
         guard_page.keyboard.press("Escape")
 
         audio_guard["mode"] = "unhealthy"
         guard_page.reload(wait_until="domcontentloaded")
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
         guard_page.get_by_text("所选 ASR 设备不可用", exact=True).wait_for()
-        assert guard_page.locator(".studio-cards button").filter(has_text="双人音频").is_disabled()
+        assert guard_page.locator(".studio-cards button").filter(has_text="双人Podcast").is_enabled()
         guard_page.screenshot(path="/tmp/sandevistan-read-podcast-unhealthy-desktop.png")
 
         audio_guard["mode"] = "ready"
         guard_page.reload(wait_until="domcontentloaded")
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
         guard_page.wait_for_function(
-            "!Array.from(document.querySelectorAll('.studio-cards button')).find(button => button.textContent.includes('双人音频')).disabled"
+            "!Array.from(document.querySelectorAll('.studio-cards button')).find(button => button.textContent.includes('双人Podcast')).disabled"
         )
-        guard_page.locator(".studio-cards button").filter(has_text="双人音频").click()
+        guard_page.locator(".studio-cards button").filter(has_text="双人Podcast").click()
         assert guard_page.get_by_role("dialog", name="生成双人深度播客").is_visible()
         guard_page.close()
 
@@ -528,9 +536,9 @@ def main() -> None:
         tablet_studio = tablet.get_by_role("dialog", name="Studio")
         assert tablet_studio.is_visible()
         assert tablet_studio.locator(".studio-cards button").count() == 4
-        assert tablet_studio.locator(".studio-cards button").filter(has_text="双人音频").is_disabled()
+        assert tablet_studio.locator(".studio-cards button").filter(has_text="双人Podcast").is_enabled()
         assert_no_horizontal_overflow(tablet)
-        tablet.screenshot(path="/tmp/sandevistan-read-podcast-disabled-tablet.png")
+        tablet.screenshot(path="/tmp/sandevistan-read-podcast-script-only-tablet.png")
         tablet_studio.get_by_role("button", name="配置 AUDIO Provider").click()
         assert tablet_studio.count() == 0
         assert tablet.get_by_role("dialog", name="Provider 配置").is_visible()
@@ -548,9 +556,9 @@ def main() -> None:
         assert mobile.locator(".sources").is_visible()
         mobile.get_by_role("button", name="Studio", exact=True).click()
         assert mobile.locator(".workspace > .studio").is_visible()
-        assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人音频").is_disabled()
+        assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人Podcast").is_enabled()
         assert mobile.locator(".workspace > .studio").get_by_role("button", name="配置 AUDIO Provider").is_visible()
-        mobile.screenshot(path="/tmp/sandevistan-read-podcast-disabled-mobile.png")
+        mobile.screenshot(path="/tmp/sandevistan-read-podcast-script-only-mobile.png")
 
         mobile.route("**/api/providers/inspect", inspect_provider)
         mobile.get_by_role("button", name="设置").click()

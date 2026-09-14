@@ -212,6 +212,20 @@ PROVIDER_PROBE_RESPONSES = json_response(_object({
 }), "重新探测并持久化能力；AUDIO 还应用默认配置和自动推荐，MAIN/VLM 返回各自窗口能力。")
 ARTIFACT_RESPONSES = json_response(ARTIFACT_SCHEMA, "产物详情及可选的 Podcast 执行统计。")
 ARTIFACT_LIST_RESPONSES = json_response(_array(ARTIFACT_SCHEMA), "产物列表；view=summary 时 payload 为 {}，citations 为 []，不返回媒体链接。")
+PODCAST_SUBMIT_RESPONSES = json_response(_object({}), "已加入 Podcast 生成队列。AUDIO Provider 未配置或不可用时请求仍被接受，产物降级为仅脚本交付（payload.delivery_status 为 script_only）。")
+PODCAST_DOWNLOAD_RESPONSES = {
+    200: {
+        "description": "按 part 与 script_format 返回下载内容：part=all 打包 ZIP（音频存在时含 podcast.m4a|wav，另含 script.md 极简对话稿与 script.json 结构化脚本）；part=audio 仅音频（无音频时 404）；part=script 按 script_format 返回 Markdown、JSON 或仅脚本的 ZIP。仅适用于 Podcast 产物。",
+        "content": {
+            "application/zip": {},
+            "audio/mp4": {},
+            "audio/wav": {},
+            "text/markdown": {},
+            "application/json": {},
+        },
+    },
+    404: {"description": "产物不存在、非 Podcast 产物，或所选部分不可用。"},
+}
 JOB_RESPONSES = json_response(_object({}), "任务详情；Quiz result 与产物接口采用相同公开结构，隐藏答案、解析和作答后证据，作答后通过学习会话接口返回。其他任务字段保留。")
 JOB_LIST_RESPONSES = json_response(_object({}), "分页任务列表；Quiz result 隐藏答案、解析和作答后证据。view=summary 仅返回已有摘要字段。")
 CONTEXT_PREVIEW_RESPONSES = json_response(_object({

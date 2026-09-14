@@ -187,10 +187,7 @@ export default function App(){
   async function onCreate(type:string){
     if(!notebook){notify('请先新建或选择一个 Notebook','error');return}
     if(!selected.length){notify('请先选择至少一份已完成索引的资料','error');return}
-    if(type==='podcasts'){
-      if(podcastUnavailableReason){notify(podcastUnavailableReason,'error');return}
-      setPodcastOpen(true);return
-    }
+    if(type==='podcasts'){setPodcastOpen(true);return}
     if(type==='quiz'||type==='flashcards'){setStudyCreate(type==='quiz'?'quiz':'flashcard');return}
     try{await createArtifact(notebook.id,type,selected);notify('生成任务已进入本地队列','success');await loadCurrent(notebook.id)}catch(error){reportError(error)}
   }
@@ -242,7 +239,7 @@ export default function App(){
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
     {settings?<SettingsDrawer status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} notebookId={notebook?.id} sourceIds={selected} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}
-    {podcastOpen?<PodcastCreateModal provider={audioProvider} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
+    {podcastOpen?<PodcastCreateModal provider={audioProvider} unavailableReason={podcastUnavailableReason||undefined} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
     {studyCreate?<StudyCreateModal kind={studyCreate} provider={mainProvider} sourceCount={selected.length} onClose={()=>setStudyCreate(null)} onCreate={onCreateStudy}/>:null}
     {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}><button className="drawer-close" data-autofocus onClick={()=>setTabletStudio(false)}>关闭 ×</button>{studio}</Overlay>:null}
     {toast?<div className={`toast toast-${toast.tone}`} role={toast.tone==='error'?'alert':'status'}><span>{toast.message}</span><button aria-label="关闭提示" onClick={()=>setToast(undefined)}>×</button></div>:null}

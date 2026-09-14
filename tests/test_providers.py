@@ -783,16 +783,14 @@ async def test_sequence_synthesis_preserves_item_mapping_and_downloads_each_wav(
     assert execution["oom_fallbacks"] == [{"stage": "generation", "from": 4, "to": 2}]
 
 
-def test_podcast_is_rejected_before_enqueue_when_audio_is_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_podcast_enqueues_without_audio_and_degrades_at_job_layer(monkeypatch: pytest.MonkeyPatch) -> None:
     app_module = importlib.import_module("sandevistan_read.app")
     enqueued: list[str] = []
     monkeypatch.setattr(app_module, "_require_notebook", lambda notebook_id: None)
     monkeypatch.setattr(app_module, "active_provider", lambda role: None)
     monkeypatch.setattr(app_module, "enqueue", lambda *args: enqueued.append("called"))
-    with pytest.raises(HTTPException, match="AUDIO Provider") as captured:
-        app_module.podcast("n1", PodcastRequest(minutes=5))
-    assert captured.value.status_code == 409
-    assert enqueued == []
+    app_module.podcast("n1", PodcastRequest(minutes=5))
+    assert enqueued == ["called"]
 
 
 @pytest.mark.asyncio

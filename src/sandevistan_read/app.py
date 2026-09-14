@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import math
 import shutil
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, JOB_LIST_RESPONSES, JOB_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
+from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, JOB_LIST_RESPONSES, JOB_RESPONSES, PODCAST_DOWNLOAD_RESPONSES, PODCAST_SUBMIT_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
 from .documents import SUPPORTED_EXTENSIONS, sanitize_filename
@@ -22,7 +24,8 @@ from .jobs import WORKER, enqueue, reconcile_cancelled_ingests, request_cancel
 from .cleanup import backfill_resources, process_cleanup_operations, purge_job, reconcile_legacy_podcast_temps, register_resource, request_notebook_delete, request_notebook_deletes
 from .observability import present_job
 from .paths import PATHS
-from .providers import ProviderError, active_provider, audio_provider_readiness, health, inspect_provider, normalize_provider_base_url, probe_audio_provider, probe_chat_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
+from .podcast import script_markdown
+from .providers import ProviderError, active_provider, health, inspect_provider, normalize_provider_base_url, probe_audio_provider, probe_chat_provider, provider_by_id, refresh_active_chat_capabilities, study_generation_profile
 from .retrieval import EMBEDDINGS
 from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSessionReview, ImageProcessingPolicy, LoginRequest, NotebookBatchDelete, NotebookCreate, NotebookUpdate, PodcastRequest, ProviderCreate, ProviderInspectionRequest, ProviderRoleUpdate, ProviderUpdate, QuizAnswer, QuizRequest, QuizSubmission, SourceSelection, StudySessionCreate, SummaryRequest
 from .security import VAULT
@@ -342,12 +345,11 @@ def quiz(notebook_id: str, body: QuizRequest): _require_notebook(notebook_id); r
 def flashcards(notebook_id: str, body: FlashcardRequest): _require_notebook(notebook_id); return enqueue("flashcard", notebook_id, body.model_dump())
 
 
-@api.post("/notebooks/{notebook_id}/podcasts")
+@api.post("/notebooks/{notebook_id}/podcasts", responses=PODCAST_SUBMIT_RESPONSES)
 def podcast(notebook_id: str, body: PodcastRequest):
+    # Audio readiness is decided at job execution time; when the AUDIO provider
+    # is missing or unhealthy the job degrades to a script-only artifact.
     _require_notebook(notebook_id)
-    ready, message = audio_provider_readiness(active_provider("audio"))
-    if not ready:
-        raise HTTPException(409, message)
     return enqueue("podcast", notebook_id, body.model_dump())
 
 
@@ -381,12 +383,67 @@ def artifact(artifact_id: str):
     return public_artifact(item)
 
 
+def _artifact_media_path(row: dict[str, Any] | None) -> Path | None:
+    if not row or not row.get("media_path"):
+        return None
+    path = (PATHS.root / row["media_path"]).resolve()
+    try:
+        path.relative_to(PATHS.artifacts.resolve())
+    except ValueError:
+        return None
+    return path if path.exists() else None
+
+
 @api.get("/artifacts/{artifact_id}/media")
 def artifact_media(artifact_id: str):
-    row = DB.fetchone("SELECT media_path FROM artifacts WHERE id=?", (artifact_id,)); path = PATHS.root / row["media_path"] if row and row["media_path"] else None
-    if not path or not path.exists(): raise HTTPException(404, "音频不存在")
+    row = DB.fetchone("SELECT media_path FROM artifacts WHERE id=?", (artifact_id,)); path = _artifact_media_path(row)
+    if not path: raise HTTPException(404, "音频不存在")
     media_type = "audio/mp4" if path.suffix.lower() in {".m4a", ".mp4"} else "audio/wav"
     return FileResponse(path, media_type=media_type, filename=f"sandevistan-podcast{path.suffix.lower()}")
+
+
+def _podcast_script_json(row: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    turns = payload.get("turns") if isinstance(payload.get("turns"), list) else []
+    return {
+        "title": row.get("title"),
+        "language": row.get("language"),
+        "delivery_status": payload.get("delivery_status"),
+        "duration": payload.get("duration"),
+        "chapters": payload.get("chapters") or [],
+        "turns": [{"index": index, **{key: turn.get(key) for key in ("speaker", "text", "dialogue_act", "claim_ids", "citation_ids", "start_seconds", "end_seconds")}}
+                  for index, turn in enumerate(turns, 1) if isinstance(turn, dict)],
+        "citations": json_load(row.get("citations_json"), []),
+        "warnings": payload.get("warnings") or [],
+    }
+
+
+@api.get("/artifacts/{artifact_id}/download", responses=PODCAST_DOWNLOAD_RESPONSES)
+def download_artifact(artifact_id: str, part: Literal["all", "audio", "script"] = "all", script_format: Literal["both", "markdown", "json"] = "both"):
+    row = DB.fetchone("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
+    if not row or row.get("type") != "podcast":
+        raise HTTPException(404, "播客产物不存在")
+    payload = json_load(row.get("payload_json"), {})
+    audio = _artifact_media_path(row)
+    if part == "audio":
+        if not audio: raise HTTPException(404, "音频不存在")
+        media_type = "audio/mp4" if audio.suffix.lower() in {".m4a", ".mp4"} else "audio/wav"
+        return FileResponse(audio, media_type=media_type, filename=f"sandevistan-podcast{audio.suffix.lower()}")
+    suffix = artifact_id.removeprefix("artifact_")
+    markdown = script_markdown(payload)
+    script_json = json_dump(_podcast_script_json(row, payload))
+    if part == "script" and script_format == "markdown":
+        return Response(content=markdown, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=sandevistan-podcast-script-{suffix}.md"})
+    if part == "script" and script_format == "json":
+        return Response(content=script_json, media_type="application/json", headers={"Content-Disposition": f"attachment; filename=sandevistan-podcast-script-{suffix}.json"})
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        if part == "all" and audio:
+            archive.write(audio, f"podcast{audio.suffix.lower()}", compress_type=zipfile.ZIP_STORED)
+        if script_format in {"both", "markdown"}:
+            archive.writestr("script.md", markdown, compress_type=zipfile.ZIP_DEFLATED)
+        if script_format in {"both", "json"}:
+            archive.writestr("script.json", script_json, compress_type=zipfile.ZIP_DEFLATED)
+    return Response(content=buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=sandevistan-podcast-{suffix}.zip"})
 
 
 @api.get("/visuals/{visual_id}/image")

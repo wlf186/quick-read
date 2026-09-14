@@ -188,6 +188,22 @@ def resolve_podcast_language(source_ids: list[str], requested: str) -> str:
     return resolve_output_language(DB, source_ids, requested)[0]
 
 
+def script_markdown(payload: dict[str, Any]) -> str:
+    """Minimal transcript for download: index, speaker, and text only."""
+    turns = payload.get("turns")
+    if isinstance(turns, list) and turns:
+        speaker_names = {"HOST_A": "A", "HOST_B": "B"}
+        lines = []
+        for index, turn in enumerate(turns, 1):
+            if not isinstance(turn, dict):
+                continue
+            speaker = speaker_names.get(str(turn.get("speaker") or ""), str(turn.get("speaker") or ""))
+            lines.append(f"{index}. {speaker}：{str(turn.get('text') or '').strip()}")
+        return "\n\n".join(lines)
+    legacy = payload.get("script")
+    return legacy if isinstance(legacy, str) else ""
+
+
 def estimate_auto_minutes(chapter_count: int, evidence_count: int) -> int:
     if evidence_count < 4:
         return max(5, evidence_count * 2)
