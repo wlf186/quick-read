@@ -16,8 +16,85 @@ def test_duration_modes_are_backward_compatible() -> None:
     assert PodcastRequest().language == "zh-CN"
     assert podcast.estimate_auto_minutes(4, 20) == 18
     assert podcast.estimate_auto_minutes(7, 20) == 21
-    assert podcast.target_turn_count(5) == 18
+    assert podcast.target_turn_count(5) == 10
+    assert podcast.target_turn_count(6) == 12
     assert podcast.target_turn_count(20) == 56
+
+
+def test_duration_recovery_plan_scales_for_short_episodes() -> None:
+    # 5-minute episodes draft ~1.5x long with short factual turns; the standard
+    # floor/margin leave total candidate capacity just under the target
+    # reduction, which used to abort the only recovery slot. The plan must now
+    # proceed with every candidate and scale floors/margins down for short
+    # episodes while keeping long-episode parameters unchanged.
+    def make_turns(count: int, factual_every: int = 2):
+        return [
+            {
+                "speaker": "HOST_A" if i % 2 == 0 else "HOST_B",
+                "dialogue_act": "explain" if i % factual_every == 0 else "bridge",
+                "text": ("系统通过公开记录建立可验证的交易顺序，节点遵循最长链原则，" * 4) if i % factual_every == 0 else "承接上一点。",
+                "claim_ids": ["C1"] if i % factual_every == 0 else [],
+            }
+            for i in range(count)
+        ]
+
+    chapters = [{"turn_start": 0, "turn_end": 17}]
+    short_turns = make_turns(18)
+    excess = 500
+    plan = podcast._duration_compression_plan(short_turns, chapters, excess, "zh-CN")
+    assert plan, "short-episode plan must proceed with all candidates"
+    assert len(plan) == sum(1 for t in short_turns if t["dialogue_act"] == "explain")
+    # Reductions must respect the scaled per-turn floors.
+    for item in plan:
+        assert item["safe_minimum_units"] >= 28
+
+    long_turns = make_turns(30)
+    long_chapters = [{"turn_start": 0, "turn_end": 29}]
+    long_plan = podcast._duration_compression_plan(long_turns, long_chapters, 120, "zh-CN")
+    assert long_plan and all(item["safe_minimum_units"] >= 35 for item in long_plan)
+
+    empty = podcast._duration_compression_plan(
+        [{"speaker": "HOST_A", "dialogue_act": "bridge", "text": "承接。", "claim_ids": []}],
+        [{"turn_start": 0, "turn_end": 0}],
+        500,
+        "zh-CN",
+    )
+    assert empty == []
+
+
+@pytest.mark.asyncio
+async def test_short_act_prompt_adds_compact_wording(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_budgeted_chat(builder, **kwargs):
+        build = builder(PromptBudget(16384, 12000, 2400, 2048, 1.0))
+        captured["prompt"] = "\n".join(message["content"] for message in build.messages)
+        raise RuntimeError("stop after capture")
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_budgeted_chat)
+    claims = [{"id": "C1", "text": "节点接受最长链作为最终记录。", "evidence_ids": ["E1"], "source_id": "s1", "filename": "a.md"}]
+    duration_budget = {"target_minutes": 1.6, "minimum_units": 300, "maximum_units": 330}
+
+    async def capture(target_minutes: float) -> str:
+        captured.clear()
+        with pytest.raises(RuntimeError, match="stop after capture"):
+            await podcast._draft_scene(
+                scene_kind="act",
+                chapter={"title": "t", "purpose": "p", "tension": "x", "bridge_in": "b", "bridge_out": "o", "lead_host": "HOST_A"},
+                claims=claims,
+                cards_by_id={},
+                memory=podcast.EpisodeMemory("thesis"),
+                existing_turns=[],
+                target=9,
+                language="zh-CN",
+                profile={"tier": "full", "recent_turns": 6},
+                trace=podcast.ContextUsage(),
+                duration_budget={**duration_budget, "target_minutes": target_minutes},
+            )
+        return captured["prompt"]
+
+    assert "2–3 个紧凑句子" in await capture(1.6)
+    assert "2–3 个紧凑句子" not in await capture(4.0)
 
 
 def test_question_rule_translates_ratio_into_actionable_counts() -> None:
@@ -855,7 +932,7 @@ async def test_build_podcast_script_emits_v4_editorial_payload(monkeypatch: pyte
     assert result["quality_report"]["passed"] is True
     assert result["chapters"][0]["turn_start"] < result["chapters"][1]["turn_start"]
     assert {citation["id"] for citation in result["citations"]} == {"S1", "S2"}
-    assert [item["start_index"] for item in ready_acts] == [0, 9]
+    assert [item["start_index"] for item in ready_acts] == [0, 5]
     assert all(item["language"] == "zh-CN" and item["turns"] for item in ready_acts)
 
 

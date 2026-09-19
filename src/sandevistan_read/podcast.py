@@ -234,6 +234,12 @@ def target_turn_count(minutes: int) -> int:
     # Strong podcast references use fewer, more substantial turns than chatty
     # interview templates. This also gives the model enough room to complete an
     # act in one bounded call instead of paying for continuation calls.
+    # Short episodes (<=6 min) use a lower density: at 2.8 turns/min a 5-minute
+    # episode spreads into ~90-unit chatter turns with almost no claim-bearing
+    # factual turns, so the single bounded compression call has nothing to cut
+    # and the episode can never reach the duration gate.
+    if minutes <= 6:
+        return max(10, min(90, round(minutes * 2.0)))
     return max(18, min(90, round(minutes * 2.8)))
 
 
@@ -1721,9 +1727,13 @@ async def _draft_scene(
             "Use the sentence density in the slot plan instead of calculating an exact word count."
         )
     elif duration_budget:
+        compact_rule = (
+            "本 Act 篇幅很短：深槽只写 2–3 个紧凑句子，优先一句结论加一句依据，不要把每个深槽都写满。"
+            if float(duration_budget.get("target_minutes") or 0) < 2.5 else ""
+        )
         duration_rule = (
             f"本 Act 需要形成约 {duration_budget['target_minutes']:.1f} 分钟的自然口播；"
-            "按槽位计划的句数密度直接写，不要计算精确字符数。"
+            "按槽位计划的句数密度直接写，不要计算精确字符数。" + compact_rule
         )
     else:
         duration_rule = ""
@@ -2469,8 +2479,12 @@ def _duration_compression_plan(
     excess_units: int,
     language: str,
 ) -> list[dict[str, Any]]:
-    base_floor = 18 if language == "en" else 35
-    margin = 12 if language == "en" else 24
+    # Short episodes (5–8 min ≈ ≤20 turns) have shorter factual turns, so the
+    # standard floor/margin leave too little per-turn capacity for the single
+    # bounded compression call to cover the excess; scale them down there.
+    short_episode = len(turns) <= 20
+    base_floor = (14 if short_episode else 18) if language == "en" else (28 if short_episode else 35)
+    margin = (9 if short_episode else 12) if language == "en" else (18 if short_episode else 24)
     candidates: dict[int, list[dict[str, Any]]] = {index: [] for index in range(len(chapters))}
     for turn_index, turn in enumerate(turns):
         if _is_question_turn(turn) or turn.get("dialogue_act") not in FACTUAL_ACTS or not turn.get("claim_ids"):
@@ -2508,7 +2522,13 @@ def _duration_compression_plan(
         if capacity >= target_reduction:
             break
     if capacity < target_reduction:
-        return []
+        if not selected:
+            return []
+        # Short episodes can land just under the target reduction (short turns
+        # have little per-turn capacity). Proceed with every candidate so the
+        # single bounded compression call gets the episode as close as
+        # possible; the post-compression 0.85–1.20 duration gate decides.
+        target_reduction = capacity
     remaining = target_reduction
     for position, item in enumerate(selected):
         slots_left = len(selected) - position
