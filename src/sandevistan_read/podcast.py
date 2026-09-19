@@ -26,7 +26,7 @@ from .generation_context import adaptive_generation, current, generation_trace, 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)*(?:%|％)?")
 SENTENCE_PATTERN = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+|\n+")
-PODCAST_ENGINE_VERSION = 14
+PODCAST_ENGINE_VERSION = 15
 PODCAST_DURATION_CALIBRATION_VERSION = 6
 GENERATION_DURATION_TARGET_RATIO = 0.95
 CJK_CHARS_PER_MINUTE = 225
