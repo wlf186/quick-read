@@ -339,6 +339,19 @@ V10 Bitcoin 首测未通过扩展条件。V11 先离线核对原文预算，再�
 
 V11 首测仍未通过：生成 44 轮、估计 13.33 分钟，保留部分脚本；九次调用中一次 Ollama HTTP 500，使用已有一次技术恢复。自动文本复核为核心点 2/7、连贯性 3/5，未扩跑或合成音频。初始离线检查漏带文件名：14 段原文成本由 11888 增至 11972，超过选材预算，实际仍选入 12 段。因此不得把离线去重测试通过解读为实际覆盖提高；下一批应首先用完整应用行结构复现预算边界。
 
+## 文字稿策略迭代循环（2026-09-17）
+
+在 `runtime/evals/podcast-strategy-loop-20260917/` 启动针对播客脚本生成策略的闭环迭代实验：
+
+- **生产 MAIN 固定**：alpha-ollama / `gemma4:12b`，`reasoning_effort=none`。
+- **评测范围**：仅文字稿，零 ASR/TTS 调用；盲评使用冻结六维 rubric（sha256 `0a460b06d85c5db7...`）。
+- **开发集**：bitcoin-25m、strange-loop-14m；**冻结 holdout**：geb-22m。
+- **保留改进**：iter-00 预算记账修复与 plan 视图精简、iter-01 深槽硬下限、iter-02 问句下限与主持人均衡；第二轮（iter-13–18）recovery 硬化六项（恢复预算授予时机、续写区间重述、grant-before-call 对称化、续写 claim 绑定旋转、双层嵌套 turns 解包）与 iter-18 open_hook 实质收尾；第三轮（iter-30–40）在双指标（bitcoin margin + strange 可评率）、K=3 复现、锚点漂移监测的方差削减协议下测试 10 个杠杆，零保留。
+- **结果**：iter-02 使 bitcoin-25m 首次达到 90% 线（23/23）；iter-18 将重锚盲评 dev_margin 从 −18.5 提升至 −11.5（+7）。第三轮实证：strange 基线可评率 ≈0–33%，裁判跨轮漂移 −2~−6 分超过判定阈值，生成+评审方差淹没一切小增益；90% 双样本目标三轮均未达成。
+- **产物**：第一轮报告 `final-report.md`；第三轮报告 `final-report-v3.md`（统计功效分析、裁判漂移序列、再启建议：先修测量再迭代）。
+
+该循环未达成「开发集双样本同轮达标 + 零变更确认轮 + holdout 面板 ≥2/3 通过」的终极目标；README 与版本号已按协议同步至 v0.4.10。
+
 ## 短章节对照与回复回放
 
 `scripts/evaluate_podcast_diagnostics.py` 接受显式 `--cases`、`--output`、`--main-url` 和 `--model`。cases 是三个对象的 JSON 数组，每项仅含 id、title、rows；每行包含 id、source_id、filename、content 和可选 locator/locator_json。提供完整原文，评审标准单独冻结，不放入 cases。输出目录必须不存在，原文、请求和回复仅保存在本地 runtime/evals。

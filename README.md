@@ -193,7 +193,9 @@ Podcast 对相同证据组去重，并在每次请求中共享原文、完整计
 
 Podcast 短章节诊断先回放已有回复，分别检查原文选材、解析、校验和组装的内容损失，再对照现有与简化写作协议。Podcast 预览和执行共用包含文件名、定位的选材成本；未引用的提问可与紧接的回答一起保留，事实引用不足仍提示待核实。短章节测试通过不代表整集或音频达标。参见 [评测说明](docs/podcast-evaluation.md)。
 
-当前 v0.4.9 允许 AUDIO Provider 未配置或不可用时仍提交 Podcast：界面提示离线原因，任务交付双人对话脚本（`script_only`），产物抽屉提供打包下载（ZIP 含音频、极简 Markdown 脚本与完整 JSON）或单独下载其中任一部分；Studio 入口更名为“双人Podcast”。页脚直接读取后端运行版本，升级必须重启后端。
+当前 v0.4.10 允许 AUDIO Provider 未配置或不可用时仍提交 Podcast：界面提示离线原因，任务交付双人对话脚本（`script_only`），产物抽屉提供打包下载（ZIP 含音频、极简 Markdown 脚本与完整 JSON）或单独下载其中任一部分；Studio 入口更名为“双人Podcast”。页脚直接读取后端运行版本，升级必须重启后端。
+
+**策略迭代循环**：2026-09-17 起在 `runtime/evals/podcast-strategy-loop-20260917/` 开展针对播客脚本生成策略的三轮迭代实验（生产 MAIN 固定为 alpha-ollama/gemma4:12b，仅评估文字稿，共 44 个记录轮次）。已认证的保留改进：iter-00 预算记账修复、iter-01/02 深槽硬下限与问句/主持人均衡（使 bitcoin-25m 首次达到 90% 线 23/23）、第二轮 recovery 硬化六项（恢复预算授予时机、续写区间重述、嵌套 turns 解包等，消除迭代前的不透明生成失败）与 iter-18 open_hook 实质收尾（重锚盲评 dev_margin −18.5→−11.5）。第三轮在方差削减协议（双指标、K=3 复现、裁判漂移锚点）下测试 10 个杠杆零保留：strange 基线可评率 ≈0–33%，裁判跨轮漂移 −2~−6 分淹没小增益，90% 双样本目标未达成。完整报告与复现命令见 `runtime/evals/podcast-strategy-loop-20260917/final-report.md` 与 `final-report-v3.md`；holdout 面板因开发集未双达标而未启动，后续再启前需先修复测量（固定裁判面板或改用程序化指标）。
 
 MAIN 的 `config.reasoning_effort` 显式配置为 `high` / `xhigh` / `max` 时，结构化生成会为首轮输出预留至少 8192 tokens 的目标额度，仍受模型、上下文和任务预算限制；这些额外额度用于推理，不增加要求的要点或审查条目。成功恢复的同阶段额度在任务内复用。conservative Podcast 的高推理任务采用既有 45000 tokens 上限，扩写使用剩余输入与输出预算，优先保留完整核心稿和终审。模型返回过多章节时按顺序归并其机制与条件，单章旧格式可以本地转换。长资料预读不再为已用完的技术恢复重复预留调用名额；实际选材、预读和最终综合覆盖仍须分别查看。
 
@@ -201,7 +203,7 @@ MAIN 的 `config.reasoning_effort` 显式配置为 `high` / `xhigh` / `max` 时�
 
 ## 升级与回退
 
-v0.4.9 需重建前端、同步本项目安装元数据并重启后端，无新增数据库迁移或依赖升级。停止服务前等待活动任务完成，备份 `runtime/config.toml`、`runtime/data`（含凭据密钥）、旧代码和前端；SQLite 应停服备份或使用 backup API。Podcast engine 14 不复用旧脚本检查点，已有完成产物继续读取；失败任务后续重试可能重新生成。
+v0.4.10 需重建前端、同步本项目安装元数据并重启后端，无新增数据库迁移或依赖升级。停止服务前等待活动任务完成，备份 `runtime/config.toml`、`runtime/data`（含凭据密钥）、旧代码和前端；SQLite 应停服备份或使用 backup API。Podcast engine 14 不复用旧脚本检查点，已有完成产物继续读取；失败任务后续重试可能重新生成。
 
 部署本身不自动修改 Provider。若希望启用上述高推理预算保护，可为支持的 OpenAI-compatible MAIN 显式设置 `config.reasoning_effort="high"`；未指定时按服务默认推理行为，应用不猜测其强度。修改 Provider 的 `config` 会替换整个对象，需保留其余键。无需同时改变 `thinking`、模型或窗口；均衡上下文策略仍须独立取得资格或显式选择。
 
