@@ -116,6 +116,7 @@ class EpisodeGenerationState:
     duration_expansion_used: bool = False
     duration_compression_used: bool = False
     empty_response_retry_used: bool = False
+    audit_reserve_extended: bool = False
 
     @property
     def recovery_kind(self) -> str | None:
@@ -142,10 +143,26 @@ def _coerce_scene_draft(value: Any) -> SceneDraftResult:
     return SceneDraftResult(turns, issues)
 
 
-def _reserve_episode_audit_after_recovery(trace: ContextUsage) -> None:
-    """Keep the mandatory final audit reachable after one bounded recovery call."""
-    if trace.total_token_limit is not None and not current():
-        trace.total_token_limit = min(45_000, trace.total_token_limit + EPISODE_AUDIT_RECOVERY_RESERVE_TOKENS)
+def _reserve_episode_audit_after_recovery(
+    trace: ContextUsage,
+    generation_state: "EpisodeGenerationState | None" = None,
+) -> None:
+    """Keep the mandatory final audit reachable after one bounded recovery call.
+
+    Must be granted BEFORE the recovery request: providers.budgeted_chat refuses
+    any non-audit MAIN call whose admission would cross
+    total_token_limit - episode_audit_reserve_tokens, so granting the extension
+    only after a recovery call returns (the pre-iter-13 behavior) rejected the
+    recovery call itself with "已为最终整集审校保留预算". Idempotent via
+    EpisodeGenerationState.audit_reserve_extended.
+    """
+    if trace.total_token_limit is None or current():
+        return
+    if generation_state is not None and generation_state.audit_reserve_extended:
+        return
+    trace.total_token_limit = min(45_000, trace.total_token_limit + EPISODE_AUDIT_RECOVERY_RESERVE_TOKENS)
+    if generation_state is not None:
+        generation_state.audit_reserve_extended = True
 
 
 def _segment_prompt_build(
@@ -313,7 +330,7 @@ def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
             f"Follow this ordered slot plan: {encoded}. short slots use 1–2 natural sentences for concise questions, "
             "acknowledgements, or bridges; deep slots use 3–5 complete sentences to explain, probe, qualify, or synthesize the @ claim. "
             "Within the 3–5 sentence range, alternate compact and expansive deep turns instead of writing them all at one length, "
-            f"Aim for about {deep_units} words per deep turn: answer first, then develop the source-supported reason, condition or example. "
+            f"and every deep turn must run at least {deep_units} words — a hard floor, shorter deep turns are rejected: answer first, then develop the source-supported reason, condition or example. "
             "The @ claim is also the only default support when a short slot states a fact. "
             "Do not strengthen association into causation, or a supporting argument into the only, final, or definitive one unless the claim says so. "
             "Write directly without counting words or reporting statistics; use useful spoken content, not filler or repeated summaries."
@@ -321,7 +338,7 @@ def _slot_plan_instruction(plan: list[dict[str, Any]], language: str) -> str:
     return (
         f"严格执行按轮次排列的槽位计划：{encoded}。短槽用 1–2 个自然句完成简洁追问、回应或承接；"
         "深槽用 3–5 个完整但紧凑的句子解释、追问、辨析或综合 @ 后的主张；在 3–5 句范围内让紧凑轮与展开轮长短交替，"
-        f"深槽以约 {deep_units} 个中文等价字符为篇幅参考：先回应问题，再依据原文展开原因、条件或实例；"
+        f"且每个深槽的口播篇幅不得少于 {deep_units} 个中文等价字符——这是硬下限，不足的轮次会被退回重写：先回应问题，再依据原文展开原因、条件或实例；"
         "短槽一旦陈述事实，也只能使用该槽的 @ 主张作为默认支持。"
         "除非主张本身明说，不得把相关性强化为因果，也不得把支持性论据说成‘唯一、最终、根本、证明’。"
         "直接写正文，不要在思考中逐字计数或输出统计；禁止填充语和重复总结。"
@@ -655,6 +672,16 @@ def _extract_turns(raw: str) -> list[dict[str, Any]] | None:
         return None
     turns: list[dict[str, Any]] = []
     for value in values:
+        # Some models double-wrap each turn tuple ([[["A","X","text",[]]]]);
+        # unwrap one list layer when the inner value is a well-formed turn
+        # tuple (observed in iter-16/26 act_continuation outputs; iter-26.5
+        # also covers inner tuples with trailing junk fields).
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
+            inner = value[0]
+            if len(inner) >= 3 and all(isinstance(inner[i], str) for i in range(3)):
+                if len(inner) > 4 and isinstance(inner[3], list):
+                    inner = inner[:4]
+                value = inner
         if isinstance(value, dict):
             act = _coerce_dialogue_act(
                 value.get("dialogue_act") or value.get("act_code"), str(value.get("text") or ""), value.get("claim_ids")
@@ -1162,6 +1189,17 @@ def _render_claim_bundle(claim: dict[str, Any]) -> str:
     return f"[{claim['id']}|{claim['filename']}] {claim['text']} Conditions: {claim.get('qualification', '')} Type: {claim.get('statement_kind', 'source_excerpt')}"
 
 
+def _render_claim_for_plan(claim: dict[str, Any]) -> str:
+    """Compact plan-view of a claim: chapter planning needs each claim's gist,
+    not its full passage; acts still receive complete evidence via
+    _render_claim_bundle. Keeps the plan prompt proportional on evidence-dense
+    sources so the strict task budget leaves room for drafting and audit."""
+    text = str(claim.get("text") or "")
+    if len(text) > 320:
+        text = text[:320].rstrip() + "…"
+    return f"[{claim['id']}|{claim['filename']}] {text} Conditions: {claim.get('qualification', '')} Type: {claim.get('statement_kind', 'source_excerpt')}"
+
+
 def _fallback_episode_plan(claims: list[dict[str, Any]], language: str, act_count: int | None = None) -> dict[str, Any]:
     chapter_count = act_count or max(2, min(6, round(math.sqrt(max(1, len(claims))))))
     size = max(1, math.ceil(len(claims) / chapter_count))
@@ -1291,13 +1329,23 @@ Available claims:
     if DELIVERY.get():
         prompt_prefix += "\nReturn assignments mapping EVERY core unit ID to its main chapter number (1-based): " + json.dumps(required_units) + ". Each assigned unit's mechanism and essential conditions must be explained there, not merely cited. Reuse in other chapters is background, not a new topic. Cover all topics in a supplied unit, including its definitions and practical limitations.\n"
     try:
+        # Chapter planning only needs each claim's gist to group topics; heavy
+        # fields (evidence_passages/original/preparation_notes) would route the
+        # builder into the shared full-passage renderer and can dominate the
+        # strict task budget on evidence-dense sources. Acts still receive the
+        # complete evidence via _render_claim_bundle/_shared_evidence_text.
+        plan_claims = [
+            {key: value for key, value in claim.items()
+             if key not in ("evidence_bundle", "evidence_passages", "original", "preparation_notes")}
+            for claim in claims
+        ]
         generated = await budgeted_chat(
             lambda budget: _segment_prompt_build(
                 budget,
                 language=language,
                 prefix=prompt_prefix,
-                items=claims,
-                renderer=_render_claim_bundle,
+                items=plan_claims,
+                renderer=_render_claim_for_plan,
                 group_key=lambda claim: str(claim["source_id"]),
             ),
             json_mode=True,
@@ -1683,7 +1731,7 @@ async def _draft_scene(
     prompt_prefix = f"""你是严格资料内的双人深度播客编剧。{language_rule}。两位主持人都能解释、质疑和综合；本 Act 由 {chapter.get('lead_host') or 'HOST_A'} 主导，但另一位必须贡献实质判断，禁止机械采访和孤立事实罗列。
 {_scene_instruction(scene_kind, language)}
 {_delivery_instruction(language)}
-生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。{question_rule}，不得连续出现超过两个问句；使用 Q act_code 的轮次必须写成自然问句并以问号结尾。长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个深槽的 claim_ids 至少填一个允许的 C 编号；短槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
+生成恰好 {target} 轮，从 {start_speaker} 开始并严格交替。{question_rule}——问句数量是硬指标，不足或超出都会被退回重写；不得连续出现超过两个问句；使用 Q act_code 的轮次必须写成自然问句并以问号结尾。两位主持人的口播总篇幅必须大体相当：任一方占本 Act 的四到六成；主导方写长时，另一方要用有信息量的追问、补充或辨析保持篇幅相当，不能只回短句。长短轮次要有变化，但每一轮都要完成一个实质推进。{duration_rule} {_slot_plan_instruction(slot_plan, language)} 每个深槽的 claim_ids 至少填一个允许的 C 编号；短槽只有在 Q/B/A/I/O 且完全不陈述事实时才允许空数组。围绕本 Act 的“张力”组织论证主线，把前提、机制和含义逐步讲清；张力只用于内部规划，不得照读或转述其措辞。涉及尚未确认的内容时，用一句自然口语限定带过（如“这里原文没明说”“这点还差一点证据”），把不确定体现在论证结构里，不要念成方法论旁白；口播中禁止使用“不能推出、只支持、边界、门槛、范围、回扣、压实、下一层”一类审稿术语。对听者的显性防误读提醒（“别把它读成/夸成/说成 X”“A 不等于 B”“这不意味着…”）每个 Act 至多一处，其余限定直接并入叙述——说“原文给的是 A”，而不是反复敲打“A 不等于 B”。事实、数字、案例、判断必须被所填 claim_ids 直接支持；禁止用“唯一、必然、完全”等绝对措辞放大原主张，也不能从个人行动擅自推演到社会影响。不得使用资料外常识、轶事或类比，不得念出编号，不得重复“所以你的意思是”一类模板句。
 只输出一个 JSON 对象，键名为 turns；turns 的每一项必须是四元素数组，依次为 speaker、act_code、text、claim_ids。speaker 只能为 A/B；act_code 只能为 I/F/B/Q/A/X/E/M/C/S/O；claim_ids 只能从下方允许列表逐字复制，不能省略事实轮的编号。不要输出示例、统计、解释或额外字段。
 剧集记忆：{memory_json}
 当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；本 Act 的内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；承接：{chapter.get('bridge_in')}；后续钩子：{chapter.get('bridge_out')}。
@@ -1930,6 +1978,7 @@ async def _continue_scene(
     language: str,
     trace: ContextUsage,
     duration_budget: dict[str, Any] | None,
+    generation_state: "EpisodeGenerationState | None" = None,
 ) -> SceneDraftResult:
     missing = target - len(partial)
     actual_units = sum(_spoken_unit_count(turn["text"], language) for turn in partial)
@@ -1941,13 +1990,22 @@ async def _continue_scene(
     ]
     start_speaker = "B" if partial[-1]["speaker"] == "HOST_A" else "A"
     language_rule = "只输出自然的简体中文口语" if language != "en" else "Use natural spoken English only"
-    slot_plan = _turn_slot_plan(missing, minimum_units, language, [str(claim["id"]) for claim in claims])
+    claim_ids = [str(claim["id"]) for claim in claims]
+    # Rotate the default-claim binding so the continuation segment does not
+    # restart the index rotation at claim 0: segments that follow an earlier
+    # partial keep cycling forward, which removes a structural source of
+    # cross-segment claim repetition (content-agnostic).
+    used_claims = {cid for turn in partial for cid in (turn.get("claim_ids") or [])}
+    rotation = sum(1 for cid in claim_ids if cid in used_claims)
+    if claim_ids and rotation:
+        claim_ids = claim_ids[rotation:] + claim_ids[:rotation]
+    slot_plan = _turn_slot_plan(missing, minimum_units, language, claim_ids)
     remaining_question_cap = max(0, math.floor(target * 0.40) - sum(_is_question_turn(turn) for turn in partial))
     remaining_minutes = minimum_units / (LATIN_WORDS_PER_MINUTE if language == "en" else CJK_CHARS_PER_MINUTE)
-    prompt_prefix = f"""你正在补全一段提前结束、结构不完整的资料型双人播客。{language_rule}。不要重写或复述已有轮次，只续写缺失的 {missing} 轮，从 HOST_{start_speaker} 开始严格交替。
+    prompt_prefix = f"""你正在补全一段提前结束、结构不完整的资料型双人播客。{language_rule}。不要重写或复述已有轮次。本 Act 共 {target} 轮，已写完 {len(partial)} 轮；只续写第 {len(partial) + 1} 轮到第 {target} 轮，恰好 {missing} 轮，从 HOST_{start_speaker} 开始严格交替。
 {_delivery_instruction(language)}
 续写需要补足约 {remaining_minutes:.1f} 分钟自然口播，其中最多 {remaining_question_cap} 轮可以是问句（包括以问号结尾的非 Q 标签轮）。{_slot_plan_instruction(slot_plan, language)} 继续当前推理并完成本 Act 的目的与后续钩子；事实轮必须带受支持的 claim_ids。
-只输出一个 JSON 对象，键名为 turns；每一项是 speaker、act_code、text、claim_ids 组成的四元素数组。不要输出短示例、统计或解释。act code 只能使用 I/F/B/Q/A/X/E/M/C/S/O。
+只输出一个 JSON 对象，键名为 turns；turns 数组必须恰好包含 {missing} 项，每一项是 speaker、act_code、text、claim_ids 组成的四元素数组。不要输出短示例、统计或解释。act code 只能使用 I/F/B/Q/A/X/E/M/C/S/O。
 当前部分：{chapter.get('title')}；目的：{chapter.get('purpose')}；内部张力（仅用于组织论证主线，不得照读或转述其措辞）：{chapter.get('tension')}；后续钩子：{chapter.get('bridge_out')}。
 紧邻的已有对话：{json.dumps(compact_recent, ensure_ascii=False)}
 允许使用的主张：
@@ -1957,6 +2015,12 @@ async def _continue_scene(
         "maximum_units": maximum_units,
         "unit": (duration_budget or {}).get("unit"),
     }
+    if generation_state is not None:
+        # Same grant-before-call contract as the duration recovery paths (A1):
+        # the admission check refuses non-audit MAIN calls that would cross
+        # total_token_limit - episode_audit_reserve_tokens, so the bounded
+        # continuation must extend the limit before its own request.
+        _reserve_episode_audit_after_recovery(trace, generation_state)
     generated = await budgeted_chat(
         lambda budget: _segment_prompt_build(
             budget,
@@ -1977,7 +2041,8 @@ async def _continue_scene(
     raw_turns = _extract_turns(generated.content)
     finish_reason = getattr(generated, "finish_reason", None)
     if not raw_turns:
-        return SceneDraftResult([], ["续写没有返回可解析的 turns"], finish_reason)
+        preview = re.sub(r"\s+", " ", str(generated.content or ""))[:80]
+        return SceneDraftResult([], [f"续写没有返回可解析的 turns（finish={finish_reason}，内容前缀：{preview!r}）"], finish_reason)
     available_claims = {claim["id"]: claim for claim in generated.build.metadata["items"]}
     validated, issues = validate_scene_turns(
         raw_turns,
@@ -2112,6 +2177,7 @@ async def create_linked_scene(
                 language=language,
                 trace=trace,
                 duration_budget=duration_budget,
+                generation_state=generation_state,
             )
         except Exception as exc:
             if not allow_partial:
@@ -2314,6 +2380,7 @@ async def _expand_episode_duration(
             {"passed": False, "stage": "duration_expansion", **report},
         )
     generation_state.duration_expansion_used = True
+    _reserve_episode_audit_after_recovery(trace, generation_state)
     items = []
     for item in plan:
         turn = turns[item["index"]]
@@ -2488,6 +2555,7 @@ async def _compress_episode_duration(
             {"passed": False, "stage": "duration_compression", **report},
         )
     generation_state.duration_compression_used = True
+    _reserve_episode_audit_after_recovery(trace, generation_state)
     items = []
     for item in plan:
         turn = turns[item["index"]]
@@ -2588,9 +2656,16 @@ def _update_memory(memory: EpisodeMemory, turns: list[dict[str, Any]], chapter: 
     substantive = [turn["text"] for turn in turns if turn["claim_ids"]]
     if substantive:
         memory.chapter_summaries.append({"title": str(chapter.get("title") or ""), "summary": " ".join(substantive[-2:])[:360]})
-    # Planned bridges are intentions, not statements that have been spoken.
-    # Carry only a real unanswered closing question into the next act.
-    memory.open_hook = turns[-1]["text"] if turns and _is_question_turn(turns[-1]) else ""
+    # Carry a real hook into the next act. Questions are the strongest hook,
+    # but an act that closes on a substantive statement still owes the follow-up
+    # act a response to its final claim — leaving open_hook empty just because
+    # the last turn was not a question loses that continuity (iter-18/B3).
+    if turns and _is_question_turn(turns[-1]):
+        memory.open_hook = turns[-1]["text"][:200]
+    else:
+        substantive_turns = [turn for turn in turns if turn["claim_ids"]]
+        hook_source = substantive_turns[-1] if substantive_turns else (turns[-1] if turns else None)
+        memory.open_hook = (hook_source["text"][:200] if hook_source else "")
     memory.last_turns = (memory.last_turns + turns)[-recent_limit:]
     memory.last_speaker = turns[-1]["speaker"] if turns else memory.last_speaker
 
@@ -3406,6 +3481,10 @@ async def build_podcast_script(
     context_usage.request_limit = act_count + 4
     if not current():
         context_usage.total_token_limit = min(45_000, 14_000 + 750 * total_target)
+        # Strict runs have no delivery wrapper to hold back audit budget; reserve
+        # just enough for the final episode audit admission (calibrated prompt
+        # estimate + minimum output) so drafting cannot consume it.
+        context_usage.episode_audit_reserve_tokens = 6_000
         from .context_budget import high_reasoning
         if allow_partial and high_reasoning(active_provider("main") or {}):
             context_usage.total_token_limit = 45_000
@@ -3578,7 +3657,7 @@ async def build_podcast_script(
         # Expansion/compression is deliberately bounded to one call, but its
         # output must not consume the token allowance reserved for the final
         # publishability audit. The absolute 45k task ceiling still applies.
-        _reserve_episode_audit_after_recovery(context_usage)
+        _reserve_episode_audit_after_recovery(context_usage, generation_state)
     check_cancelled()
     provisional_used_evidence = {evidence_id for turn in turns for evidence_id in turn["citation_ids"]}
     provisional_citations = [citation for citation in all_citations if citation["id"] in provisional_used_evidence]

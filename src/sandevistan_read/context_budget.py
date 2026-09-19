@@ -99,30 +99,51 @@ def estimate_text_tokens(text: str) -> int:
     return max(1, math.ceil(len(text.encode("utf-8")) / 2))
 
 
-def _content_tokens(content: Any, image_tokens: int) -> int:
+def approximate_text_tokens(text: str) -> int:
+    """Approximate true tokenizer load for task-budget admission only.
+
+    estimate_text_tokens (bytes/2) is a deliberate ~2x conservative bound used
+    for context-overflow safety. Measured MAIN tokenizer load on mixed zh/Latin
+    text is ~bytes/4. Never use this for context-window overflow checks.
+    """
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text.encode("utf-8")) / 4))
+
+
+def _content_tokens(content: Any, image_tokens: int, estimator: Callable[[str], int] = estimate_text_tokens) -> int:
     if isinstance(content, str):
-        return estimate_text_tokens(content)
+        return estimator(content)
     if not isinstance(content, list):
-        return estimate_text_tokens(str(content))
+        return estimator(str(content))
     total = 0
     for part in content:
         if not isinstance(part, dict):
-            total += estimate_text_tokens(str(part))
+            total += estimator(str(part))
         elif part.get("type") in {"image_url", "input_image"} or "image_url" in part:
             total += image_tokens
         else:
-            total += estimate_text_tokens(str(part.get("text") or part.get("content") or ""))
+            total += estimator(str(part.get("text") or part.get("content") or ""))
     return total
 
 
-def estimate_messages_tokens(messages: list[dict[str, Any]], image_tokens: int = DEFAULT_IMAGE_TOKENS) -> int:
+def estimate_messages_tokens(
+    messages: list[dict[str, Any]],
+    image_tokens: int = DEFAULT_IMAGE_TOKENS,
+    estimator: Callable[[str], int] = estimate_text_tokens,
+) -> int:
     total = 16
     for message in messages:
-        total += 8 + estimate_text_tokens(str(message.get("role") or ""))
-        total += _content_tokens(message.get("content", ""), image_tokens)
+        total += 8 + estimator(str(message.get("role") or ""))
+        total += _content_tokens(message.get("content", ""), image_tokens, estimator)
         if message.get("images"):
             total += image_tokens * len(message["images"])
     return total
+
+
+def approximate_messages_tokens(messages: list[dict[str, Any]], image_tokens: int = DEFAULT_IMAGE_TOKENS) -> int:
+    """Calibrated prompt-load estimate for task-budget admission; see approximate_text_tokens."""
+    return estimate_messages_tokens(messages, image_tokens, estimator=approximate_text_tokens)
 
 
 def truncate_text_tokens(text: str, token_budget: int) -> tuple[str, bool]:
@@ -444,7 +465,9 @@ class ContextUsage:
 
     def record_failure(self) -> None:
         self.failed_requests += 1
-        # No reliable usage on a failed request: retain its conservative charge.
+        # A failed request consumed no metered tokens; refund the reservation.
+        # Attempt storms remain bounded by request_limit and one-shot recovery flags.
+        self.accounted_tokens -= self.reserved_tokens
         self.reserved_tokens = 0
 
     def record(
@@ -464,6 +487,8 @@ class ContextUsage:
         total_segments: int = 0,
         included_segments: int = 0,
         truncated_segments: int = 0,
+        fallback_prompt: int | None = None,
+        fallback_completion: int | None = None,
     ) -> None:
         self.effective_context_tokens = limits.effective_context_tokens
         self.max_output_tokens = limits.max_output_tokens
@@ -480,8 +505,16 @@ class ContextUsage:
         self.cached_tokens += cached_tokens or 0
         self.accounted_tokens -= self.reserved_tokens
         self.reserved_tokens = 0
-        self.accounted_tokens += (actual_prompt if actual_prompt is not None else estimated_prompt)
-        self.accounted_tokens += (actual_completion if actual_completion is not None else output_tokens)
+        self.accounted_tokens += (
+            actual_prompt
+            if actual_prompt is not None
+            else (fallback_prompt if fallback_prompt is not None else estimated_prompt)
+        )
+        self.accounted_tokens += (
+            actual_completion
+            if actual_completion is not None
+            else (fallback_completion if fallback_completion is not None else output_tokens)
+        )
         stage_usage = self.by_stage.setdefault(
             stage,
             {"calls": 0, "estimated_prompt_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},

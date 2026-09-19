@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -268,6 +269,40 @@ def test_extract_turns_accepts_compact_and_truncated_tuples() -> None:
     assert podcast._act_output_tokens({"maximum_units": 4000}, 20, "zh-CN") == 14096
 
 
+def test_extract_turns_unwraps_double_nested_turn_tuples() -> None:
+    # iter-16.5: gemma occasionally emits each turn wrapped in an extra array
+    # layer ([[["A","X","text",[]]]]); the salvaged turn must still validate.
+    raw = '{"turns": [[["A", "X", "外层多套了一层数组的轮次", []]], [["B", "I", "正常轮次", []]]}'
+    turns = podcast._extract_turns(raw)
+    assert turns == [
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "外层多套了一层数组的轮次", "claim_ids": []},
+        {"speaker": "HOST_B", "dialogue_act": "intro", "text": "正常轮次", "claim_ids": []},
+    ]
+    # iter-26.5: the same double-wrap with trailing junk fields after claims.
+    raw_junk = '{"turns": [[["A", "X", "带尾随杂项的双层轮次", ["C1"], "extra"]]]}'
+    turns_junk = podcast._extract_turns(raw_junk)
+    assert turns_junk == [
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "带尾随杂项的双层轮次", "claim_ids": ["C1"]},
+    ]
+
+
+def test_update_memory_keeps_substantive_statement_hook() -> None:
+    # iter-18 (B3): an act closing on a substantive statement (not a question)
+    # must still leave a hook for the next act's opening turn.
+    memory = podcast.EpisodeMemory("thesis")
+    turns = [
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "系统通过公开记录建立可验证的交易顺序。", "claim_ids": ["C1"]},
+        {"speaker": "HOST_B", "dialogue_act": "acknowledgement", "text": "这就把验证问题转化成了顺序问题。", "claim_ids": ["C1"]},
+    ]
+    podcast._update_memory(memory, turns, {"title": "公开顺序"}, 6)
+    assert memory.open_hook == "这就把验证问题转化成了顺序问题。"
+    # A question close still wins.
+    memory_q = podcast.EpisodeMemory("thesis")
+    q_turns = turns + [{"speaker": "HOST_A", "dialogue_act": "question", "text": "那接收方需要等多久？", "claim_ids": []}]
+    podcast._update_memory(memory_q, q_turns, {"title": "公开顺序"}, 6)
+    assert memory_q.open_hook == "那接收方需要等多久？"
+
+
 @pytest.mark.asyncio
 async def test_chapter_generation_rejects_duplicates_and_unsupported_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_budgeted_chat(builder, **kwargs):
@@ -326,6 +361,87 @@ async def test_linked_scene_repairs_a_bad_draft_without_per_scene_audit(monkeypa
     assert len(turns) == 2
     assert audit["passed"] is True and audit["repaired"] is True
     assert calls == {"draft": 2, "audit": 0}
+
+
+@pytest.mark.asyncio
+async def test_continue_scene_prompt_restates_ordinal_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    # iter-14 (A2): the continuation prompt must restate the exact ordinal span
+    # (act total, already-written count, remaining span) so the model does not
+    # stop early — the iter-09 continuation failure mode.
+    captured: dict[str, str] = {}
+
+    async def fake_budgeted_chat(builder, **kwargs):
+        build = builder(PromptBudget(8192, 6000, 1200, 2048, 1.0))
+        captured["prompt"] = "\n".join(message["content"] for message in build.messages)
+        raise RuntimeError("stop after capture")
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_budgeted_chat)
+    partial = [
+        {"speaker": "HOST_A" if index % 2 == 0 else "HOST_B", "dialogue_act": "explain", "text": "已有轮次的实质内容。", "claim_ids": []}
+        for index in range(4)
+    ]
+    with pytest.raises(RuntimeError, match="stop after capture"):
+        await podcast._continue_scene(
+            chapter={"title": "t", "purpose": "p", "tension": "x", "bridge_out": "b"},
+            claims=[{"id": "C1", "text": "主张", "evidence_ids": ["E1"], "source_id": "s1"}],
+            cards_by_id={},
+            memory=podcast.EpisodeMemory("thesis"),
+            existing_turns=[],
+            partial=partial,
+            target=13,
+            language="zh-CN",
+            trace=podcast.ContextUsage(),
+            duration_budget={"minimum_units": 900, "maximum_units": 1000, "unit": "cjk_equivalent_chars"},
+        )
+    prompt = captured["prompt"]
+    assert "本 Act 共 13 轮" in prompt
+    assert "已写完 4 轮" in prompt
+    assert "第 5 轮到第 13 轮" in prompt
+    assert "恰好 9 轮" in prompt
+    assert "turns 数组必须恰好包含 9 项" in prompt
+
+
+@pytest.mark.asyncio
+async def test_continue_scene_rotates_default_claim_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A4: the continuation's slot plan must rotate the default-claim list by
+    # the claims already used in the partial draft, so the new segment does
+    # not restart the index rotation at claim 0 (structural repetition fix).
+    captured: dict[str, str] = {}
+
+    async def fake_budgeted_chat(builder, **kwargs):
+        build = builder(PromptBudget(8192, 6000, 1200, 2048, 1.0))
+        captured["prompt"] = "\n".join(message["content"] for message in build.messages)
+        raise RuntimeError("stop after capture")
+
+    monkeypatch.setattr(podcast, "budgeted_chat", fake_budgeted_chat)
+    claims = [
+        {"id": "C1", "text": "主张一", "evidence_ids": ["E1"], "source_id": "s1"},
+        {"id": "C2", "text": "主张二", "evidence_ids": ["E2"], "source_id": "s1"},
+        {"id": "C3", "text": "主张三", "evidence_ids": ["E3"], "source_id": "s1"},
+    ]
+    partial = [
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "前半段已经展开第一个主张的实质内容。", "claim_ids": ["C1"]},
+        {"speaker": "HOST_B", "dialogue_act": "explain", "text": "承接并补充同一主张的条件与限定。", "claim_ids": ["C1"]},
+        {"speaker": "HOST_A", "dialogue_act": "explain", "text": "随后转向第二个主张的机制说明。", "claim_ids": ["C2"]},
+        {"speaker": "HOST_B", "dialogue_act": "question", "text": "这对应到第二个主张的哪个条件？", "claim_ids": ["C2"]},
+    ]
+    with pytest.raises(RuntimeError, match="stop after capture"):
+        await podcast._continue_scene(
+            chapter={"title": "t", "purpose": "p", "tension": "x", "bridge_out": "b"},
+            claims=claims,
+            cards_by_id={},
+            memory=podcast.EpisodeMemory("thesis"),
+            existing_turns=[],
+            partial=partial,
+            target=10,
+            language="zh-CN",
+            trace=podcast.ContextUsage(),
+            duration_budget={"minimum_units": 600, "maximum_units": 700, "unit": "cjk_equivalent_chars"},
+        )
+    prompt = captured["prompt"]
+    # C1 and C2 were used in the partial -> binding rotates to start at C3.
+    assert "1:深@C3" in prompt
+    assert "1:深@C1" not in prompt
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,8 @@ from .context_budget import (
     ContextUsage,
     PromptBudget,
     TokenLimits,
+    approximate_messages_tokens,
+    approximate_text_tokens,
     estimate_messages_tokens,
     is_context_error,
     positive_int,
@@ -1288,13 +1290,24 @@ async def budgeted_chat(
                 if state and state.cancel_check and state.cancel_check():
                     raise RuntimeError("任务已取消")
                 if trace:
+                    # Task-budget admission uses a calibrated prompt estimate plus the
+                    # minimum required output; record() settles to metered actuals and
+                    # record_failure() refunds, so the conservative estimate + full
+                    # output budget no longer needs to be reserved up front.
+                    admission = approximate_messages_tokens(build.messages, budget.image_tokens_per_image) + min(
+                        output_tokens, max(128, minimum_output_tokens)
+                    )
                     if role == "main" and DELIVERY.get() and trace.episode_audit_reserve_tokens and stage != "episode_audit":
                         if (trace.request_limit is not None and trace.requests >= trace.request_limit - 1
                                 or trace.total_token_limit is not None and trace.accounted_tokens + estimated + output_tokens > trace.total_token_limit - trace.episode_audit_reserve_tokens):
                             raise RuntimeError("已为最终连贯性审校保留预算")
+                    if (role == "main" and not DELIVERY.get() and trace.episode_audit_reserve_tokens
+                            and stage != "episode_audit" and trace.total_token_limit is not None
+                            and trace.accounted_tokens + admission > trace.total_token_limit - trace.episode_audit_reserve_tokens):
+                        raise RuntimeError("已为最终整集审校保留预算")
                     if state and (stage == "context_prepare" or (state.plan.kind in {"summary", "chat"} and stage in {"summary", "generation"} and trace.requests == 0)) and trace.accounted_tokens + estimated + output_tokens > state.plan.total_token_limit - state.plan.final_reserve_tokens:
                         raise RuntimeError("已为最终综合与审校保留预算")
-                    trace.begin_request(estimated_tokens=estimated + output_tokens)
+                    trace.begin_request(estimated_tokens=admission)
                 try:
                     result = await _chat_once(provider, build.messages, json_mode=json_mode,
                                              timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state or (json_mode and high_reasoning(provider)) else timeout,
@@ -1311,7 +1324,9 @@ async def budgeted_chat(
                                  cached_tokens=result.cached_tokens, temperature=result.temperature,
                                  temperature_source=result.temperature_source, stage=stage,
                                  total_segments=build.total_segments, included_segments=build.included_segments,
-                                 truncated_segments=build.truncated_segments)
+                                 truncated_segments=build.truncated_segments,
+                                 fallback_prompt=approximate_messages_tokens(build.messages, budget.image_tokens_per_image),
+                                 fallback_completion=approximate_text_tokens(result.content) if result.content and result.content.strip() else None)
                     if result.finish_reason in {"length", "max_tokens"}:
                         trace.output_limited_calls += 1
                 mark_sent(build, stage)
@@ -1321,7 +1336,7 @@ async def budgeted_chat(
             except (httpx.ConnectError, httpx.TimeoutException, ProviderError) as exc:
                 if isinstance(exc, ProviderError) and not (
                     not isinstance(exc, ContextOverflowError)
-                    and provider.get("kind") == "ollama"
+                    and provider.get("kind") in {"ollama", "openai"}
                     and exc.status in {500, 502, 503, 504}
                 ):
                     raise

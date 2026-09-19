@@ -323,7 +323,7 @@ async def test_measured_duration_recovery_preserves_original_on_failure(database
         return output
     async def repair(generated, seconds, trace):
         trace.begin_request(estimated_tokens=500)
-        trace.record_failure()  # Retain the conservative charge in this fixture.
+        trace.record_failure()  # Failed requests refund their reservation.
         return [{**turn, 'text': 'long'} for turn in generated['turns']]
     asr_calls = []
     async def transcribe(*args, **kwargs):

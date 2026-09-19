@@ -40,17 +40,21 @@ def test_epub_regions_do_not_collapse_repeated_book_titles():
     assert region(first) != region(last)
 
 
-def test_failed_requests_consume_budget_and_success_settles_reservation():
+def test_failed_requests_refund_reservation_and_success_settles():
+    # Token budget tracks metered consumption: a failed request consumed no
+    # provider tokens, so its reservation is refunded. Attempt storms remain
+    # bounded by request_limit, not by phantom token charges.
     trace = ContextUsage(total_token_limit=1000)
     trace.begin_request(estimated_tokens=400)
     trace.record_failure()
-    assert trace.accounted_tokens == 400
+    assert trace.failed_requests == 1
+    assert trace.accounted_tokens == 0
     trace.begin_request(estimated_tokens=500)
     trace.record(limits=TokenLimits.from_provider(provider()),requested_output=200,output_tokens=200,
                  estimated_prompt=300,actual_prompt=100,actual_completion=100)
-    assert trace.accounted_tokens == 600
+    assert trace.accounted_tokens == 200
     with pytest.raises(RuntimeError):
-        trace.begin_request(estimated_tokens=401)
+        trace.begin_request(estimated_tokens=801)
 
 
 @pytest.mark.parametrize("source_count", [5, 10])
@@ -261,13 +265,17 @@ def test_checkpoint_restores_usage_and_does_not_reset_budget():
     from sandevistan_read.generation_context import restore_trace
     saved = ContextUsage(total_token_limit=300000, request_limit=10)
     saved.begin_request(estimated_tokens=90000)
-    saved.record_failure()
+    saved.record(limits=TokenLimits.from_provider(provider()),requested_output=90000,output_tokens=90000,
+                 estimated_prompt=90000,actual_prompt=85000,actual_completion=5000)
+    saved.begin_request(estimated_tokens=1)
+    saved.record_failure()  # refunded: no metered consumption on a failed request
     restored = ContextUsage(total_token_limit=100000, request_limit=80)
     restore_trace(restored, saved.as_dict())
     assert restored.accounted_tokens == 90000
     assert restored.total_token_limit == 100000
-    assert restored.failed_requests == restored.requests == 1
-    assert restored.actual_prompt_tokens == 0
+    assert restored.failed_requests == 1
+    assert restored.requests == 2
+    assert restored.actual_prompt_tokens == 85000
     with pytest.raises(RuntimeError, match='token'):
         restored.begin_request(estimated_tokens=10001)
 

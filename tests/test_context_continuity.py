@@ -26,7 +26,10 @@ def test_memory_carries_actual_question_not_planned_bridge():
     chapter = {'title': 'First act', 'bridge_out': 'A question that was never spoken?'}
     statement = {'speaker': 'HOST_A', 'text': 'The source describes ordered records.', 'claim_ids': ['C1'], 'dialogue_act': 'explain'}
     podcast._update_memory(memory, [statement], chapter, 4)
-    assert memory.open_hook == ''
+    # iter-18: an act closing on a substantive statement still leaves a hook
+    # (the last substantive turn), never the unspoken planned bridge_out.
+    assert memory.open_hook == statement['text'][:200]
+    assert 'never spoken' not in memory.open_hook
     question = {**statement, 'speaker': 'HOST_B', 'text': 'How are these records ordered?', 'dialogue_act': 'question'}
     podcast._update_memory(memory, [question], chapter, 4)
     assert memory.open_hook == question['text']
