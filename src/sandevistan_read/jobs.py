@@ -66,6 +66,14 @@ def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_
         (id,kind,state,stage,progress,notebook_id,parent_id,payload_json,result_json,error,retryable,cancel_requested,attempts,created_at,updated_at,started_at,finished_at,display_name,stage_code,stage_progress,progress_basis,activity_json,workload_json,execution_profile_json,processing_seconds)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (job_id, kind, "queued", "等待执行", 0.0, notebook_id, parent_id, json_dump(payload), None, None, 0, 0, 0, now, now, None, None, LABELS.get(kind, kind), "queued", 0.0, "observed", "{}", json_dump(workload), json_dump(profile), 0.0))
+    if "quality_level" in payload and not payload.get("quality_run_id") and notebook_id and kind != "ingest":
+        from . import quality
+        try:
+            payload["quality_run_id"] = quality.initialize(job_id, notebook_id, kind, payload, context_provider)
+            DB.execute("UPDATE jobs SET payload_json=? WHERE id=?", (json_dump(payload), job_id))
+        except Exception:
+            DB.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            raise
     Reporter(job_id).update("queued", "等待执行", 0.0, state="queued")
     return DB.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,)) or {}
 
@@ -101,6 +109,11 @@ def request_cancel(job_id: str) -> bool:
         elif job["state"] == "running":
             connection.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
             Reporter(job_id).update("cancelling", "正在安全终止", job["progress"], state="cancelling", connection=connection)
+    payload = json_load(job.get("payload_json"), {})
+    if payload.get("quality_run_id") and job["state"] == "queued":
+        from .quality import load, checkpoint
+        quality_run = load(payload["quality_run_id"])
+        checkpoint(quality_run, "complete", "kept" if quality_run["data"].get("stop_requested") else "cancelled")
     return True
 
 
@@ -198,9 +211,13 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
     provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
+    if "_quality_audio_provider" in payload:
+        snapshot_audio = payload["_quality_audio_provider"]
+        current_audio = provider_by_id(snapshot_audio.get("id")) if snapshot_audio.get("id") else None
+        provider = {**snapshot_audio, "api_key": current_audio.get("api_key", "")} if current_audio and current_audio.get("base_url") == snapshot_audio.get("base_url") else None
     ready, readiness_message = audio_provider_readiness(provider)
     if not ready or not provider:
-        generated = await build_podcast_script(notebook_id, payload, allow_partial=True,
+        generated = copy.deepcopy(payload["_quality_script"]) if payload.get("_quality_script") else await build_podcast_script(notebook_id, payload, allow_partial=True,
             cancel_check=lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested")))
         return _save_script_result(notebook_id, job_id, generated, readiness_message)
     main_provider = copy.deepcopy(current().provider if current() else provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main"))
@@ -431,7 +448,7 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
             save_manifest(saved)
 
         try:
-            generated = await build_podcast_script(
+            generated = copy.deepcopy(payload["_quality_script"]) if payload.get("_quality_script") else await build_podcast_script(
                 notebook_id, payload, progress=report, act_ready=on_act_ready if overlap_enabled else None,
                 allow_partial=True,
                 cancel_check=cancel_check,
@@ -808,12 +825,26 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
 async def execute(job: dict[str, Any]) -> Any:
     from .usage import running, attach, summarize
     payload = json_load(job["payload_json"], {})
-    with running(DB, job["notebook_id"], job["kind"], job_id=job["id"], target_id=payload.get("source_id"), token_limit=payload.get("token_limit")) as run:
-        result = await _execute(job)
+    operation_limit = payload.get("token_limit")
+    if payload.get("quality_run_id"):
+        from .quality import load
+        operation_limit = load(payload["quality_run_id"])["data"]["operation_limit"]
+    with running(DB, job["notebook_id"], job["kind"], job_id=job["id"], target_id=payload.get("source_id"), token_limit=operation_limit) as run:
+        if payload.get("quality_run_id"):
+            from .quality import execute as execute_quality
+            result = await execute_quality(payload["quality_run_id"])
+        else:
+            result = await _execute(job)
         if isinstance(result, dict) and result.get("id"):
             attach(run, result["id"])
+    if payload.get("quality_run_id"):
+        from .quality import load, publish
+        quality_run = load(payload["quality_run_id"])
+        publish(quality_run)
+        if job["kind"] == "chat" and isinstance(result, dict):
+            result["conversation_id"] = quality_run["data"]["payload"].get("conversation_id")
     if isinstance(result, dict):
-        result["usage"] = summarize(DB, run_id=run.id)
+        result["usage"] = summarize(DB, target_id=result.get("id")) if payload.get("quality_run_id") else summarize(DB, run_id=run.id)
         if run.quota_denial:
             result["quota_denial"] = run.quota_denial
             artifact = DB.fetchone("SELECT payload_json FROM artifacts WHERE id=?", (result.get("id"),))

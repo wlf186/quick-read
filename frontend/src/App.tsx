@@ -1,7 +1,8 @@
+import {submitChat} from './api';
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {BookOpen,Headphones,MessageSquare} from 'lucide-react';
-import {SummaryCreateModal,ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SourceRail,StudioRail,StudyCreateModal} from './components';
-import {authStatus,ask,createArtifact,createNotebook,createProvider,deleteSource,getArtifact,getArtifacts,getConversations,getImageProcessingPolicy,getJobs,getMessages,getNotebook,getNotebooks,getProviderRoles,getProviders,getStatus,getWorkspaceState,inspectProvider,login,reviewFlashcard,selectSource,submitQuiz,updateImageProcessingPolicy,updateProvider,updateProviderRole,upload,type Artifact,type Citation,type ConfigurableProviderRole,type ImageProcessingPolicy,type Job,type Notebook,type PodcastOptions,type Provider,type ProviderDraft,type ProviderInspection,type ProviderRoleState,type Source,type StudyOptions} from './api';
+import {ChatResultDrawer,SummaryCreateModal,ArtifactDrawer,ChatPanel,CitationDrawer,Header,LoginScreen,PodcastCreateModal,SourceRail,StudioRail,StudyCreateModal} from './components';
+import {authStatus,createArtifact,createNotebook,createProvider,deleteSource,getArtifact,getArtifacts,getConversations,getImageProcessingPolicy,getJobs,getMessages,getNotebook,getNotebooks,getProviderRoles,getProviders,getStatus,getWorkspaceState,inspectProvider,login,reviewFlashcard,selectSource,submitQuiz,updateImageProcessingPolicy,updateProvider,updateProviderRole,upload,type Artifact,type Citation,type ConfigurableProviderRole,type ImageProcessingPolicy,type Job,type Notebook,type PodcastOptions,type Provider,type ProviderDraft,type ProviderInspection,type ProviderRoleState,type Source,type StudyOptions} from './api';
 import {JobsPage,NotebooksPage} from './management';
 import {SettingsDrawer} from './provider_settings';
 import {WeeklyBudget} from './weekly_usage';
@@ -36,6 +37,7 @@ export default function App(){
   const[question,setQuestion]=useState('');
   const[busy,setBusy]=useState(false);
   const[citation,setCitation]=useState<Citation|null>(null);
+  const[openedChat,setOpenedChat]=useState<{conversationId:string;messageId:string}>();
   const[openedArtifact,setOpenedArtifact]=useState<Artifact|null>(null);
   const[settings,setSettings]=useState(false);
   const[settingsPanel,setSettingsPanel]=useState<'models'|'audio'>('models');
@@ -166,6 +168,18 @@ export default function App(){
     const timer=window.setTimeout(()=>setToast(current=>current?.id===toast.id?undefined:current),5000);return()=>window.clearTimeout(timer);
   },[toast]);
 
+  useEffect(()=>{let inFlight=false;const refresh=()=>{if(!activeId||inFlight)return;inFlight=true;void loadCurrent(activeId).finally(()=>{inFlight=false})};window.addEventListener('sread-quality-changed',refresh);return()=>window.removeEventListener('sread-quality-changed',refresh)},[activeId,loadCurrent]);
+  const improvingMessages=messages.some(message=>message.role==='assistant'&&['queued','generating','scoring','improving','rendering'].includes(message.metadata?.quality_control?.phase));
+  useEffect(()=>{
+    if(!conversationId)return;
+    let stopped=false,inFlight=false;const context=chatContext.current,generation=context.generation;
+    const refresh=async()=>{if(inFlight||document.hidden)return;inFlight=true;try{const next=await getMessages(conversationId);if(!stopped&&chatContext.current===context&&context.generation===generation)setMessages(next)}catch{/* Retry after reconnect. */}finally{inFlight=false}};
+    const timer=improvingMessages?window.setInterval(()=>void refresh(),2000):undefined;
+    window.addEventListener('sread-quality-changed',refresh);window.addEventListener('online',refresh);
+    return()=>{stopped=true;if(timer)clearInterval(timer);window.removeEventListener('sread-quality-changed',refresh);window.removeEventListener('online',refresh)};
+  },[conversationId,improvingMessages]);
+  useEffect(()=>{const open=(event:Event)=>{const id=(event as CustomEvent<string>).detail;if(id)void getArtifact(id).then(setOpenedArtifact).catch(reportError)};window.addEventListener('sread-quality-open',open);return()=>window.removeEventListener('sread-quality-open',open)},[]);
+
   const selected=(notebook?.sources||[]).filter(source=>source.selected&&source.state==='ready').map(source=>source.id);
   const audioProvider=providers.find(provider=>provider.role==='audio'&&provider.active);
   const audioHealth=status?.providers?.audio;
@@ -179,7 +193,7 @@ export default function App(){
     const context=chatContext.current,generation=context.generation,request=++context.request;
     const isCurrent=()=>chatContext.current===context&&context.generation===generation&&context.request===request;
     const content=question.trim(),optimisticId=`local-${Date.now()}`;setQuestion('');setMessages(value=>[...value,{id:optimisticId,role:'user',content}]);setBusy(true);
-    try{const result=await ask(notebook.id,content,selected,conversationId,chatTokenLimit);if(!isCurrent())return;setConversationId(result.conversation_id);setMessages(value=>[...value,{role:'assistant',...result}])}
+    try{const result=await submitChat(notebook.id,content,selected,conversationId,chatTokenLimit);if(!isCurrent())return;setConversationId(result.conversation_id);const next=await getMessages(result.conversation_id);if(!isCurrent())return;setMessages(next);await loadCurrent(notebook.id)}
     catch(error){if(!isCurrent())return;setMessages(value=>value.filter(message=>message.id!==optimisticId));setQuestion(content);reportError(error)}finally{if(isCurrent())setBusy(false)}
   }
 
@@ -229,7 +243,7 @@ export default function App(){
   return <div className={`shell route-${route}`}>
     <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={activateNotebook} onCreate={onCreateNotebook} onSettings={()=>{setSettingsPanel('models');setSettings(true)}}/>
     <WeeklyBudget providers={providers} running={busy||jobs.some(job=>['running','queued','cancelling'].includes(job.state))} revision={`${messages.length}:${jobs.map(job=>`${job.id}:${job.state}`).join(',')}:${providers.length}`}/>
-    {route==='jobs'?<JobsPage onError={reportError} onOpenArtifact={id=>void getArtifact(id).then(setOpenedArtifact).catch(reportError)}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{activateNotebook(id);location.hash='workspace'}}/>:<section className="workspace-shell">
+    {route==='jobs'?<JobsPage onOpenChat={(conversationId,messageId)=>setOpenedChat({conversationId,messageId})} onError={reportError} onOpenArtifact={id=>void getArtifact(id).then(setOpenedArtifact).catch(reportError)}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{activateNotebook(id);location.hash='workspace'}}/>:<section className="workspace-shell">
       <GettingStarted hasModel={Boolean(mainProvider)} hasNotebook={Boolean(notebook)} sourceCount={selected.length} hasResult={artifacts.length>0||messages.some(message=>message.role==='assistant')} onSettings={()=>{setSettingsPanel('models');setSettings(true)}} onCreate={()=>{location.hash='notebooks'}} onImport={()=>{setWorkspacePanel('sources');requestAnimationFrame(()=>document.querySelector<HTMLInputElement>('.upload-zone input')?.click())}} onTry={()=>{setWorkspacePanel('chat');setQuestion('请提炼核心结论与适用限制，并给出原文引用。')}}/>
       <nav className="workspace-tabs" aria-label="工作区面板">
         <button className={workspacePanel==='chat'?'active':''} aria-pressed={workspacePanel==='chat'} onClick={()=>setWorkspacePanel('chat')}><MessageSquare/>对话</button>
@@ -244,6 +258,7 @@ export default function App(){
     </section>}
     <footer><span>© 2077 SANDEVISTAN RESEARCH SYSTEMS</span><b>LOCAL-FIRST // SOURCE-GROUNDED // TRACEABLE</b><span>BUILD {status?.version||'—'}</span></footer>
     {summaryOpen&&notebook?<SummaryCreateModal notebookId={notebook.id} sourceIds={selected} onClose={()=>setSummaryOpen(false)} onCreate={async limit=>{try{await createArtifact(notebook.id,'summary',selected,{token_limit:limit});setSummaryOpen(false);notify('摘要任务已进入队列','success');await loadCurrent(notebook.id)}catch(error){reportError(error);throw error}}}/>:null}
+    {openedChat?<ChatResultDrawer {...openedChat} onClose={()=>setOpenedChat(undefined)} onCitation={setCitation}/>:null}
     <CitationDrawer citation={citation} onClose={()=>setCitation(null)}/>
     <ArtifactDrawer key={openedArtifact?.id||'closed'} artifact={openedArtifact} onClose={()=>setOpenedArtifact(null)} onCitation={setCitation} onSubmitQuiz={submitQuiz} onReview={handleReview}/>
     {settings?<SettingsDrawer initialPanel={settingsPanel} status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} notebookId={notebook?.id} sourceIds={selected} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}

@@ -345,6 +345,9 @@ def adaptive_generation(kind: str) -> Callable:
             provider = lookup(pinned_id) if pinned_id else function.__globals__.get("active_provider", providers.active_provider)("main")
             if pinned_id and not provider:
                 raise RuntimeError("任务绑定的 MAIN Provider 不存在")
+            from .delivery import CURRENT as PINNED_DELIVERY
+            if PINNED_DELIVERY.get() and PINNED_DELIVERY.get().provider:
+                provider = PINNED_DELIVERY.get().provider
             actual_kind = values.get("kind", kind)
             if not provider or context_strategy(provider, actual_kind) != "balanced":
                 return await function(*args, **kwargs)

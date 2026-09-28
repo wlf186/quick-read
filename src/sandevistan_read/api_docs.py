@@ -310,3 +310,21 @@ WEEKLY_OVERVIEW_SCHEMA = _object({
 WEEKLY_SETTINGS_RESPONSES = json_response(WEEKLY_SETTINGS_SCHEMA, "默认每周 100 万 tokens、500 次文字/视觉请求，仅提醒；初始化仅设置首次时区。")
 WEEKLY_USAGE_RESPONSES = json_response(WEEKLY_OVERVIEW_SCHEMA, "包含真实请求尝试及未知预留；语音另计，历史缺失不补零。")
 TASK_PREVIEW_RESPONSES[200]["content"]["application/json"]["schema"]["properties"]["weekly_budget"] = WEEKLY_OVERVIEW_SCHEMA
+
+QUALITY_CONTROL_SCHEMA = _object({
+    "run_id": {"type":"string"}, "job_id": {"type":"string"},
+    "quality_level": {"type":"string", "enum":["low","medium","high","extreme"]},
+    "target_score": {"type":"integer"}, "score": {"type":["integer","null"]},
+    "phase": {"type":"string", "enum":["queued","generating","scoring","improving","rendering","complete"]},
+    "attempts": {"type":"integer"}, "max_attempts": {"type":"integer"},
+    "version_id": {"type":["string","null"]}, "best_version_id": {"type":["string","null"]},
+    "target_id": {"type":["string","null"]}, "stop_reason": {"type":["string","null"]},
+    "met_target": {"type":"boolean"}, "blocking": {"type":"boolean", "description":"存在明确未完成要求、伪造引用或已确认事实矛盾，不能仅按总分判为达标。"}, "rubric_version": {"type":"integer"},
+    "coverage": _object({}, "实际原文采样与截断信息；不是事实正确率。"),
+    "dimensions": _object({}, "固定标准：忠实度40、要求完成度30、结构20、表达10。"),
+    "feedback": _array({"type":"string"}, "具体建议；测验公开接口始终为空，避免泄题。"),
+}, "持久化的分级质量状态。评分失败为null，已生成的内容仍然可读。")
+QUALITY_RESPONSES = json_response(_object({**QUALITY_CONTROL_SCHEMA["properties"], "versions":_array(QUALITY_CONTROL_SCHEMA)}), "进度、最佳版本及各候选版本；不包含测验答案。")
+CHAT_RUN_RESPONSES = {202: {"description":"已排队，可立即轮询质量任务及对话消息。", "content":{"application/json":{"schema":_object({"id":{"type":"string"},"run_id":{"type":"string"},"message_id":{"type":"string"},"conversation_id":{"type":"string"}})}}}}
+ARTIFACT_SCHEMA["properties"]["payload"]["properties"]["quality_control"] = QUALITY_CONTROL_SCHEMA
+TASK_PREVIEW_RESPONSES[200]["content"]["application/json"]["schema"]["properties"]["quality_policy"] = _object({}, "与执行相同的档位、目标分、自动次数及抽样深度。")

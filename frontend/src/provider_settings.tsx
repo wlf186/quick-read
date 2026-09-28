@@ -124,6 +124,7 @@ export function SettingsDrawer({initialPanel='models',status,providers,roles,ima
   const[lastMode,setLastMode]=useState<InspectionMode>('catalog');
   const[busy,setBusy]=useState('');
   const[dirty,setDirty]=useState(false);
+  const[defaultsRestored,setDefaultsRestored]=useState(false);
   const[leaveTarget,setLeaveTarget]=useState<'list'|'close'>();
   const[cardResults,setCardResults]=useState<Record<string,ProviderInspection>>({});
 
@@ -147,10 +148,10 @@ export function SettingsDrawer({initialPanel='models',status,providers,roles,ima
   const canActivate=Boolean(canSave&&draft.model.trim()&&!hostVoiceError);
 
   function mutate(updater:(current:ProviderDraft)=>ProviderDraft,invalidates=true,clearsCatalog=false){
-    setDraft(current=>updater(current));setDirty(true);if(invalidates)setInspection(undefined);if(clearsCatalog)setCatalog(undefined);
+    setDefaultsRestored(false);setDraft(current=>updater(current));setDirty(true);if(invalidates)setInspection(undefined);if(clearsCatalog)setCatalog(undefined);
   }
-  function beginAdd(role:ConfigurableProviderRole){setView({mode:'add'});setDraft(newDraft(role));setCatalog(undefined);setInspection(undefined);setLastMode('catalog');setDirty(false)}
-  function beginEdit(provider:Provider){const next=providerDraft(provider);setView({mode:'edit',provider});setDraft(next);setCatalog(undefined);setInspection(undefined);setLastMode('catalog');setDirty(false);void inspect(next,'catalog',true)}
+  function beginAdd(role:ConfigurableProviderRole){setDefaultsRestored(false);setView({mode:'add'});setDraft(newDraft(role));setCatalog(undefined);setInspection(undefined);setLastMode('catalog');setDirty(false)}
+  function beginEdit(provider:Provider){setDefaultsRestored(false);const next=providerDraft(provider);setView({mode:'edit',provider});setDraft(next);setCatalog(undefined);setInspection(undefined);setLastMode('catalog');setDirty(false);void inspect(next,'catalog',true)}
   function requestLeave(target:'list'|'close'){if(isForm&&dirty)setLeaveTarget(target);else if(target==='close')onClose();else setView({mode:'role',role:draft.role as ConfigurableProviderRole})}
   function confirmLeave(){const target=leaveTarget;setLeaveTarget(undefined);setDirty(false);if(target==='close')onClose();else setView({mode:'role',role:draft.role as ConfigurableProviderRole})}
 
@@ -248,7 +249,7 @@ export function SettingsDrawer({initialPanel='models',status,providers,roles,ima
             <small className="token-limit-summary" role="status">{tokenLimitText(tokenLimits)}</small>
             <div className="provider-form-grid"><label>上下文窗口覆盖（tokens）<input type="number" min="1024" step="1" value={draft.config.context_window_tokens??''} placeholder="留空自动探测" onChange={event=>updateNumericOverride('context_window_tokens',event.target.value)}/><small>单次请求可容纳的资料、指令和输出总量，不是每次消耗量或整项任务预算。仅在识别值不符服务实际能力时覆盖；扩大 Ollama 窗口可能增加内存占用。</small></label><label>最大输出覆盖（tokens）<input type="number" min="128" step="1" value={draft.config.max_output_tokens??''} placeholder="留空自动推导" onChange={event=>updateNumericOverride('max_output_tokens',event.target.value)}/><small>单次返回的最大额度，部分模型的思考也占用它。出现输出截断时再检查此项；过大会挤占原文空间。未知时按窗口的 25% 推导，最多 4096。</small></label></div>
             {draft.role==='main'?<ContextCapacity providerId={currentProvider?.id} model={draft.model} config={draft.config} limits={tokenLimits} notebookId={notebookId} sourceIds={sourceIds}/>:null}
-            {draft.config.reasoning_effort?<p>已配置推理强度：{String(draft.config.reasoning_effort)}；可能占用额外输出额度。</p>:null}<button type="button" onClick={()=>mutate(current=>{const config={...current.config};for(const key of ['temperature','thinking','context_window_tokens','max_output_tokens','study_generation_tier','reasoning_effort'])delete config[key];return {...current,config}})}>恢复任务默认参数</button></details>
+            {draft.config.reasoning_effort?<p>已配置推理强度：{String(draft.config.reasoning_effort)}；可能占用额外输出额度。</p>:null}<button className="secondary-button" type="button" onClick={()=>{mutate(current=>{const config={...current.config};for(const key of ['temperature','thinking','context_window_tokens','max_output_tokens','study_generation_tier','reasoning_effort'])delete config[key];return {...current,config}});setDefaultsRestored(true)}}>恢复任务默认参数</button>{defaultsRestored?<p role="status">已恢复本页默认参数，验证并保存后生效。</p>:null}</details>
             {draft.role==='vlm'?<small className="capability-note">视觉能力：{inspection?.status==='failed'?'验证失败':lastMode==='deep'&&inspection?.activation_eligible?'已深度验证':inspection?.catalog_supported?'清单未声明，建议深度验证':'未知'}</small>:null}
           </>}
         </div>

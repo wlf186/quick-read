@@ -9,7 +9,7 @@ from .database import DB, json_dump, json_load, utc_now
 
 
 LABELS = {
-    "ingest": "文档解析", "summary": "生成摘要", "quiz": "Quiz 题库",
+    "chat": "资料对话", "ingest": "文档解析", "summary": "生成摘要", "quiz": "Quiz 题库",
     "flashcard": "Flashcard 闪卡", "podcast": "双人音频播客",
 }
 

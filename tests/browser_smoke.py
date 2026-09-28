@@ -5,7 +5,7 @@ import re
 import tomllib
 
 from playwright.sync_api import Page, sync_playwright
-from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions
+from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions, run_ui_usability_regressions, run_quality_flow_regressions
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +53,8 @@ def main() -> None:
         run_delivery_regressions(browser)
         run_experience_regressions(browser)
         run_weekly_budget_regressions(browser)
+        run_ui_usability_regressions(browser)
+        run_quality_flow_regressions(browser)
         if os.environ.get("SREAD_BROWSER_FIXTURES_ONLY") == "1":
             browser.close()
             print("Isolated browser checks passed; all API calls intercepted.")

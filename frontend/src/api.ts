@@ -1,3 +1,5 @@
+import {qualityPreference} from './quality_preferences';
+import type {QualityLevel} from './quality_preferences';
 export type EpisodeAudit={status:"complete"|"partial"|"unavailable";coverage_mode:"full"|"sampled";checked_transitions:number;total_transitions:number;reviewed_transitions:number[];requested_transitions?:number[];reason?:string;repair_unreviewed?:boolean;transition_checks?:Array<{index:number;verdict:"connected"|"broken"|"uncertain";reason:string}>};
 export type QualityAssessment={review_status?:string;reason_code?:string;reason?:string;version:1;level:"good"|"fair"|"needs_review"|"unrated";method:string;total_units:number;reviewed_units:number;supported_units:number;issues:Array<{unit?:string;code:string;message:string;severity?:string}>};
 export type DeliveryStatus="full"|"partial"|"script_only"|"draft_only";
@@ -52,7 +54,7 @@ export async function upload(id:string,files:FileList|File[],imagePolicy?:ImageP
 export const ask=(id:string,question:string,source_ids:string[],conversation_id?:string,token_limit?:number)=>api<any>(`/notebooks/${id}/chat`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,token_limit,language:'auto'})});
 export const getConversations=(id:string)=>api<any[]>(`/notebooks/${id}/conversations`);
 export const getMessages=(id:string)=>api<any[]>(`/conversations/${id}/messages`);
-export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions|{token_limit?:number})=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options})});
+export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions|{token_limit?:number})=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options,quality_level:qualityPreference(type)})});
 export const getArtifacts=(id:string)=>api<Artifact[]>(`/notebooks/${id}/artifacts?view=summary`);
 export const getArtifact=(id:string)=>api<Artifact>(`/artifacts/${id}`);
 export const getJobsPage=(params:Record<string,string|number|undefined>={})=>{const query=new URLSearchParams();Object.entries(params).forEach(([key,value])=>value!==undefined&&query.set(key,String(value)));return api<Page<Job>>(`/jobs?${query}`)};
@@ -104,3 +106,8 @@ export type WeeklyOverview={has_active_work?:boolean;period_start:string;reset_a
 export const getWeeklySettings=()=>api<WeeklySettings>('/settings/usage-budget');
 export const saveWeeklySettings=(body:WeeklySettings&{initialize_only?:boolean})=>api<WeeklySettings>('/settings/usage-budget',{method:'PUT',headers:jsonHeaders,body:JSON.stringify(body)});
 export const getWeeklyUsage=(signal?:AbortSignal)=>api<WeeklyOverview>('/usage/weekly',{signal});
+
+export type QualityControl={run_id:string;job_id:string;quality_level:QualityLevel;target_score:number;score:number|null;phase:string;attempts:number;max_attempts:number;stop_reason?:string;version_id?:string;best_version_id?:string;target_id?:string;met_target:boolean;blocking?:boolean;dimensions?:Record<string,number>;feedback?:string[];coverage?:{selected_segments:number;total_segments:number;evidence_truncated?:boolean;content_truncated?:boolean};versions?:QualityControl[]};
+export const qualityState=(id:string)=>api<QualityControl>(`/quality-runs/${id}`);
+export const qualityAction=(id:string,body:Record<string,unknown>)=>api<QualityControl>(`/quality-runs/${id}/actions`,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
+export const submitChat=(id:string,question:string,source_ids:string[],conversation_id?:string,token_limit?:number)=>api<{id:string;run_id:string;message_id:string;conversation_id:string}>(`/notebooks/${id}/chat-runs`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,token_limit,quality_level:qualityPreference('chat'),language:'auto'})});

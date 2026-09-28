@@ -1254,6 +1254,9 @@ async def budgeted_chat(
 ) -> BudgetedCompletion:
     from .generation_context import current, mark_sent
     from .delivery import CURRENT as DELIVERY, claim_audit, claim_recovery
+    from .delivery import QUALITY_FLOW
+    if QUALITY_FLOW.get() and "audit" in stage and stage != "quality_audit":
+        raise RuntimeError("本版本由统一质量评分替代旧审校")
     is_audit = "audit" in stage
     product_audit = is_audit and DELIVERY.get() is not None
     if role == "main" and is_audit and not claim_audit():

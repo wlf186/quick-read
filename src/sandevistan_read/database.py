@@ -247,10 +247,24 @@ class Database:
         self._migrate_v6()
         self._migrate_v7()
         self._migrate_v8()
+        self._migrate_v9()
         with self.transaction() as connection:
             connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
                 WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
             connection.execute("UPDATE jobs SET stage_progress=progress WHERE stage_progress=0 AND progress>0")
+
+    def _migrate_v9(self) -> None:
+        with self.transaction() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS quality_runs (
+                id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL, job_id TEXT NOT NULL, state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS quality_versions (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES quality_runs(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL, target_id TEXT NOT NULL, content_json TEXT NOT NULL,
+                score_json TEXT, created_at TEXT NOT NULL, UNIQUE(run_id,ordinal))""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_quality_job ON quality_runs(job_id)")
+            connection.execute("INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(9,?)", (utc_now(),))
 
     def _migrate_v8(self) -> None:
         with self.transaction() as connection:

@@ -1,9 +1,21 @@
+import {useQualityPreference} from './quality_ui';
 import {type ReactNode,useEffect,useId,useMemo,useRef,useState} from 'react';
 import {createPortal} from 'react-dom';
 import {previewTask,recheck,reviewHistory,notebookUsage,type Citation,type Usage,type TaskPreview,type ReviewReport} from './api';
 
-const FOCUSABLE='button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+const FOCUSABLE='button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
 const overlayStack:string[]=[];
+function tabbableElements(panel:HTMLElement){
+  return [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(element=>{
+    if(element.tabIndex<0||element.matches(':disabled')||element.closest('[inert]')||!element.getClientRects().length)return false;
+    const style=getComputedStyle(element);
+    if(style.visibility==='hidden'||style.visibility==='collapse')return false;
+    for(let parent=element.parentElement;parent&&parent!==panel;parent=parent.parentElement){
+      if(parent instanceof HTMLDetailsElement&&!parent.open&&!parent.querySelector(':scope > summary')?.contains(element))return false;
+    }
+    return true;
+  });
+}
 
 type OverlayProps={
   children:ReactNode;
@@ -26,18 +38,19 @@ export function Overlay({children,className='',label,layer='base',onClose,closeO
     overlayStack.push(overlayId);
     document.body.classList.add('overlay-open');
     const frame=requestAnimationFrame(()=>{
-      const preferred=panelRef.current?.querySelector<HTMLElement>('[data-autofocus]');
-      (preferred||panelRef.current?.querySelector<HTMLElement>(FOCUSABLE)||panelRef.current)?.focus();
+      const candidates=panelRef.current?tabbableElements(panelRef.current):[];
+      (candidates.find(element=>element.hasAttribute('data-autofocus'))||candidates[0]||panelRef.current)?.focus();
     });
     const onKeyDown=(event:KeyboardEvent)=>{
       if(overlayStack.at(-1)!==overlayId)return;
       if(event.key==='Escape'&&event.target instanceof Element&&event.target.closest('[data-escape-boundary]'))return;
       if(event.key==='Escape'&&closeOnEscape){event.preventDefault();event.stopImmediatePropagation();onCloseRef.current();return}
       if(event.key!=='Tab'||!panelRef.current)return;
-      const focusable=[...panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(element=>element.offsetParent!==null);
+      const focusable=tabbableElements(panelRef.current);
       if(!focusable.length){event.preventDefault();panelRef.current.focus();return}
       const first=focusable[0],last=focusable.at(-1)!;
-      if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
+      if(!focusable.includes(document.activeElement as HTMLElement)){event.preventDefault();(event.shiftKey?last:first).focus()}
+      else if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
       else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
     };
     document.addEventListener('keydown',onKeyDown,true);
@@ -134,11 +147,23 @@ export function UsageDetails({value,legacy}:{value?:Usage;legacy?:Record<string,
   </details>
 }
 
-export function TaskEstimate({notebookId,kind,sourceIds,question='',count,minutes,limit,onLimit}:{notebookId?:string;kind:string;sourceIds:string[];question?:string;count?:number;minutes?:number;limit?:number;onLimit:(value:number|undefined)=>void}){
+export function TaskEstimate({notebookId,kind,sourceIds,question='',count,minutes,limit,onLimit,presentation='inline'}:{presentation?:'inline'|'responsive-dialog';notebookId?:string;kind:string;sourceIds:string[];question?:string;count?:number;minutes?:number;limit?:number;onLimit:(value:number|undefined)=>void}){
+  const qualityLevel=useQualityPreference(kind);
   const[value,setValue]=useState<TaskPreview>();const[error,setError]=useState('');
-  const body=JSON.stringify({kind,source_ids:sourceIds,question,count,minutes,token_limit:validTokenLimit(limit)?limit:undefined});
+  const[mobile,setMobile]=useState(()=>presentation==='responsive-dialog'&&window.matchMedia('(max-width:767px)').matches);
+  const[dialogOpen,setDialogOpen]=useState(false);const summaryRef=useRef<HTMLElement>(null);
+  useEffect(()=>{
+    if(presentation!=='responsive-dialog')return;
+    const media=window.matchMedia('(max-width:767px)');
+    const update=()=>{setMobile(media.matches);if(!media.matches){const restore=Boolean(document.activeElement?.closest('.task-estimate-dialog'));setDialogOpen(false);if(restore)requestAnimationFrame(()=>summaryRef.current?.focus())}};
+    update();media.addEventListener('change',update);return()=>media.removeEventListener('change',update);
+  },[presentation]);
+  const body=JSON.stringify({kind,quality_level:qualityLevel,source_ids:sourceIds,question,count,minutes,token_limit:validTokenLimit(limit)?limit:undefined});
   useEffect(()=>{setValue(undefined);setError('');if(!notebookId||!sourceIds.length)return;const controller=new AbortController();const timer=setTimeout(()=>{void previewTask(notebookId,JSON.parse(body),controller.signal).then(result=>{if(!controller.signal.aborted)setValue(result)}).catch(error=>{if(!controller.signal.aborted)setError(error instanceof Error?error.message:'预估暂不可用')})},400);return()=>{clearTimeout(timer);controller.abort()}},[notebookId,body]);
-  return <details className="task-estimate"><summary>本次范围与用量 · {sourceIds.length} 份资料{value?` · 约 ${value.calls_range.join('–')} 次调用`:''}</summary>{value?<><p>选材输入估算约 {value.estimated_input_tokens.toLocaleString()} tokens；单次输出最多 {value.output_limit.toLocaleString()}。{value.token_limit?`任务预算上限 ${value.token_limit.toLocaleString()} tokens。`:''}</p>{value.weekly_budget?<p>本周剩余可用估算：{value.weekly_budget.global_usage.remaining_tokens===null?'未设 token 额度':`${value.weekly_budget.global_usage.remaining_tokens.toLocaleString()} tokens`} · {value.weekly_budget.global_usage.remaining_calls===null?'未设调用额度':`${value.weekly_budget.global_usage.remaining_calls} 次请求`}。{value.weekly_budget.global_usage.limit?.mode==='block'?'不足时停止新请求。':'仅提醒，可继续使用。'}</p>:null}<small>{value.notice} 当前{value.strategy==='balanced'?'均衡':'保守'}策略；有效窗口 {value.context_tokens.toLocaleString()}{value.context_source==='fallback'?'（服务未报告，采用兼容值）':''}。</small></>:<p>{error||(!sourceIds.length?'先选择已就绪资料。':'正在本地估算…')}</p>}<label>本次模型用量上限（可选）<input aria-label="本次模型用量上限" type="number" min="1024" max="4194304" step="1" value={limit??''} placeholder="留空按任务规划" onChange={event=>onLimit(event.target.value?Number(event.target.value):undefined)}/></label>{!validTokenLimit(limit)?<p role="alert">请输入 1024–4194304 之间的整数。</p>:null}<small>包括生成、审校和恢复；不足时保留可用内容并停止后续请求。语音字符和时长另计，上限不是货币账单承诺。</small></details>
+  const title=<>本次范围与用量 · {sourceIds.length} 份资料{value?` · 约 ${value.calls_range.join('–')} 次调用`:''}</>;
+  const content=<>{value?<><p>选材输入估算约 {value.estimated_input_tokens.toLocaleString()} tokens；单次输出最多 {value.output_limit.toLocaleString()}。{value.token_limit?`任务预算上限 ${value.token_limit.toLocaleString()} tokens。`:''}</p>{value.weekly_budget?<p>本周剩余可用估算：{value.weekly_budget.global_usage.remaining_tokens===null?'未设 token 额度':`${value.weekly_budget.global_usage.remaining_tokens.toLocaleString()} tokens`} · {value.weekly_budget.global_usage.remaining_calls===null?'未设调用额度':`${value.weekly_budget.global_usage.remaining_calls} 次请求`}。{value.weekly_budget.global_usage.limit?.mode==='block'?'不足时停止新请求。':'仅提醒，可继续使用。'}</p>:null}<small>{value.notice} 当前{value.strategy==='balanced'?'均衡':'保守'}策略；有效窗口 {value.context_tokens.toLocaleString()}{value.context_source==='fallback'?'（服务未报告，采用兼容值）':''}。</small></>:<p>{error||(!sourceIds.length?'先选择已就绪资料。':'正在本地估算…')}</p>}<label>本次模型用量上限（可选）<input aria-label="本次模型用量上限" type="number" min="1024" max="4194304" step="1" value={limit??''} placeholder="留空按任务规划" onChange={event=>onLimit(event.target.value?Number(event.target.value):undefined)}/></label>{!validTokenLimit(limit)?<p role="alert">请输入 1024–4194304 之间的整数。</p>:null}<small>包括生成、审校和恢复；不足时保留可用内容并停止后续请求。语音字符和时长另计，上限不是货币账单承诺。</small></>;
+  if(mobile&&presentation==='responsive-dialog')return <><button className="task-estimate-trigger" aria-haspopup="dialog" aria-expanded={dialogOpen} onClick={()=>setDialogOpen(true)}>{title}<span aria-hidden="true"> ›</span></button>{dialogOpen?<Overlay label="本次范围与用量" className="task-estimate-dialog" onClose={()=>setDialogOpen(false)}><button className="drawer-close" data-autofocus onClick={()=>setDialogOpen(false)}>关闭 ×</button><h2>本次范围与用量</h2><p>{sourceIds.length} 份已选资料{value?` · 约 ${value.calls_range.join('–')} 次调用`:''}</p><div className="task-estimate">{content}</div></Overlay>:null}</>;
+  return <details className="task-estimate"><summary ref={summaryRef}>{title}</summary>{content}</details>;
 }
 export function validTokenLimit(limit?:number){return limit===undefined||Number.isInteger(limit)&&limit>=1024&&limit<=4194304}
 
@@ -167,5 +192,5 @@ export function GettingStarted({hasModel,hasNotebook,sourceCount,hasResult,onSet
   const[demo,setDemo]=useState(false);const[answer,setAnswer]=useState<number>();const[quote,setQuote]=useState(false);
   const steps=[hasModel,hasNotebook,sourceCount>0,hasResult];const current=steps.findIndex(done=>!done);
   const actions=[onSettings,onCreate,onImport,onTry];const names=['连接文字模型','创建资料库','导入并选择资料','生成内容并点击引用核对'];
-  return <details className="getting-started" open={current>=0?true:undefined}><summary>{current>=0?`开始使用 · ${names[current]}`:'使用指南 · 阅读 → 核对 → 自测 → 复习'}</summary><ol>{names.map((name,index)=><li key={name}>{steps[index]?'✓ ':`${index+1}. `}{name}</li>)}</ol><div className="review-actions">{current>=0?<button onClick={actions[current]}>下一步：{names[current]}</button>:null}<button onClick={()=>{setDemo(true);setAnswer(undefined);setQuote(false)}}>体验示例（不消耗 token）</button></div>{demo?<Overlay label="使用示例" className="example-tour" onClose={()=>setDemo(false)}><button className="drawer-close" data-autofocus onClick={()=>setDemo(false)}>关闭 ×</button><h2>从资料到可复习的知识</h2><p>以下是内置的虚构示例，不会上传资料或调用模型。</p><h3>1. 阅读与核对</h3><p>试验 A 的发芽率为 80%，试验 B 为 60%。两次试验光照不同，不能仅据此认定差异来自肥料。<button onClick={()=>setQuote(value=>!value)} aria-expanded={quote}>[S1] 查看原文</button></p>{quote?<blockquote>示例试验记录，第 1 页：A 组 10 粒种子发芽 8 粒，B 组 10 粒发芽 6 粒。两组的光照时间不同。</blockquote>:null}<h3>2. 自测</h3><p>可以从资料中确认哪项结论？</p><button disabled={answer!==undefined} onClick={()=>setAnswer(0)}>A. A 组肥料一定更好</button><button disabled={answer!==undefined} onClick={()=>setAnswer(1)}>B. A 组的发芽比例较高</button>{answer!==undefined?<p role="status">{answer===1?'回答正确。':'这次答错了。'}记录支持发芽比例的差异，不能排除光照的影响。<button onClick={()=>setAnswer(undefined)}>重新练习</button></p>:null}<h3>3. 持续复习</h3><p>真实测验支持错题重练，闪卡会依据反馈安排到期复习。复习已有内容不会重新调用生成模型。</p><p>每项任务都可查看资料范围、原文核查情况和用量；自动核查不能保证事实正确。</p></Overlay>:null}</details>
+  return <details className="getting-started" open={current>=0&&!hasResult?true:undefined}><summary>{current>=0?`开始使用 · ${names[current]}`:'使用指南 · 阅读 → 核对 → 自测 → 复习'}</summary><ol>{names.map((name,index)=><li key={name}>{steps[index]?'✓ ':`${index+1}. `}{name}</li>)}</ol><div className="review-actions">{current>=0?<button onClick={actions[current]}>下一步：{names[current]}</button>:null}<button onClick={()=>{setDemo(true);setAnswer(undefined);setQuote(false)}}>体验示例（不消耗 token）</button></div>{demo?<Overlay label="使用示例" className="example-tour" onClose={()=>setDemo(false)}><button className="drawer-close" data-autofocus onClick={()=>setDemo(false)}>关闭 ×</button><h2>从资料到可复习的知识</h2><p>以下是内置的虚构示例，不会上传资料或调用模型。</p><h3>1. 阅读与核对</h3><p>试验 A 的发芽率为 80%，试验 B 为 60%。两次试验光照不同，不能仅据此认定差异来自肥料。<button onClick={()=>setQuote(value=>!value)} aria-expanded={quote}>[S1] 查看原文</button></p>{quote?<blockquote>示例试验记录，第 1 页：A 组 10 粒种子发芽 8 粒，B 组 10 粒发芽 6 粒。两组的光照时间不同。</blockquote>:null}<h3>2. 自测</h3><p>可以从资料中确认哪项结论？</p><button disabled={answer!==undefined} onClick={()=>setAnswer(0)}>A. A 组肥料一定更好</button><button disabled={answer!==undefined} onClick={()=>setAnswer(1)}>B. A 组的发芽比例较高</button>{answer!==undefined?<p role="status">{answer===1?'回答正确。':'这次答错了。'}记录支持发芽比例的差异，不能排除光照的影响。<button onClick={()=>setAnswer(undefined)}>重新练习</button></p>:null}<h3>3. 持续复习</h3><p>真实测验支持错题重练，闪卡会依据反馈安排到期复习。复习已有内容不会重新调用生成模型。</p><p>每项任务都可查看资料范围、原文核查情况和用量；自动核查不能保证事实正确。</p></Overlay>:null}</details>
 }

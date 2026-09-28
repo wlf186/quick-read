@@ -197,27 +197,42 @@ class TaskBudget(BaseModel):
     token_limit: int | None = Field(default=None, ge=1024, le=4194304, description="可选的本次模型用量上限；逐请求预留输入与最大输出，未知消耗不按零计算，不是货币账单承诺。")
 
 
-class ChatRequest(TaskBudget):
+QualityLevel = Literal["low", "medium", "high", "extreme"]
+
+
+class QualityTask(TaskBudget):
+    quality_level: QualityLevel = Field(default="low", description="内容质量：低/中/高/极致。目标分60/75/85/92，自动改进最多1/1/2/3次；全部调用计入同一用量上限。")
+
+
+class QualityAction(BaseModel):
+    base_version: str
+    action: Literal["keep", "retry", "lower"]
+    attempts: int = Field(default=1, ge=1, le=5, strict=True)
+    quality_level: QualityLevel | None = None
+    request_id: str = Field(min_length=1, max_length=120)
+
+
+class ChatRequest(QualityTask):
     question: str = Field(min_length=1, max_length=8000)
     conversation_id: str | None = Field(default=None, description="继续同一 Notebook 的对话；近期同资料修订范围的完整问答用于指代理解与检索，不作为事实证据。")
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
 
-class SummaryRequest(TaskBudget):
+class SummaryRequest(QualityTask):
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
 
-class QuizRequest(TaskBudget):
+class QuizRequest(QualityTask):
     source_ids: list[str] | None = None
-    count: int = Field(default=10, ge=1, le=30, description="目标题数；保留结构可用的题目，不为质量偏差反复补写，实际数量及评级随产物返回。")
+    count: int = Field(default=10, ge=1, le=30, description="目标题数；保留可用题目，按质量档位有限自动改进，实际数量及评分随产物返回。")
     difficulty: StudyDifficulty = "mixed"
     language: Literal["auto", "zh-CN", "en"] = "auto"
     custom_prompt: str = Field(default="", max_length=1000)
 
 
-class FlashcardRequest(TaskBudget):
+class FlashcardRequest(QualityTask):
     source_ids: list[str] | None = None
     count: int = Field(default=20, ge=1, le=50, description="目标卡数；保留可用卡片，数量不足或质量待核实会在结果中注明。")
     difficulty: StudyDifficulty = "mixed"
@@ -225,7 +240,7 @@ class FlashcardRequest(TaskBudget):
     custom_prompt: str = Field(default="", max_length=1000)
 
 
-class PodcastRequest(TaskBudget):
+class PodcastRequest(QualityTask):
     source_ids: list[str] | None = None
     duration_mode: Literal["auto", "fixed"] = "auto"
     minutes: Literal[5, 10, 20, 30] | None = None
@@ -278,7 +293,7 @@ class LoginRequest(BaseModel):
     access_key: str
 
 
-class TaskPreviewRequest(TaskBudget):
+class TaskPreviewRequest(QualityTask):
     kind: Literal["chat", "summary", "quiz", "flashcard", "podcast"]
     source_ids: list[str] | None = None
     question: str = Field(default="", max_length=8000)

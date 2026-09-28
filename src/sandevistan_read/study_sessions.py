@@ -33,6 +33,7 @@ def public_artifact(item: dict[str, Any]) -> dict[str, Any]:
     if item.get("type") != "quiz":
         return item
     payload = dict(item.get("payload") or {})
+    payload.pop("citations", None)
     public_items = []
     for source in payload.get("items") or []:
         question = dict(source)

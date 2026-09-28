@@ -15,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Q
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, usage
+from . import __version__, usage, quality
 from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, JOB_LIST_RESPONSES, JOB_RESPONSES, PODCAST_DOWNLOAD_RESPONSES, PODCAST_SUBMIT_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
@@ -31,10 +31,10 @@ from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSe
 from .security import VAULT
 from .services import grounded_generate, source_scope
 from .study_sessions import answer_quiz, create_session, flashcards_csv, get_session, public_artifact, review_flashcard, suspend_flashcard
-from .schemas import ContextPreviewRequest, TaskPreviewRequest, ReviewRequest
+from .schemas import ContextPreviewRequest, TaskPreviewRequest, ReviewRequest, QualityAction
 from .context_budget import TokenLimits, estimate_text_tokens, plan_context
 from .retrieval import is_quality_chunk
-from .api_docs import USAGE_RESPONSES, TASK_PREVIEW_RESPONSES, REVIEW_RESPONSES, REVIEW_HISTORY_RESPONSES, CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
+from .api_docs import QUALITY_RESPONSES, CHAT_RUN_RESPONSES, USAGE_RESPONSES, TASK_PREVIEW_RESPONSES, REVIEW_RESPONSES, REVIEW_HISTORY_RESPONSES, CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
 
 
 @asynccontextmanager
@@ -350,6 +350,46 @@ async def ask(notebook_id: str, body: ChatRequest):
     return {"id": message_id, "conversation_id": conversation_id, **result, "metadata": metadata}
 
 
+@api.post("/notebooks/{notebook_id}/chat-runs", status_code=202, responses=CHAT_RUN_RESPONSES, description="异步生成文字回答，首版可读后继续自动评分和限次改进。")
+def submit_chat(notebook_id: str, body: ChatRequest):
+    _require_notebook(notebook_id)
+    ids = source_scope(notebook_id, body.source_ids)
+    if not ids:
+        raise HTTPException(409, "当前范围没有已就绪的文档")
+    conversation_id, now = body.conversation_id, utc_now()
+    if conversation_id:
+        row = DB.fetchone("SELECT notebook_id FROM conversations WHERE id=?", (conversation_id,))
+        if not row or row["notebook_id"] != notebook_id:
+            raise HTTPException(404, "当前笔记本中不存在该对话")
+    else:
+        conversation_id = new_id("conversation")
+        DB.execute("INSERT INTO conversations VALUES(?,?,?,?,?)", (conversation_id, notebook_id, body.question[:80], now, now))
+    message_id = new_id("message")
+    for role, text, identity in (("user", body.question, new_id("message")), ("assistant", "", message_id)):
+        DB.execute("INSERT INTO messages(id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (identity, conversation_id, role, text, "[]", None, "queued" if role == "assistant" else "complete", "{}", utc_now()))
+    job = enqueue("chat", notebook_id, {**body.model_dump(), "source_ids": ids, "conversation_id": conversation_id, "message_id": message_id})
+    run_id = json_load(job["payload_json"], {})["quality_run_id"]
+    DB.execute("UPDATE messages SET metadata_json=? WHERE id=?", (json_dump({"quality_control": quality.public(run_id)}), message_id))
+    return {"id": job["id"], "run_id": run_id, "message_id": message_id, "conversation_id": conversation_id}
+
+
+@api.get("/quality-runs/{run_id}", responses=QUALITY_RESPONSES, description="质量进度和版本引用；不返回测验答案或泄题反馈。")
+def quality_state(run_id: str):
+    try:
+        return quality.public(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@api.post("/quality-runs/{run_id}/actions", responses=QUALITY_RESPONSES, description="采用版本或追加1–5次改进，原任务用量上限仍然有效；request_id保证幂等。")
+def quality_action(run_id: str, body: QualityAction):
+    try:
+        return quality.action(run_id, body)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @api.get("/notebooks/{notebook_id}/conversations")
 def conversations(notebook_id: str): return [normalize(row) for row in DB.fetchall("SELECT * FROM conversations WHERE notebook_id=? ORDER BY updated_at DESC", (notebook_id,))]
 
@@ -368,6 +408,9 @@ def latest_summary(notebook_id: str):
     if not row:
         return None
     result = normalize(row)
+    if row["id"].startswith("summary_quality_"):
+        run_id = row["id"].removeprefix("summary_")
+        result["quality_control"] = quality.public(run_id)
     artifact = DB.fetchone("SELECT payload_json FROM artifacts WHERE notebook_id=? AND type='summary' AND created_at=? ORDER BY id DESC LIMIT 1", (notebook_id, row["created_at"]))
     payload = json_load(artifact["payload_json"], {}) if artifact else {}
     for field in ("quality_assessment", "delivery_status", "warnings", "degraded", "context_usage"):
@@ -395,6 +438,8 @@ def podcast(notebook_id: str, body: PodcastRequest):
 @api.get("/notebooks/{notebook_id}/artifacts", responses=ARTIFACT_LIST_RESPONSES)
 def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     rows = DB.fetchall("SELECT * FROM artifacts WHERE notebook_id=? AND (? IS NULL OR type=?) ORDER BY created_at DESC", (notebook_id, type, type))
+    selected = {item["run_id"]: item["target_id"] for item in DB.fetchall("SELECT q.id AS run_id,v.target_id FROM quality_runs q LEFT JOIN quality_versions v ON v.id=json_extract(q.state_json,'$.best') WHERE q.notebook_id=?", (notebook_id,))}
+    rows = [row for row in rows if not (q := json_load(row.get("payload_json"), {}).get("quality_control")) or selected.get(q["run_id"]) == row["id"]]
     if view == "summary":
         output = []
         for row in rows:
@@ -402,7 +447,7 @@ def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
             quality = payload.get("quality_assessment")
             # List metadata never carries Quiz answer-related issue text.
             public_quality = {**quality, "issues": []} if isinstance(quality, dict) else None
-            output.append({key: row.get(key) for key in ("id", "notebook_id", "type", "title", "language", "status", "created_at", "updated_at")} | {"payload": {"quality_assessment": public_quality, "delivery_status": payload.get("delivery_status")}, "citations": []})
+            output.append({key: row.get(key) for key in ("id", "notebook_id", "type", "title", "language", "status", "created_at", "updated_at")} | {"payload": {"quality_assessment": public_quality, "quality_control": payload.get("quality_control"), "delivery_status": payload.get("delivery_status")}, "citations": []})
         return output
     output = [normalize(row) for row in rows]
     for item in output:
@@ -853,7 +898,8 @@ def task_preview(notebook_id: str, body: TaskPreviewRequest):
     provider = active_provider("main")
     if not provider:
         raise HTTPException(409, "请先连接文字模型")
-    return {**preview(DB, notebook_id, provider, **(body.model_dump() | {"source_ids": source_scope(notebook_id, body.source_ids)})), "weekly_budget": weekly_budget.overview(DB)}
+    options = body.model_dump() | {"source_ids": source_scope(notebook_id, body.source_ids)}
+    return {**quality.task_preview(DB, notebook_id, provider, **options), "weekly_budget": weekly_budget.overview(DB)}
 
 
 @api.get("/notebooks/{notebook_id}/usage", responses=USAGE_RESPONSES, description="语言及视觉模型逐次请求的已知计量、估算和未知项；不包含未记录的历史消耗。")

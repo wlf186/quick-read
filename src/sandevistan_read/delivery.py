@@ -16,6 +16,8 @@ class DeliveryBudget:
     provider: dict[str, Any] | None = None
     stage_output_tokens: dict[str, int] = field(default_factory=dict)
 
+QUALITY_FLOW: ContextVar[bool] = ContextVar("quality_flow", default=False)
+
 CURRENT: ContextVar[DeliveryBudget | None] = ContextVar("delivery_budget", default=None)
 
 def claim_recovery() -> bool:

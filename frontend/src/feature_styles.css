@@ -55,3 +55,28 @@
 
 .shell{grid-template-rows:72px auto minmax(0,1fr) 44px}@media(max-width:767px){.shell,.route-jobs,.route-notebooks{grid-template-rows:56px auto minmax(0,1fr)}}
 .weekly-dialog button{border:1px solid #426066;background:#17292c;color:#eef4ee;padding:10px 14px;min-height:40px;cursor:pointer}.weekly-dialog button:disabled{opacity:.45;cursor:default}.weekly-dialog input,.weekly-dialog select{background:#0b1719;border:1px solid #426066;color:#eaf2ee;padding:10px;font:inherit;border-radius:3px}.weekly-dialog .drawer-close{background:transparent;border:0}.weekly-dialog h3{margin-top:24px}
+
+/* Shared controls and compact mobile usage surfaces. */
+.weekly-settings-fields{border:0;padding:0;margin:24px 0 0;min-width:0}
+.weekly-settings-fields>legend{font-size:18px;margin-bottom:12px;padding:0}
+.weekly-dialog .weekly-provider-toggle{display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer}
+.weekly-provider-toggle>input{flex:none;margin:0;accent-color:var(--cyan)}
+.weekly-provider-toggle>span{min-width:0;overflow-wrap:anywhere}
+.meter-compact{display:none}
+.task-estimate-trigger{width:100%;min-height:44px;text-align:left;padding:10px 12px;border:0;border-top:1px solid #314244;background:transparent;color:#e7efee;font-size:12px;line-height:1.6;cursor:pointer}
+.task-estimate-dialog{width:min(520px,100vw)}
+.task-estimate-dialog .task-estimate{border:0;padding:0;font-size:14px}
+.task-estimate-dialog .task-estimate input{max-width:none;min-height:44px}
+@media(max-width:767px){
+  .weekly-entry{display:block;padding:8px 10px}
+  .weekly-entry>b{display:block;font-size:12px;margin-bottom:4px}
+  .weekly-entry>div{gap:10px;align-items:start}
+  .weekly-entry .weekly-meter{gap:4px}
+  .weekly-entry .weekly-meter,.weekly-entry .weekly-meter .weekly-pending-note,.weekly-entry .weekly-meter .weekly-warning{font-size:12px;line-height:1.4}
+  .weekly-entry .meter-full{display:none}
+  .weekly-entry .meter-compact{display:block}
+  .task-estimate-dialog{width:100vw}
+}
+
+.quality-selector{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--text);margin:8px 0}.quality-selector select,.quality-actions select{min-height:36px;max-width:100%;background:#102628;color:#e8f7f5;border:1px solid #426064;border-radius:6px;padding:5px}.quality-selector small{font-size:12px;color:#b1c6c8}.quality-result{font-size:13px;margin:10px 0;color:#c5dad8;overflow-wrap:anywhere}.quality-result p{margin:6px 0}.quality-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.quality-actions label{display:flex;gap:6px;align-items:center}.quality-actions button,.quality-result>button{min-height:36px;padding:6px 10px;background:#102628;color:#e8f7f5;border:1px solid #426064;border-radius:6px}.result-details{font-size:12px;color:#a9c0c2;margin:8px 0}.result-details>summary{cursor:pointer;padding:6px 0}.result-details>p{max-width:65ch}.composer>.quality-selector{margin:4px 0}.composer>.quality-selector small{display:none}@media(max-width:767px){.quality-selector select{min-height:36px}.quality-actions button{min-height:44px}.quality-selector{font-size:12px}}
+@media(max-width:767px){.composer{display:grid;grid-template-columns:minmax(0,1fr) auto}.composer>textarea,.composer>.composer-meta{grid-column:1/-1}.composer>textarea{height:54px}.composer>.quality-selector{margin:0;padding:4px 6px;gap:4px;flex-wrap:nowrap;font-size:11px;min-width:0}.composer>.quality-selector select{width:112px;min-width:0;padding:4px;font-size:12px}.composer>.task-estimate-trigger{width:auto;padding:4px 10px;border-left:1px solid #314244;border-top:0;font-size:0;min-height:44px}.composer>.task-estimate-trigger:before{content:'范围与用量';font-size:12px}}

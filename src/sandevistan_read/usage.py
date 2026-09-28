@@ -67,13 +67,21 @@ async def post(client: Any, url: str, *, provider: dict[str, Any], payload: dict
     # Transactions serialize reservations made by concurrent child tasks.
     from .weekly_budget import reserve as reserve_weekly
     with db.transaction() as conn:
+        if run and run.job_id:
+            job = conn.execute("SELECT cancel_requested FROM jobs WHERE id=?", (run.job_id,)).fetchone()
+            if job and job[0]:
+                raise RuntimeError("任务已取消；未发送下一次请求")
         try:
             reserve_weekly(conn, call_id=call_id, provider=provider, estimated=estimated, output=output, created_at=utc_now())
         except RuntimeError as exc:
             if run and getattr(exc, "detail", {}).get("code") == "quota_exhausted":
                 run.quota_denial = exc.detail
             raise
-        if run and run.job_id:
+        quality_row = conn.execute("SELECT state_json FROM quality_runs WHERE job_id=?", (run.job_id,)).fetchone() if run and run.job_id else None
+        quality_jobs = json_load(quality_row[0], {}).get("jobs", []) if quality_row else []
+        if run and quality_jobs:
+            spent = conn.execute("SELECT COALESCE(SUM(c.accounted_tokens),0) FROM provider_calls c JOIN generation_runs r ON r.id=c.run_id WHERE r.job_id IN (" + ",".join("?" for _ in quality_jobs) + ")", quality_jobs).fetchone()[0]
+        elif run and run.job_id:
             spent = conn.execute("SELECT COALESCE(SUM(c.accounted_tokens),0) FROM provider_calls c JOIN generation_runs r ON r.id=c.run_id WHERE r.job_id=?", (run.job_id,)).fetchone()[0]
         elif run:
             spent = conn.execute("SELECT COALESCE(SUM(accounted_tokens),0) FROM provider_calls WHERE run_id=?", (run.id,)).fetchone()[0]
@@ -121,6 +129,13 @@ async def post(client: Any, url: str, *, provider: dict[str, Any], payload: dict
 def summarize(db: Database, *, run_id: str | None = None, notebook_id: str | None = None,
               target_id: str | None = None, job_id: str | None = None, include_reviews: bool = True) -> dict[str, Any]:
     where, params = [], []
+    quality_row = db.fetchone("SELECT q.state_json FROM quality_runs q JOIN quality_versions v ON v.run_id=q.id WHERE v.target_id=? LIMIT 1", (target_id,)) if target_id else None
+    if quality_row:
+        quality_jobs = json_load(quality_row["state_json"], {}).get("jobs", [])
+        if quality_jobs:
+            where.append("r.job_id IN (" + ",".join("?" for _ in quality_jobs) + ")")
+            params.extend(quality_jobs)
+            target_id = None
     for key, value in (("id", run_id), ("notebook_id", notebook_id), ("target_id", target_id), ("job_id", job_id)):
         if value is not None:
             if key == "target_id":

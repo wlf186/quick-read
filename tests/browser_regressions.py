@@ -14,6 +14,7 @@ BASE_URL = os.environ.get("SREAD_BROWSER_BASE_URL", "http://127.0.0.1:20830")
 class Fixture:
     def __init__(self, page: Page):
         self.pending = []
+        self.conversation_messages = {}
         self.requests = []
         self.cards = ["f1", "f2"]
         self.reviews = {}
@@ -64,7 +65,7 @@ class Fixture:
             start = (now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0)
             result = {"period_start":start.isoformat(), "reset_at":(start+timedelta(days=7)).isoformat(), "timezone":self.budget_settings["timezone"],
                       "global_usage":{"known_tokens":320000,"unconfirmed_tokens":80000,"occupied_tokens":400000,"unknown_calls":2,"calls":126,"limit":limit,"remaining_tokens":max(0,(limit["tokens"] or 0)-400000),"remaining_calls":max(0,(limit["calls"] or 0)-126)},"providers":[],"notice":"测试统计：仅本应用，语音另计。"}
-        elif path.endswith("/chat"):
+        elif path.endswith("/chat-runs"):
             self.pending.append(route)
             return
         elif path == "/notebooks":
@@ -114,6 +115,8 @@ class Fixture:
                 self.pending_messages.append(route)
                 return
             result = self.messages or []
+        elif path.startswith("/conversations/") and path.endswith("/messages"):
+            result = self.conversation_messages.get(path.split('/')[2], [])
         elif path.endswith("/artifacts"):
             result = [artifact]
         elif path == "/artifacts/cards":
@@ -132,8 +135,11 @@ class Fixture:
         route.fulfill(json=result)
 
     def reply(self, index: int, text: str, conversation: str, status: int = 200):
-        self.pending[index].fulfill(status=status, json={"id": f"answer-{index}", "conversation_id": conversation,
-                                                       "content": text, "citations": [], "detail": text})
+        if status == 200:
+            self.conversation_messages[conversation] = self.conversation_messages.get(conversation, []) + [
+                {"id":f"user-{index}","role":"user","content":json.loads(self.pending[index].request.post_data)['question']},
+                {"id":f"answer-{index}","role":"assistant","content":text,"citations":[]}]
+        self.pending[index].fulfill(status=status, json={"id": f"job-{index}", "run_id":f"quality-{index}", "message_id":f"answer-{index}", "conversation_id": conversation, "detail":text})
 
 
 def select_notebook(page: Page, key: str, wait: bool = True):
@@ -177,8 +183,8 @@ def run_core_regressions(browser: Browser):
         expect(page.locator(".thinking")).not_to_be_visible()
         expect(page.locator(".messages")).not_to_contain_text("OLD ANSWER A")
         send(page, fixture, "question B")
-        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][1] == "/notebooks/b/chat"
-        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2].get("conversation_id") is None
+        assert [request for request in fixture.requests if request[1].endswith("/chat-runs")][-1][1] == "/notebooks/b/chat-runs"
+        assert [request for request in fixture.requests if request[1].endswith("/chat-runs")][-1][2].get("conversation_id") is None
         fixture.reply(1, "Correct answer B", "conversation-b")
         expect(page.locator(".messages")).to_contain_text("Correct answer B")
         page.screenshot(path=f"/tmp/quick-read-chat-fixed-{width}.png")
@@ -200,7 +206,7 @@ def run_core_regressions(browser: Browser):
         send(page, fixture, "discarded conversation")
         page.get_by_role("button", name="新对话", exact=True).click()
         send(page, fixture, "fresh conversation")
-        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2].get("conversation_id") is None
+        assert [request for request in fixture.requests if request[1].endswith("/chat-runs")][-1][2].get("conversation_id") is None
         fixture.reply(4, "DISCARDED RESPONSE", "discarded")
         settle(page)
         expect(page.locator(".thinking")).to_be_visible()
@@ -208,7 +214,7 @@ def run_core_regressions(browser: Browser):
         fixture.reply(5, "Fresh response", "fresh")
         expect(page.locator(".messages")).to_contain_text("Fresh response")
         send(page, fixture, "follow up")
-        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2]["conversation_id"] == "fresh"
+        assert [request for request in fixture.requests if request[1].endswith("/chat-runs")][-1][2]["conversation_id"] == "fresh"
         fixture.reply(6, "Follow up response", "fresh")
         expect(page.locator(".messages")).to_contain_text("Follow up response")
 
@@ -327,6 +333,7 @@ def run_generation_regressions(browser: Browser) -> None:
         expect(drawer.locator(".podcast-meta")).not_to_contain_text("PASSED")
         expect(drawer).to_contain_text("原文核验 3/10 项")
         expect(drawer).to_contain_text("本集未涵盖 1 份已选资料")
+        drawer.locator('.result-details > summary').click()
         drawer.locator('.coverage-details > summary').click()
         expect(drawer.locator('.coverage-details')).to_contain_text('成功调用完整送入 20 段')
         expect(drawer.locator('.coverage-details')).to_contain_text('章节写作 18 段 · 技术恢复 5 段')
@@ -415,6 +422,7 @@ def run_summary_coverage_regressions(browser: Browser) -> None:
             page.locator('.workspace-tabs button').filter(has_text='学习与输出').click()
         page.locator('.artifact').filter(has_text='核验摘要').click()
         drawer = page.get_by_role('dialog', name='核验摘要')
+        drawer.locator('.result-details > summary').click()
         drawer.locator('.coverage-details > summary').click()
         expect(drawer).to_contain_text('预读 20 段 · 最终生成 10 段')
         expect(drawer).to_contain_text('模型核验支持 3 项 · 不支持 1 项 · 未完成 2 项')
@@ -482,7 +490,8 @@ def run_delivery_regressions(browser: Browser) -> None:
             fixture.artifact["payload"].update(generation_mode="expanded" if review_status=="complete" else "complete_short", narrative_status="complete" if review_status=="complete" else "incomplete" if review_status=="partial" else "unverified")
             fixture.artifact['payload']['quality_report'] = {'episode_audit': {'status':review_status,'coverage_mode':'sampled' if review_status!='complete' else 'full','checked_transitions':2 if review_status=='complete' else 1 if review_status=='partial' else 0,'total_transitions':2,'reviewed_transitions':[]}}
         page.goto(BASE_URL)
-        rating = page.locator('.messages details').filter(has_text='已生成 · 已核对 1/2 项')
+        page.locator('.messages .result-details>summary').click()
+        rating = page.locator('.messages details.generation-warnings').filter(has_text='已生成 · 已核对 1/2 项')
         rating.locator('summary').focus()
         page.keyboard.press('Enter')
         expect(rating).to_contain_text('有效原文核查结论 1 / 2 项')
@@ -524,6 +533,7 @@ def run_experience_regressions(browser: Browser) -> None:
         page.goto(BASE_URL, wait_until='networkidle')
         assert page.title() == 'Sandevistan-Read'
         expect(page.locator('.messages')).to_contain_text('尚未完成原文核查（0/6）')
+        page.locator('.messages .result-details>summary').click()
         quality = page.locator('.messages .generation-warnings').first
         quality.locator('summary').focus();page.keyboard.press('Enter')
         expect(quality).to_contain_text('本次用量不足')
@@ -532,13 +542,20 @@ def run_experience_regressions(browser: Browser) -> None:
         expect(costs).to_contain_text('1,200 tokens（已知部分）')
         expect(costs).to_contain_text('1 次请求未返回完整计量')
         page.screenshot(path=f'/tmp/quick-read-experience-result-{width}.png')
-        estimate = page.locator('.composer .task-estimate')
-        estimate.locator('summary').click()
+        if width < 768:
+            page.locator('.task-estimate-trigger').click()
+            estimate = page.get_by_role('dialog', name='本次范围与用量')
+        else:
+            estimate = page.locator('.composer .task-estimate')
+            estimate.locator('summary').click()
         expect(estimate).to_contain_text('约 2–3 次调用')
         estimate.get_by_label('本次模型用量上限', exact=True).fill('2048')
         page.wait_for_timeout(550)
         assert any(path.endswith('/task-preview') and body.get('token_limit') == 2048 for _,path,body in fixture.requests)
-        estimate.locator('summary').click()
+        if width < 768:
+            page.keyboard.press('Escape')
+        else:
+            estimate.locator('summary').click()
         # Static example: no API calls for answers or review.
         if not page.get_by_text('体验示例（不消耗 token）', exact=True).is_visible():
             page.locator('.getting-started > summary').click()
@@ -636,3 +653,203 @@ def run_weekly_budget_regressions(browser):
         assert not fixture.errors and not fixture.console_errors
         context.close()
     print("Weekly budget desktop/mobile checks passed")
+
+
+def run_ui_usability_regressions(browser: Browser) -> None:
+    """Contrast, actual keyboard reachability, saved drafts and short mobile screens."""
+    def contrast(button):
+        return button.evaluate('''el => {
+          const luminance = color => color.match(/[\\d.]+/g).slice(0,3).map(Number).map(v => {
+            v/=255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4;
+          }).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+          const style=getComputedStyle(el),a=luminance(style.color),b=luminance(style.backgroundColor);
+          return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);
+        }''')
+
+    for width,height in ((1440,900),(1024,768),(768,1024),(390,844),(320,640)):
+        context=browser.new_context(viewport={'width':width,'height':height},reduced_motion='reduce')
+        page=context.new_page();page.set_default_timeout(8000);fixture=Fixture(page)
+        fixture.provider={'id':'main','name':'示例文字模型','role':'main','kind':'openai','base_url':'https://example.invalid','model':'fixture','active':True,'selected':True,'config':{'context_window_tokens':32768},'capabilities':{}}
+        fixture.artifact={'id':'cards','type':'summary','title':'UI 示例摘要','status':'ready','payload':{'content':'示例结论。'},'citations':[{'id':'S1','source_id':'a-source','filename':'示例.txt','quote':'用于检查界面的虚构原文。','locator':{'page':1}}]}
+        fixture.messages=[{'id':'answer','role':'assistant','content':'可以正常阅读的示例回答。','metadata':{}}]
+        page.goto(BASE_URL,wait_until='networkidle')
+        assert page.title()=='Sandevistan-Read'
+        assert_layout(page)
+        if width<768:
+            trigger=page.locator('.task-estimate-trigger')
+            trigger.click();estimate=page.get_by_role('dialog',name='本次范围与用量')
+            estimate.get_by_label('本次模型用量上限',exact=True).fill('2048')
+            page.keyboard.press('Escape');expect(trigger).to_be_focused()
+            trigger.click();expect(estimate.get_by_label('本次模型用量上限',exact=True)).to_have_value('2048')
+            expect(estimate).to_contain_text('选材输入估算')
+            expect(estimate).to_contain_text('约 2–3 次调用')
+            page.screenshot(path=f'/tmp/quick-read-ui-fixed-estimate-{width}.png')
+            page.set_viewport_size({'width':768,'height':height})
+            expect(estimate).to_have_count(0)
+            inline=page.locator('.composer .task-estimate');inline.locator('summary').click()
+            expect(inline.get_by_label('本次模型用量上限',exact=True)).to_have_value('2048')
+            page.set_viewport_size({'width':width,'height':height})
+            expect(page.locator('.task-estimate-trigger')).to_be_visible()
+            expect(page.locator('.messages')).to_be_visible()
+            assert page.locator('.messages').bounding_box()['height']>100
+            page.locator('.messages .result-details>summary').click()
+            page.screenshot(path=f'/tmp/quick-read-ui-fixed-chat-{width}.png')
+            page.get_by_role('button',name='学习与输出',exact=True).click()
+        elif width<1200:
+            page.get_by_role('button',name='Studio',exact=True).click()
+        page.locator('.artifact:visible').filter(has_text='UI 示例摘要').click()
+        drawer=page.get_by_role('dialog',name='UI 示例摘要')
+        expect(drawer).to_be_visible()
+        close=drawer.get_by_role('button',name='关闭 ×');close.focus()
+        last=drawer.locator('.citation-index > summary')
+        close.press('Shift+Tab');expect(last).to_be_focused()
+        last.press('Tab');expect(close).to_be_focused()
+        for _ in range(12):
+            page.keyboard.press('Tab')
+            assert drawer.evaluate('el=>el.contains(document.activeElement)')
+        last.focus();page.keyboard.press('Enter')
+        citation=drawer.get_by_role('button',name='[S1] 示例.txt')
+        citation.focus();page.keyboard.press('Enter')
+        nested=page.get_by_role('dialog',name='引用 S1');expect(nested).to_be_visible()
+        page.keyboard.press('Escape');expect(nested).to_have_count(0);expect(citation).to_be_focused()
+        page.keyboard.press('Escape');expect(drawer).to_have_count(0)
+        if width>=768 and width<1200:page.keyboard.press('Escape')
+        page.get_by_role('button',name='设置',exact=True).click()
+        settings=page.get_by_role('dialog',name='Provider 配置')
+        settings.get_by_role('button',name='管理 MAIN',exact=True).click()
+        settings.get_by_role('button',name='编辑',exact=True).click()
+        settings.get_by_text('高级参数与容量说明',exact=True).click()
+        restore=settings.get_by_role('button',name='恢复任务默认参数')
+        restore.scroll_into_view_if_needed()
+        assert contrast(restore)>=4.5
+        restore.hover();assert contrast(restore)>=4.5
+        restore.focus();assert contrast(restore)>=4.5
+        assert restore.bounding_box()['height']>=44
+        restore.click()
+        expect(settings.get_by_role('status').filter(has_text='已恢复本页默认参数')).to_contain_text('验证并保存后生效')
+        expect(settings.get_by_label('上下文窗口覆盖（tokens）')).to_have_value('')
+        expect(settings.locator('.context-capacity tbody tr')).to_have_count(5)
+        restore.scroll_into_view_if_needed()
+        page.screenshot(path=f'/tmp/quick-read-ui-fixed-restore-{width}.png')
+        page.keyboard.press('Escape')
+        page.get_by_role('button',name='放弃修改',exact=True).click()
+        entry=page.get_by_role('button',name='本周用量与额度');entry.click()
+        budget=page.get_by_role('dialog',name='用量与额度');field=budget.get_by_label('每周 token 额度',exact=True)
+        field.fill('1500000');budget.get_by_role('button',name='保存额度设置').click()
+        expect(budget.get_by_role('status')).to_have_text('额度设置已保存。')
+        field.fill('2000000');expect(budget.get_by_role('status')).to_contain_text('有未保存修改')
+        page.keyboard.press('Escape');entry.click()
+        expect(field).to_have_value('2000000');expect(budget.get_by_role('status')).to_contain_text('有未保存修改')
+        pending=[]
+        def hold_save(route):
+            if route.request.method=='PUT':pending.append(route)
+            else:route.fallback()
+        page.route('**/api/settings/usage-budget',hold_save)
+        budget.get_by_role('button',name='保存额度设置').click()
+        expect(field).to_be_disabled()
+        expect(budget.get_by_label('预算时区')).to_be_disabled()
+        assert pending
+        console_before=len(fixture.console_errors)
+        pending.pop().fulfill(status=503,json={'detail':'模拟保存失败'})
+        expect(field).to_be_enabled();expect(field).to_have_value('2000000')
+        expect(budget.get_by_role('alert')).to_contain_text('模拟保存失败')
+        assert all('503' in message for message in fixture.console_errors[console_before:])
+        del fixture.console_errors[console_before:]
+        expect(budget.get_by_role('status')).to_contain_text('有未保存修改')
+        page.unroute('**/api/settings/usage-budget',hold_save)
+        budget.get_by_role('button',name='保存额度设置').click()
+        expect(budget.get_by_role('status')).to_have_text('额度设置已保存。')
+        budget.get_by_text('单独配置 Provider 额度（可选）',exact=True).click()
+        toggle=budget.locator('.weekly-provider-toggle');toggle.click()
+        expect(toggle.get_by_role('checkbox')).to_be_checked()
+        check=toggle.get_by_role('checkbox').bounding_box();label=toggle.locator('span').bounding_box()
+        assert abs(check['y']+check['height']/2-label['y']-label['height']/2)<2
+        assert label['x']>check['x']+check['width']
+        assert_layout(page)
+        page.screenshot(path=f'/tmp/quick-read-ui-fixed-budget-{width}.png')
+        assert not fixture.errors and not fixture.console_errors
+        assert not any(method=='POST' and path.endswith('/sources') for method,path,_ in fixture.requests)
+        if width<768:
+            fixture.budget_settings['global_limit']={'tokens':400000,'calls':126,'mode':'block'}
+            page.reload(wait_until='networkidle')
+            expect(page.locator('.weekly-entry .weekly-warning .meter-compact').first).to_contain_text('已达额度')
+            assert page.locator('.messages').bounding_box()['height']>100
+            assert_layout(page)
+            page.screenshot(path=f'/tmp/quick-read-ui-fixed-limits-{width}.png')
+        context.close()
+    print('UI readability, focus and draft-state regressions passed (5 viewports)')
+
+
+def run_quality_flow_regressions(browser: Browser) -> None:
+    """Quality preferences, early content, bounded continuation and mobile keyboard flows."""
+    for width,height in ((1440,900),(390,844),(320,640)):
+        context=browser.new_context(viewport={'width':width,'height':height},reduced_motion='reduce')
+        page=context.new_page();page.set_default_timeout(8000);fixture=Fixture(page)
+        state={'run_id':'quality-ui','job_id':'job-ui','quality_level':'high','target_score':85,'score':None,'phase':'scoring','attempts':0,'max_attempts':2,'stop_reason':None,'version_id':'version-1','best_version_id':'version-1','target_id':'answer','met_target':False}
+        fixture.messages=[{'id':'answer','role':'assistant','content':'三个核心要点：\n\n1. 明确目标。\n2. 对照资料。\n3. 结合限制。','citations':[], 'metadata':{'quality_control':dict(state)}}]
+        actions=[]
+        def quality_route(route):
+            if route.request.method=='POST':
+                body=json.loads(route.request.post_data);actions.append(body)
+                if body['action']=='lower':
+                    state.update(quality_level=body['quality_level'],target_score=60,met_target=True,phase='complete',stop_reason='target_met')
+                elif body['action']=='keep':state.update(phase='complete',stop_reason='kept')
+                else:state.update(phase='improving',attempts=3,max_attempts=4)
+                fixture.messages[0]['metadata']['quality_control']=dict(state)
+            route.fulfill(json=state)
+        page.route('**/api/quality-runs/**',quality_route)
+        page.goto(BASE_URL)
+        expect(page.get_by_label('内容质量',exact=True)).to_have_value('low')
+        expect(page.locator('.message-body')).to_contain_text('三个核心要点')
+        expect(page.locator('.quality-result')).to_contain_text('正在评分')
+        expect(page.locator('.message-body')).to_be_visible()
+        assert not page.locator('.result-details').evaluate('el=>el.open')
+        assert page.locator('.review-control').count()==0
+        page.get_by_label('内容质量',exact=True).select_option('high')
+        page.reload()
+        expect(page.get_by_label('内容质量',exact=True)).to_have_value('high')
+        state.update(score=72,phase='complete',attempts=2,stop_reason='attempt_limit')
+        fixture.messages[0]['metadata']['quality_control']=dict(state)
+        expect(page.locator('.quality-result')).to_contain_text('尚未达到目标')
+        expect(page.get_by_label('追加改进次数')).to_have_value('1')
+        page.get_by_label('追加改进次数').select_option('2')
+        page.screenshot(path=f'/tmp/quality-actions-before-{width}.png')
+        page.get_by_role('button',name='继续改进',exact=True).click()
+        expect(page.locator('.quality-result')).to_contain_text('正在改进第 3 次')
+        assert actions[-1]['attempts']==2 and actions[-1]['action']=='retry'
+        state.update(phase='complete',score=73,attempts=4,stop_reason='attempt_limit')
+        fixture.messages[0]['metadata']['quality_control']=dict(state)
+        expect(page.get_by_role('button',name='采用当前结果',exact=True)).to_be_visible()
+        adopt=page.get_by_role('button',name='采用当前结果',exact=True);adopt.focus();page.keyboard.press('Enter')
+        expect(page.locator('.quality-result')).to_contain_text('已达标')
+        assert actions[-1]['action']=='lower' and actions[-1]['quality_level']=='low'
+        expect(page.get_by_label('内容质量',exact=True)).to_have_value('high')
+        page.screenshot(path=f'/tmp/quick-read-quality-{width}.png')
+        if width<600:page.get_by_role('button',name='学习与输出',exact=True).click()
+        page.locator('.studio-cards button:visible').filter(has_text='资料摘要').click()
+        dialog=page.get_by_role('dialog',name='生成资料摘要')
+        expect(dialog.get_by_label('内容质量',exact=True)).to_have_value('low')
+        dialog.get_by_label('内容质量',exact=True).select_option('medium')
+        page.keyboard.press('Escape')
+        page.locator('.studio-cards button:visible').filter(has_text='资料摘要').click()
+        expect(dialog.get_by_label('内容质量',exact=True)).to_have_value('medium')
+        page.keyboard.press('Escape')
+        if width<600:page.get_by_role('button',name='对话',exact=True).click()
+        expect(page.get_by_label('内容质量',exact=True)).to_have_value('high')
+        assert_layout(page)
+        assert page.locator('.messages').bounding_box()['height']>100
+        job={'id':'chat-ui','kind':'chat','notebook_id':'a','notebook_title':'Audit A','display_name':'资料对话','state':'complete','stage':'内容已保存','stage_code':'complete','progress':1,'created_at':'2026-09-28T00:00:00Z','updated_at':'2026-09-28T00:00:00Z','eta':{'status':'learning','sample_count':0,'queue_position':0},'result':{'id':'answer','conversation_id':'history'}}
+        page.route('**/api/jobs?*',lambda route:route.fulfill(json={'items':[job],'page':1,'page_size':20,'total':1,'pages':1}))
+        page.route('**/api/jobs/chat-ui',lambda route:route.fulfill(json=job))
+        page.route('**/api/jobs/chat-ui/events',lambda route:route.fulfill(json=[]))
+        page.get_by_role('button',name='任务',exact=True).click()
+        page.get_by_role('button',name='查看任务 资料对话',exact=True).click()
+        page.get_by_role('dialog',name='任务详情 资料对话').get_by_role('button',name='查看结果',exact=True).click()
+        result=page.get_by_role('dialog',name='对话结果')
+        expect(result).to_contain_text('三个核心要点')
+        expect(result).to_contain_text('已达标')
+        page.keyboard.press('Escape');expect(result).not_to_be_visible()
+        assert_layout(page)
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+    print('Quality flow desktop/mobile/keyboard checks passed')
