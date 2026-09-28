@@ -14,6 +14,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
+from .usage import metered_media
 from .database import DB, json_dump, json_load, utc_now
 from .context_budget import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -648,6 +649,16 @@ def _effective_token_limits(
     }
 
 
+def parameter_controls(provider: dict[str, Any]) -> dict[str, Any]:
+    from urllib.parse import urlsplit
+    host = urlsplit(provider.get("base_url", "")).hostname or ""
+    known = any(host == domain or host.endswith("." + domain) for domain in ("deepseek.com", "bigmodel.cn", "z.ai", "moonshot.ai", "moonshot.cn"))
+    return {"thinking": {"editable": provider.get("kind") == "openai" and known,
+                         "source": "integration" if provider.get("kind") == "ollama" else "service_protocol" if known else "unknown",
+                         "requested": False if provider.get("kind") == "ollama" else (provider.get("config") or {}).get("thinking", "auto"),
+                         "notice": "当前 Ollama 接入固定请求关闭思考；模型是否接受由服务决定。" if provider.get("kind") == "ollama" else "仅表示请求参数，不能保证服务采用；回退请求可在用量明细查看。"}}
+
+
 async def _discover_chat_capabilities(provider: dict[str, Any], models: list[dict[str, Any]]) -> dict[str, Any]:
     model = str(provider.get("model") or "").strip()
     if provider.get("role") not in {"main", "vlm"} or not model:
@@ -681,6 +692,7 @@ async def _discover_chat_capabilities(provider: dict[str, Any], models: list[dic
                         detected["runtime_context_tokens"] = running_context
                     break
         capabilities = {"token_limits": _effective_token_limits(provider, detected), "model_profile": model_profile}
+        capabilities["parameter_controls"] = parameter_controls(provider)
         capabilities["study_generation"] = study_generation_profile({**provider, "capabilities": capabilities})
         return capabilities
 
@@ -700,6 +712,7 @@ async def _discover_chat_capabilities(provider: dict[str, Any], models: list[dic
     if detected.get("model_context_tokens"):
         detected.setdefault("provider_context_tokens", detected["model_context_tokens"])
     capabilities = {"token_limits": _effective_token_limits(provider, detected, context_source="provider_metadata")}
+    capabilities["parameter_controls"] = parameter_controls(provider)
     capabilities["study_generation"] = study_generation_profile({**provider, "capabilities": capabilities})
     return capabilities
 
@@ -819,14 +832,15 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
             temperature = resolve_temperature(provider.get("config") or {}, 0.0)
         except ValueError as exc:
             raise ProviderError(str(exc)) from exc
+        from .usage import post as metered_post
         if kind == "ollama":
             message: dict[str, Any] = {"role": "user", "content": "只回复 OK"}
             if role == "vlm":
                 message["images"] = [TEST_IMAGE_BASE64]
             limits = TokenLimits.from_provider(provider)
-            response = await client.post(
+            response = await metered_post(client,
                 f"{provider['base_url']}/api/chat",
-                json={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": temperature, "num_predict": 128, "num_ctx": limits.effective_context_tokens}},
+                provider=provider, payload={"model": model, "messages": [message], "stream": False, "think": False, "options": {"temperature": temperature, "num_predict": 128, "num_ctx": limits.effective_context_tokens}},
                 headers=headers,
             )
         else:
@@ -837,17 +851,17 @@ async def _deep_verify(provider: dict[str, Any]) -> None:
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TEST_IMAGE_BASE64}"}},
                 ]
             payload: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": content}], "temperature": temperature, "max_tokens": 512}
-            response = await client.post(
+            response = await metered_post(client,
                 f"{provider['base_url']}/v1/chat/completions",
-                json=payload,
+                provider=provider, payload=payload,
                 headers=headers,
             )
             if response.status_code == 400 and "max_tokens" in response.text:
                 # Newer OpenAI-style servers reject max_tokens in favor of max_completion_tokens.
                 payload["max_completion_tokens"] = payload.pop("max_tokens")
-                response = await client.post(
+                response = await metered_post(client,
                     f"{provider['base_url']}/v1/chat/completions",
-                    json=payload,
+                    provider=provider, payload=payload,
                     headers=headers,
                 )
         if not response.is_success:
@@ -1105,6 +1119,7 @@ async def _chat_once(
     max_tokens: int,
     temperature: float,
 ) -> ChatCompletion:
+    from .usage import post as metered_post
     headers: dict[str, str] = {}
     if provider["api_key"]:
         headers["Authorization"] = f"Bearer {provider['api_key']}"
@@ -1124,7 +1139,7 @@ async def _chat_once(
             }
             if json_mode:
                 payload["format"] = response_schema or "json"
-            response = await client.post(f"{provider['base_url'].rstrip('/')}/api/chat", json=payload, headers=headers)
+            response = await metered_post(client, f"{provider['base_url'].rstrip('/')}/api/chat", provider=provider, payload=payload, headers=headers)
             if not response.is_success:
                 raise _provider_response_error(response)
             result = response.json()
@@ -1147,14 +1162,14 @@ async def _chat_once(
             if thinking in {"disabled", "enabled"}:
                 # Zhipu-style thinking switch; reasoning tokens otherwise share the max_tokens budget.
                 payload["thinking"] = {"type": thinking}
-            response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
+            response = await metered_post(client, f"{provider['base_url'].rstrip('/')}/v1/chat/completions", provider=provider, payload=payload, headers=headers)
             if response.status_code == 400 and "thinking" in payload and "thinking" in response.text:
                 # Servers without a thinking switch (or forced-thinking models) reject the parameter.
                 from .delivery import CURRENT as DELIVERY, claim_recovery
                 if DELIVERY.get() and (DELIVERY.get().audits or not claim_recovery()):
                     raise _provider_response_error(response)
                 payload.pop("thinking", None)
-                response = await client.post(f"{provider['base_url'].rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
+                response = await metered_post(client, f"{provider['base_url'].rstrip('/')}/v1/chat/completions", provider=provider, payload=payload, headers=headers)
             if not response.is_success:
                 raise _provider_response_error(response)
             result = response.json()
@@ -1308,6 +1323,8 @@ async def budgeted_chat(
                     if state and (stage == "context_prepare" or (state.plan.kind in {"summary", "chat"} and stage in {"summary", "generation"} and trace.requests == 0)) and trace.accounted_tokens + estimated + output_tokens > state.plan.total_token_limit - state.plan.final_reserve_tokens:
                         raise RuntimeError("已为最终综合与审校保留预算")
                     trace.begin_request(estimated_tokens=admission)
+                from .usage import STAGE
+                stage_token = STAGE.set(stage)
                 try:
                     result = await _chat_once(provider, build.messages, json_mode=json_mode,
                                              timeout=max(timeout, min(600, 120 + (estimated + output_tokens) / 100)) if state or (json_mode and high_reasoning(provider)) else timeout,
@@ -1317,6 +1334,8 @@ async def budgeted_chat(
                     if trace:
                         trace.record_failure()
                     raise
+                finally:
+                    STAGE.reset(stage_token)
                 if trace:
                     trace.record(limits=limits, requested_output=max_tokens, output_tokens=output_tokens,
                                  estimated_prompt=estimated, actual_prompt=result.prompt_tokens,
@@ -1514,6 +1533,7 @@ async def probe_tts_provider(provider_id: str, *, apply_defaults: bool = False) 
     return await probe_audio_provider(provider_id, apply_defaults=apply_defaults)
 
 
+@metered_media("tts")
 async def _synthesize_sandevistan(
     provider: dict[str, Any],
     text: str,
@@ -1674,6 +1694,7 @@ async def synthesize(
     raise ProviderError(f"Provider {provider['kind']} cannot serve TTS")
 
 
+@metered_media("tts_sequence")
 async def _synthesize_sequence_sandevistan(
     provider: dict[str, Any],
     items: list[dict[str, Any]],
@@ -1867,6 +1888,7 @@ def _device_failure(error: BaseException) -> bool:
     )
 
 
+@metered_media("asr")
 async def _transcribe_sandevistan_once(
     provider: dict[str, Any],
     path: Path,

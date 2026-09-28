@@ -1,14 +1,15 @@
 from pathlib import Path
 import json
+import os
 import re
 import tomllib
 
 from playwright.sync_api import Page, sync_playwright
-from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions
+from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE_URL = "http://127.0.0.1:20830"
+BASE_URL = os.environ.get("SREAD_BROWSER_BASE_URL", "http://127.0.0.1:20830")
 QA_NOTEBOOK = "QA 2026-08-28 · ALL 4"
 
 
@@ -22,7 +23,7 @@ def authenticate(page: Page) -> None:
         page.wait_for_selector(".shell")
     page.wait_for_function(
         "document.querySelector('.notebook-switch b') && "
-        "document.querySelector('.notebook-switch b').textContent !== '选择或新建 Notebook'"
+        "document.querySelector('.notebook-switch b').textContent !== '选择或新建资料库'"
     )
 
 
@@ -50,6 +51,12 @@ def main() -> None:
         run_context_regressions(browser)
         run_import_regressions(browser)
         run_delivery_regressions(browser)
+        run_experience_regressions(browser)
+        run_weekly_budget_regressions(browser)
+        if os.environ.get("SREAD_BROWSER_FIXTURES_ONLY") == "1":
+            browser.close()
+            print("Isolated browser checks passed; all API calls intercepted.")
+            return
         context = browser.new_context(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         page = context.new_page()
         api_requests: list[str] = []
@@ -148,6 +155,7 @@ def main() -> None:
                         "catalog_supported": True,
                         "models": models,
                         "capabilities": {
+                            "parameter_controls": {"thinking": {"editable": True}},
                             "token_limits": {
                                 "model_context_tokens": 32768,
                                 "effective_context_tokens": 8192,
@@ -164,12 +172,15 @@ def main() -> None:
             )
 
         page.route("**/api/providers/inspect", inspect_provider)
+        settings.get_by_role("button", name="资料导入", exact=True).click()
         assert settings.get_by_text("IMAGE PIPELINE", exact=True).is_visible()
+        settings.get_by_role("button", name="播客语音", exact=True).click()
         settings.get_by_role("button", name="管理 AUDIO").click()
         settings.get_by_role("button", name="添加 AUDIO Provider").click()
         assert settings.get_by_role("heading", name="添加 Provider").is_visible()
         assert settings.get_by_label("角色").is_disabled()
         assert settings.get_by_label("类型").locator("option").count() == 1
+        settings.get_by_text("自定义配置名称（可选）", exact=True).click()
         settings.get_by_label("名称").fill("QA Audio")
         settings.get_by_label("服务地址").fill("http://localhost:20810")
         settings.get_by_role("button", name="连接并读取模型").click()
@@ -224,6 +235,7 @@ def main() -> None:
 
         settings.get_by_role("button", name="管理 MAIN").click()
         settings.get_by_role("button", name="添加 MAIN Provider").click()
+        settings.get_by_text("自定义配置名称（可选）", exact=True).click()
         settings.get_by_label("名称").fill("QA Provider")
         settings.get_by_label("服务地址").fill("https://api.example.com/v1")
         settings.get_by_role("button", name="连接并读取模型").click()
@@ -244,6 +256,7 @@ def main() -> None:
         assert settings.get_by_label("搜索模型").count() == 0
         assert page.get_by_role("dialog", name="放弃未保存的 Provider 配置？").count() == 0
         assert settings.get_by_role("button", name="验证并启用").is_enabled()
+        settings.get_by_text("高级参数与容量说明", exact=True).click()
         settings.get_by_label("Temperature 覆盖").fill("1")
         settings.get_by_label("上下文窗口覆盖（tokens）").fill("16384")
         settings.get_by_label("最大输出覆盖（tokens）").fill("2048")
@@ -332,6 +345,7 @@ def main() -> None:
         guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人Podcast")
         assert guarded_podcast.is_enabled()
         assert guard_page.get_by_text("音频服务离线 · 双人Podcast将仅生成文本", exact=True).is_visible()
+        guard_page.get_by_text("播客语音（可选）", exact=True).click()
         assert guard_page.get_by_text("请先配置并启用 AUDIO Provider", exact=True).is_visible()
         assert guard_page.locator(".studio-cards button").filter(has_text="Quiz 题库").is_enabled()
         guarded_podcast.click()
@@ -481,9 +495,9 @@ def main() -> None:
 
         page.route("**/api/notebook-management?*", notebook_management)
         page.goto(f"{BASE_URL}/#notebooks", wait_until="domcontentloaded")
-        page.get_by_role("button", name="新建 Notebook").wait_for()
-        page.get_by_role("button", name="新建 Notebook").click()
-        create_dialog = page.get_by_role("dialog", name="新建 Notebook")
+        page.get_by_role("button", name="新建资料库").wait_for()
+        page.get_by_role("button", name="新建资料库").click()
+        create_dialog = page.get_by_role("dialog", name="新建资料库")
         assert create_dialog.is_visible()
         page.keyboard.press("Escape")
         assert create_dialog.count() == 0
@@ -554,7 +568,7 @@ def main() -> None:
         assert mobile.locator(".notebook-menu").is_visible()
         mobile.get_by_role("button", name=re.compile("资料")).click()
         assert mobile.locator(".sources").is_visible()
-        mobile.get_by_role("button", name="Studio", exact=True).click()
+        mobile.get_by_role("button", name="学习与输出", exact=True).click()
         assert mobile.locator(".workspace > .studio").is_visible()
         assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人Podcast").is_enabled()
         assert mobile.locator(".workspace > .studio").get_by_role("button", name="配置 AUDIO Provider").is_visible()
@@ -564,10 +578,12 @@ def main() -> None:
         mobile.get_by_role("button", name="设置").click()
         mobile_settings = mobile.get_by_role("dialog", name="Provider 配置")
         mobile.screenshot(path="/tmp/sandevistan-read-provider-roles-mobile.png")
+        mobile_settings.get_by_role("button", name="播客语音", exact=True).click()
         mobile_settings.get_by_role("button", name="管理 AUDIO").click()
         mobile_settings.get_by_role("button", name="添加 AUDIO Provider").click()
         assert mobile_settings.get_by_role("heading", name="添加 Provider").is_visible()
         assert mobile_settings.get_by_label("角色").is_disabled()
+        mobile_settings.get_by_text("自定义配置名称（可选）", exact=True).click()
         mobile_settings.get_by_label("名称").fill("QA Audio Mobile")
         mobile_settings.get_by_label("服务地址").fill("http://localhost:20810")
         mobile_settings.get_by_role("button", name="连接并读取模型").click()
@@ -583,6 +599,7 @@ def main() -> None:
         mobile_settings.get_by_role("button", name="返回角色概览").click()
         mobile_settings.get_by_role("button", name="管理 MAIN").click()
         mobile_settings.get_by_role("button", name="添加 MAIN Provider").click()
+        mobile_settings.get_by_text("高级参数与容量说明", exact=True).click()
         mobile_temperature = mobile_settings.get_by_label("Temperature 覆盖")
         assert mobile_temperature.is_visible()
         assert mobile_settings.get_by_label("思考模式").is_visible()

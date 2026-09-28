@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import __version__, usage
 from .api_docs import ARTIFACT_LIST_RESPONSES, ARTIFACT_RESPONSES, INSPECTION_RESPONSES, JOB_LIST_RESPONSES, JOB_RESPONSES, PODCAST_DOWNLOAD_RESPONSES, PODCAST_SUBMIT_RESPONSES, PROVIDER_CREATE_RESPONSES, PROVIDER_LIST_RESPONSES, PROVIDER_PROBE_RESPONSES, PROVIDER_ROLE_UPDATE_RESPONSES, PROVIDER_TEST_RESPONSES, PROVIDER_UPDATE_RESPONSES
 from .config import CONFIG
 from .database import DB, json_dump, json_load, new_id, utc_now
@@ -31,10 +31,10 @@ from .schemas import ChatRequest, FlashcardRequest, FlashcardReview, FlashcardSe
 from .security import VAULT
 from .services import grounded_generate, source_scope
 from .study_sessions import answer_quiz, create_session, flashcards_csv, get_session, public_artifact, review_flashcard, suspend_flashcard
-from .schemas import ContextPreviewRequest
+from .schemas import ContextPreviewRequest, TaskPreviewRequest, ReviewRequest
 from .context_budget import TokenLimits, estimate_text_tokens, plan_context
 from .retrieval import is_quality_chunk
-from .api_docs import CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
+from .api_docs import USAGE_RESPONSES, TASK_PREVIEW_RESPONSES, REVIEW_RESPONSES, REVIEW_HISTORY_RESPONSES, CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
 
 
 @asynccontextmanager
@@ -70,6 +70,40 @@ def require_access(request: Request, authorization: str | None = Header(default=
 
 
 api = FastAPI(title="Sandevistan-Read API", version=__version__, dependencies=[Depends(require_access)])
+
+from . import weekly_budget
+from .schemas import WeeklyBudgetSettings
+from .api_docs import WEEKLY_SETTINGS_RESPONSES, WEEKLY_USAGE_RESPONSES
+
+
+@api.middleware("http")
+async def accounting_context(request: Request, call_next):
+    token = usage.ACCOUNTING_DB.set(DB)
+    try:
+        return await call_next(request)
+    finally:
+        usage.ACCOUNTING_DB.reset(token)
+
+
+@api.exception_handler(weekly_budget.QuotaExceeded)
+async def quota_error(request: Request, exc: weekly_budget.QuotaExceeded):
+    return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+
+@api.get("/settings/usage-budget", responses=WEEKLY_SETTINGS_RESPONSES, description="应用实例共用的周额度；默认仅提醒，不代表厂商套餐余额。")
+def weekly_budget_settings():
+    return weekly_budget.settings(DB)
+
+
+@api.put("/settings/usage-budget", responses=WEEKLY_SETTINGS_RESPONSES, description="修改额度不清空消费记录。initialize_only 仅在首次设置浏览器时区时生效。")
+def update_weekly_budget(body: WeeklyBudgetSettings):
+    return weekly_budget.save_settings(DB, body.model_dump(exclude={"initialize_only"}), initialize_only=body.initialize_only)
+
+
+@api.get("/usage/weekly", responses=WEEKLY_USAGE_RESPONSES, description="本周已知消耗、未知预留及 Provider 明细；语音另计，删除内容不返还额度。")
+def weekly_usage():
+    return weekly_budget.overview(DB)
+
 _STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
 _STATUS_LOCK = asyncio.Lock()
 
@@ -297,10 +331,15 @@ async def ask(notebook_id: str, body: ChatRequest):
         VALUES(?,?,?,?,?,?,?,?,?)""",
         (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", "{}", now),
     )
-    result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language, conversation_id=conversation_id)
+    message_id = new_id("message")
+    with usage.running(DB, notebook_id, "chat", target_id=message_id, token_limit=body.token_limit) as run:
+        result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language, conversation_id=conversation_id)
     context_usage = result.pop("context_usage", {})
     metadata = {"quality_assessment": result.get("quality_assessment"), "delivery_status": result.get("delivery_status"), "context_usage": context_usage, "degraded": result.get("degraded", False), "warnings": result.get("warnings", [])}
-    message_id = new_id("message")
+    metadata["usage"] = usage.summarize(DB, run_id=run.id)
+    if run.quota_denial:
+        metadata["quota_denial"] = run.quota_denial
+        metadata["warnings"].append({**run.quota_denial, "stage": "budget"})
     DB.execute(
         """INSERT INTO messages
         (id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at)
@@ -380,6 +419,7 @@ def artifact(artifact_id: str):
     item = normalize(row)
     if item.get("media_path"):
         item["media_url"] = f"/api/artifacts/{item['id']}/media"
+    item["payload"]["usage"] = usage.summarize(DB, target_id=artifact_id, include_reviews=False)
     return public_artifact(item)
 
 
@@ -589,7 +629,7 @@ def workspace_state(notebook_id: str):
 def job(job_id: str):
     row = DB.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,));
     if not row: raise HTTPException(404, "任务不存在")
-    return _public_job(row)
+    return {**_public_job(row), "usage": usage.summarize(DB, job_id=job_id)}
 
 
 @api.get("/jobs/{job_id}/events")
@@ -627,6 +667,8 @@ def providers():
     for row in DB.fetchall("SELECT * FROM provider_profiles ORDER BY role,name"):
         has_api_key = bool(row.get("secret_enc")); item = normalize(row); item.pop("secret_enc", None); item["has_api_key"] = has_api_key
         if item.get("role") in {"main", "vlm"}:
+            from .providers import parameter_controls
+            item.setdefault("capabilities", {})["parameter_controls"] = parameter_controls(item)
             item.setdefault("capabilities", {})["study_generation"] = study_generation_profile(item)
         rows.append(item)
     return rows
@@ -692,6 +734,7 @@ def update_image_processing_setting(body: ImageProcessingPolicy):
 
 def _provider_candidate(body: ProviderCreate | ProviderInspectionRequest, *, api_key: str | None = None) -> dict[str, Any]:
     return {
+        "id": getattr(body, "provider_id", None),
         "name": getattr(body, "name", "Provider"),
         "role": body.role,
         "kind": body.kind,
@@ -801,6 +844,63 @@ def context_preview(body: ContextPreviewRequest):
             "basis": "当前选中资料的实际片段长度（含定位估算）" if total is not None else "按每段约 1000 tokens 估算",
             "candidate_segments": segments, "material_tokens": total,
             "assumptions": "Quiz 10 题、Flashcard 20 张、Podcast 20 分钟；容量估算不代表质量保证。"}
+
+
+@api.post("/notebooks/{notebook_id}/task-preview", responses=TASK_PREVIEW_RESPONSES, description="根据当前实际策略、资料及任务参数在本地估算；不调用模型，不产生 token 用量。")
+def task_preview(notebook_id: str, body: TaskPreviewRequest):
+    from .generation_context import task_preview as preview
+    _require_notebook(notebook_id)
+    provider = active_provider("main")
+    if not provider:
+        raise HTTPException(409, "请先连接文字模型")
+    return {**preview(DB, notebook_id, provider, **(body.model_dump() | {"source_ids": source_scope(notebook_id, body.source_ids)})), "weekly_budget": weekly_budget.overview(DB)}
+
+
+@api.get("/notebooks/{notebook_id}/usage", responses=USAGE_RESPONSES, description="语言及视觉模型逐次请求的已知计量、估算和未知项；不包含未记录的历史消耗。")
+def notebook_usage(notebook_id: str):
+    _require_notebook(notebook_id)
+    return usage.summarize(DB, notebook_id=notebook_id)
+
+
+@api.get("/jobs/{job_id}/usage", responses=USAGE_RESPONSES, description="包括失败、取消及重试请求的任务用量。")
+def job_usage(job_id: str):
+    if not DB.fetchone("SELECT id FROM jobs WHERE id=?", (job_id,)):
+        raise HTTPException(404, "任务不存在")
+    return usage.summarize(DB, job_id=job_id)
+
+
+@api.get("/reviews", responses=REVIEW_HISTORY_RESPONSES, description="读取独立审校历史；不返回 Quiz 答案相关提示。")
+def review_history(target_type: Literal["artifact", "message"], target_id: str):
+    table = "artifacts" if target_type == "artifact" else "messages"
+    row = DB.fetchone(f"SELECT * FROM {table} WHERE id=?", (target_id,))
+    if not row:
+        raise HTTPException(404, "内容不存在")
+    reports = []
+    for record in DB.fetchall("SELECT * FROM review_reports WHERE target_id=? ORDER BY created_at DESC LIMIT 20", (target_id,)):
+        report = json_load(record["report_json"], {})
+        if row.get("type") == "quiz":
+            report = {**report, "issues": []}
+        reports.append({"id": record["id"], "created_at": record["created_at"], "assessment": report, "usage": usage.summarize(DB, run_id=record["run_id"])})
+    return reports
+
+
+@api.post("/reviews", responses=REVIEW_RESPONSES, description="用户主动发起的一次额外 MAIN 抽样原文核查，可能产生费用；不改写原内容，保存独立报告。Quiz 返回不含答案提示的聚合结果。")
+async def create_review(body: ReviewRequest):
+    from .review import load_target, review_units
+    try:
+        notebook_id, units, chunks = load_target(DB, body.target_type, body.target_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not active_provider("main"):
+        raise HTTPException(409, "请先连接文字模型")
+    with usage.running(DB, notebook_id, "review", target_id=body.target_id, token_limit=body.token_limit) as run:
+        report = await review_units(units, chunks)
+    identifier = new_id("review")
+    DB.execute("INSERT INTO review_reports VALUES(?,?,?,?,?,?)", (identifier, notebook_id, body.target_id, run.id, json_dump(report), utc_now()))
+    # Review issue text can reveal Quiz answers, even if the UI doesn't render it.
+    if body.target_type == "artifact" and (DB.fetchone("SELECT type FROM artifacts WHERE id=?", (body.target_id,)) or {}).get("type") == "quiz":
+        report = {**report, "issues": []}
+    return {"id": identifier, "assessment": report, "usage": usage.summarize(DB, run_id=run.id)}
 
 
 @api.post("/providers", responses=PROVIDER_CREATE_RESPONSES)

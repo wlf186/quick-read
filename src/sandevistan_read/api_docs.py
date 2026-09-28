@@ -249,3 +249,64 @@ NOTEBOOK_RESPONSES = json_response(_object({
         }),
     })),
 }), "笔记本及资料。工作表引用 locator 包含 sheet、cell_range，可另含 header_range；原生图表包含 chart、data_ranges。")
+
+# Documentation-only additions: never use these schemas as response filters.
+USAGE_SCHEMA = _object({
+    "recorded": {"type": "boolean"}, "complete": {"type": "boolean"},
+    "calls": {"type": "integer"}, "unknown_calls": {"type": "integer"},
+    "input_tokens": {"type": "integer"}, "output_tokens": {"type": "integer"},
+    "reasoning_tokens": {"type": "integer", "description": "输出总量的子集，不重复相加。未单列不代表没有推理。"},
+    "cached_tokens": {"type": "integer", "description": "输入总量的子集。"},
+    "estimated_input_tokens": {"type": "integer"},
+    "accounted_tokens": {"type": "integer", "description": "执行预算占用，包含未知请求预留，不是实际账单。"},
+    "stages": _object({}), "requests": _array(_object({})),
+    "media": _array(_object({"stage": {"type":"string"}, "submitted_chars":{"type":"integer"}, "audio_seconds":{"type":["number","null"]}}), "TTS/ASR 的请求量单列，不与 token 相加；无法确定收费情况。"),
+}, "逐次持久化用量；已知服务计量与未知请求分开。历史缺失不补为零，失败请求可能仍有消耗。")
+QUALITY_REVIEW_SCHEMA = _object({
+    "review_status": {"type":"string", "enum":["complete","partial","unavailable","not_applicable"]},
+    "reason_code": {"type":["string","null"]}, "reason": {"type":"string"},
+    "reviewed_units": {"type":"integer"}, "total_units": {"type":"integer"},
+    "supported_units": {"type":"integer"}, "issues": _array(_object({})),
+}, "生成状态与原文核查独立；保留旧 level/method 字段。Quiz 作答前隐藏 issues。")
+USAGE_RESPONSES = json_response(USAGE_SCHEMA, "已记录的语言、视觉和语音请求量；非完整账单。")
+TASK_PREVIEW_RESPONSES = json_response(_object({
+    "kind":{"type":"string"}, "strategy":{"type":"string"}, "source_count":{"type":"integer"},
+    "estimated_input_tokens":{"type":"integer"}, "output_limit":{"type":"integer"},
+    "calls_range":_array({"type":"integer"}), "token_limit":{"type":["integer","null"]},
+    "context_tokens":{"type":"integer"}, "context_source":{"type":"string"},
+    "can_generate":{"type":"boolean"}, "notice":{"type":"string"},
+}), "本地执行容量估算；不会调用 Provider，调用范围和输入估算不是实际账单。")
+REVIEW_SCHEMA = _object({"id":{"type":"string"}, "assessment":QUALITY_REVIEW_SCHEMA, "usage":USAGE_SCHEMA})
+REVIEW_RESPONSES = json_response(REVIEW_SCHEMA, "一次独立的额外模型审校，最多抽查 12 项，原内容不改写。")
+REVIEW_HISTORY_RESPONSES = json_response(_array(REVIEW_SCHEMA), "独立审校报告历史，Quiz 答案相关提示始终隐藏。")
+ARTIFACT_SCHEMA["properties"]["payload"]["properties"]["usage"] = USAGE_SCHEMA
+ARTIFACT_SCHEMA["properties"]["payload"]["properties"]["quality_assessment"] = QUALITY_REVIEW_SCHEMA
+
+# Documentation only: retain all existing runtime fields.
+JOB_RESPONSES[200]["content"]["application/json"]["schema"]["properties"]["usage"] = USAGE_SCHEMA
+CAPABILITIES_SCHEMA["properties"]["parameter_controls"] = _object({}, "实际接入协议可编辑的参数及其限制；请求设置不保证服务采用。")
+
+WEEKLY_LIMIT_SCHEMA = _object({
+    "tokens": {"type":["integer","null"], "description":"正整数；null 关闭此项额度。"},
+    "calls": {"type":["integer","null"]}, "mode":{"type":"string","enum":["warn","block"]},
+})
+WEEKLY_SETTINGS_SCHEMA = _object({
+    "timezone":{"type":"string"}, "initialized":{"type":"boolean"},
+    "global_limit":WEEKLY_LIMIT_SCHEMA,
+    "providers":{"type":"object","additionalProperties":WEEKLY_LIMIT_SCHEMA},
+}, "整个应用实例共用的每周参考预算；不是厂商套餐余额。")
+WEEKLY_USAGE_SCHEMA = _object({
+    "known_tokens":{"type":"integer"}, "unconfirmed_tokens":{"type":"integer"},
+    "occupied_tokens":{"type":"integer"}, "calls":{"type":"integer"}, "unknown_calls":{"type":"integer"},
+    "limit": {"anyOf":[WEEKLY_LIMIT_SCHEMA,{"type":"null"}]},
+    "remaining_tokens":{"type":["integer","null"]}, "remaining_calls":{"type":["integer","null"]},
+})
+WEEKLY_OVERVIEW_SCHEMA = _object({
+    "has_active_work":{"type":"boolean","description":"全实例有未结束任务或模型请求时，前台可定时刷新。"},
+    "period_start":{"type":"string","format":"date-time"}, "reset_at":{"type":"string","format":"date-time"},
+    "timezone":{"type":"string"}, "notice":{"type":"string"}, "global_usage":WEEKLY_USAGE_SCHEMA,
+    "providers":_array(_object({**WEEKLY_USAGE_SCHEMA["properties"],"id":{"type":"string"},"name":{"type":"string"},"kind":{"type":"string"}})),
+})
+WEEKLY_SETTINGS_RESPONSES = json_response(WEEKLY_SETTINGS_SCHEMA, "默认每周 100 万 tokens、500 次文字/视觉请求，仅提醒；初始化仅设置首次时区。")
+WEEKLY_USAGE_RESPONSES = json_response(WEEKLY_OVERVIEW_SCHEMA, "包含真实请求尝试及未知预留；语音另计，历史缺失不补零。")
+TASK_PREVIEW_RESPONSES[200]["content"]["application/json"]["schema"]["properties"]["weekly_budget"] = WEEKLY_OVERVIEW_SCHEMA

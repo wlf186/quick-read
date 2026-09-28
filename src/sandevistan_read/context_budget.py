@@ -590,3 +590,9 @@ def reserve_podcast_audit(trace: ContextUsage, limits: TokenLimits, *, reasoning
         (trace.total_token_limit or 0) // (2 if reasoning else 4),
         min(budget.input_tokens, 8192) + budget.output_tokens if reasoning else budget.input_tokens + budget.output_tokens
     )
+
+
+def study_batch_size(kind: str, count: int, tier: str, output_limit: int, plan_items: int | None = None) -> int:
+    size = 1 if tier == "lite" else math.ceil(count / 2) if kind == "flashcard" else 3
+    size = min(size, max(1, (output_limit - 512) // (900 if kind == "quiz" else 500)))
+    return min(6 if kind == "quiz" else 10, plan_items) if plan_items is not None and tier == "full" else size

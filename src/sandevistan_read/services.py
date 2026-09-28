@@ -517,6 +517,9 @@ async def grounded_generate(notebook_id: str, instruction: str, query: str, sour
     local_issues = [{"unit": "answer", "code": "answer_check", "severity": "suspect", "message": issue} for issue in locals().get("issues", [])]
     paragraphs = [part.strip() for part in answer.split("\n\n") if part.strip()]
     audit_points = [{"claim": part, "why_it_matters": "", "qualification": "", "citations": list(dict.fromkeys(re.findall(r"\[(S\d+)\]", part)))} for part in paragraphs[:12]]
+    from .delivery import audit_reason
+    if _is_refusal(answer):
+        audit_reason("not_applicable")
     verdicts = {} if _is_refusal(answer) else await _audit_summary_batch(audit_points, chunks, labels, trace)
     for index, value in verdicts.items():
         if value == "unsupported":
@@ -548,6 +551,7 @@ async def _audit_summary_batch(
     points: list[dict[str, Any]], chunks: list[dict[str, Any]], labels: list[str], trace: ContextUsage,
 ) -> dict[int, str]:
     """Audit against original evidence, rejecting missing or unverifiable verdicts."""
+    from .delivery import audit_reason
     requested = {label for point in points for label in point["citations"]}
     evidence = [(label, chunk) for label, chunk in zip(labels, chunks) if label in requested]
     prefix = (
@@ -609,8 +613,11 @@ async def _audit_summary_batch(
                 accepted.add(index)
             elif verdict.get("supported") is False and set(points[index]["citations"]) <= visible.keys():
                 rejected.add(index)
+        if len(accepted | rejected) < len(points):
+            audit_reason("output_truncated" if result.finish_reason in {"length", "max_tokens"} else "invalid_response")
         return {index: "unsupported" if index in rejected else "supported" for index in accepted | rejected}
-    except (ProviderError, RuntimeError, ValueError, TypeError):
+    except Exception as exc:
+        audit_reason(exc)
         trace.mark_fallback()
         return {}
 

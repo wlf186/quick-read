@@ -1,12 +1,12 @@
 export type EpisodeAudit={status:"complete"|"partial"|"unavailable";coverage_mode:"full"|"sampled";checked_transitions:number;total_transitions:number;reviewed_transitions:number[];requested_transitions?:number[];reason?:string;repair_unreviewed?:boolean;transition_checks?:Array<{index:number;verdict:"connected"|"broken"|"uncertain";reason:string}>};
-export type QualityAssessment={version:1;level:"good"|"fair"|"needs_review"|"unrated";method:string;total_units:number;reviewed_units:number;supported_units:number;issues:Array<{unit?:string;code:string;message:string;severity?:string}>};
+export type QualityAssessment={review_status?:string;reason_code?:string;reason?:string;version:1;level:"good"|"fair"|"needs_review"|"unrated";method:string;total_units:number;reviewed_units:number;supported_units:number;issues:Array<{unit?:string;code:string;message:string;severity?:string}>};
 export type DeliveryStatus="full"|"partial"|"script_only"|"draft_only";
 export type Source={id:string;filename:string;state:string;selected:number;page_count:number;parser?:string;error?:string;metadata?:Record<string,any>};
 export type Notebook={id:string;title:string;description:string;state?:string;sources?:Source[];source_count?:number;source_bytes?:number;artifact_count?:number;active_jobs?:number;cleanup_error?:string};
 export type NotebookDeleteResult={id:string;accepted:boolean;operation_id?:string;error?:string};
 export type NotebookBatchDeleteResponse={items:NotebookDeleteResult[]};
 export type Citation={id:string;filename:string;locator:Record<string,any>;quote:string;source_id:string};
-export type Job={id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
+export type Job={usage?:Usage;id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
 export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:number};
 export type SummaryPoint={claim:string;why_it_matters:string;qualification:string;citations:string[];source_id?:string|null;review_status?:string};
 export type SourceSummary={source_id:string;filename:string;points:SummaryPoint[];covered:boolean};
@@ -15,7 +15,7 @@ export type ProviderRole='main'|'vlm'|'audio'|'tts_only';
 export type ConfigurableProviderRole='main'|'vlm'|'audio';
 export type ProviderKind='ollama'|'openai'|'sandevistan_audio'|'openai_tts';
 export type StudyDifficulty='easy'|'medium'|'hard'|'mixed';
-export type StudyOptions={count:number;difficulty:StudyDifficulty;language:'auto'|'zh-CN'|'en';custom_prompt:string};
+export type StudyOptions={token_limit?:number;count:number;difficulty:StudyDifficulty;language:'auto'|'zh-CN'|'en';custom_prompt:string};
 export type StudySession={id:string;artifact_id:string;kind:'quiz'|'flashcard';mode:'all'|'missed'|'due'|'same';status:'active'|'complete';items:Array<Record<string,any>>;progress:{current:number;total:number};created_at:string;updated_at:string};
 export type TokenLimits={model_context_tokens?:number|null;effective_context_tokens:number;max_input_tokens?:number|null;max_output_tokens:number;context_source:'manual'|'ollama_runtime'|'ollama_modelfile'|'provider_metadata'|'fallback'|string;output_source:'manual'|'provider_metadata'|'derived'|string;image_tokens_per_image?:number;probed_at?:string};
 export type HostVoiceMode='preset'|'voiceprint';
@@ -30,7 +30,7 @@ export type VoiceprintPersonOption={id:string;name:string;note?:string|null;elig
 export type VoiceprintLibrary={status:'ready'|'unsupported'|'unavailable';people:VoiceprintPersonOption[];message?:string|null};
 export type ProviderInspection={status:'passed'|'warning'|'failed';connection_ok:boolean;activation_eligible:boolean;latency_ms:number;catalog_supported:boolean;models:ProviderModel[];capabilities:Record<string,any>;recommended?:{model?:string;compute_device?:string;reason?:string}|null;voiceprint_library?:VoiceprintLibrary;resolved_audio_config?:ProviderConfig;warning?:string|null;error?:{code:string;stage:string;message:string;hint:string;upstream_status?:number|null}|null};
 export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:ProviderConfig};
-export type PodcastOptions={duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
+export type PodcastOptions={token_limit?:number;duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
 export type AuthStatus={required:boolean;authenticated:boolean};
 
 const jsonHeaders={'Content-Type':'application/json'};
@@ -38,7 +38,7 @@ function storedToken(){try{return localStorage.getItem('sread_token')}catch{retu
 function saveToken(token:string){try{localStorage.setItem('sread_token',token)}catch{/* The secure cookie remains the source of truth. */}}
 export function clearSession(){try{localStorage.removeItem('sread_token')}catch{/* Storage may be unavailable. */}}
 export async function authStatus(){const headers=new Headers();const token=storedToken();if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch('/auth/status',{headers});if(!response.ok)throw new Error('无法确认访问状态');return response.json() as Promise<AuthStatus>}
-export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));const detail=body.detail;const message=typeof detail==='string'?detail:detail?.message||detail?.inspection?.error?.message||body.error||'请求失败';throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
+export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(init?.method&&init.method!=='GET'&&(/^\/(providers|reviews)(\/|$)/.test(path)||/^\/notebooks\/[^/]+\/(chat|summary|quiz|flashcard|podcast)$/.test(path)))window.dispatchEvent(new Event('sread-usage-changed'));if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));const detail=body.detail;const message=typeof detail==='string'?detail:detail?.message||detail?.inspection?.error?.message||body.error||'请求失败';throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
 export async function login(access_key:string){const response=await fetch('/auth/login',{method:'POST',headers:jsonHeaders,body:JSON.stringify({access_key})});if(!response.ok)throw new Error('访问密钥错误');const result=await response.json();saveToken(result.token);return result}
 export const getNotebooks=()=>api<Notebook[]>('/notebooks');
 export const createNotebook=(title:string,description='')=>api<Notebook>('/notebooks',{method:'POST',headers:jsonHeaders,body:JSON.stringify({title,description})});
@@ -49,10 +49,10 @@ export const getStatus=()=>api<any>('/status');
 export const selectSource=(id:string,selected:boolean)=>api(`/sources/${id}/selection`,{method:'PATCH',headers:jsonHeaders,body:JSON.stringify({selected})});
 export const deleteSource=(id:string)=>api<void>(`/sources/${id}`,{method:'DELETE'});
 export async function upload(id:string,files:FileList|File[],imagePolicy?:ImageProcessingPolicy){const body=new FormData();Array.from(files).forEach(file=>body.append('files',file));if(imagePolicy)body.append('image_policy',JSON.stringify(imagePolicy));return api(`/notebooks/${id}/sources`,{method:'POST',body})}
-export const ask=(id:string,question:string,source_ids:string[],conversation_id?:string)=>api<any>(`/notebooks/${id}/chat`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,language:'auto'})});
+export const ask=(id:string,question:string,source_ids:string[],conversation_id?:string,token_limit?:number)=>api<any>(`/notebooks/${id}/chat`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,token_limit,language:'auto'})});
 export const getConversations=(id:string)=>api<any[]>(`/notebooks/${id}/conversations`);
 export const getMessages=(id:string)=>api<any[]>(`/conversations/${id}/messages`);
-export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions)=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options})});
+export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions|{token_limit?:number})=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options})});
 export const getArtifacts=(id:string)=>api<Artifact[]>(`/notebooks/${id}/artifacts?view=summary`);
 export const getArtifact=(id:string)=>api<Artifact>(`/artifacts/${id}`);
 export const getJobsPage=(params:Record<string,string|number|undefined>={})=>{const query=new URLSearchParams();Object.entries(params).forEach(([key,value])=>value!==undefined&&query.set(key,String(value)));return api<Page<Job>>(`/jobs?${query}`)};
@@ -88,3 +88,19 @@ export const updateProvider=(id:string,body:Record<string,any>)=>api(`/providers
 export const inspectProvider=(body:Omit<ProviderDraft,'name'>&{mode:'catalog'|'deep'})=>api<ProviderInspection>('/providers/inspect',{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
 export const testProvider=(id:string)=>api<any>(`/providers/${id}/test`,{method:'POST'});
 export const probeProvider=(id:string)=>api<any>(`/providers/${id}/probe`,{method:'POST'});
+
+export type Usage={recorded:boolean;complete:boolean;calls:number;unknown_calls:number;input_tokens:number;output_tokens:number;reasoning_tokens:number;cached_tokens:number;estimated_input_tokens:number;accounted_tokens:number;scope:string;stages:Record<string,{calls:number;input_tokens:number;output_tokens:number;unknown_calls:number}>;requests_truncated?:boolean;requests?:Array<{id:string;model:string;stage:string;state:string;requested_controls:Record<string,unknown>}>;media?:Array<{stage:string;model:string;state:string;submitted_chars:number;audio_seconds:number|null}>};
+export type TaskPreview={weekly_budget?:WeeklyOverview;kind:string;strategy:string;source_count:number;estimated_input_tokens:number;output_limit:number;calls_range:number[];token_limit:number|null;context_tokens:number;context_source:string;can_generate:boolean;notice:string};
+export type ReviewReport={id:string;created_at?:string;assessment:QualityAssessment;usage:Usage};
+export const previewTask=(notebookId:string,body:Record<string,unknown>,signal?:AbortSignal)=>api<TaskPreview>(`/notebooks/${notebookId}/task-preview`,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body),signal});
+export const notebookUsage=(notebookId:string)=>api<Usage>(`/notebooks/${notebookId}/usage`);
+export const recheck=(target_type:'artifact'|'message',target_id:string,token_limit?:number)=>api<ReviewReport>('/reviews',{method:'POST',headers:jsonHeaders,body:JSON.stringify({target_type,target_id,token_limit})});
+export const reviewHistory=(target_type:'artifact'|'message',target_id:string)=>api<ReviewReport[]>(`/reviews?${new URLSearchParams({target_type,target_id})}`);
+
+export type WeeklyLimit={tokens:number|null;calls:number|null;mode:'warn'|'block'};
+export type WeeklySettings={timezone:string;initialized?:boolean;global_limit:WeeklyLimit;providers:Record<string,WeeklyLimit>};
+export type WeeklyUsage={known_tokens:number;unconfirmed_tokens:number;occupied_tokens:number;unknown_calls:number;calls:number;remaining_tokens:number|null;remaining_calls:number|null;limit:WeeklyLimit|null};
+export type WeeklyOverview={has_active_work?:boolean;period_start:string;reset_at:string;timezone:string;global_usage:WeeklyUsage;providers:Array<WeeklyUsage&{id:string;name:string;kind:string}>;notice:string};
+export const getWeeklySettings=()=>api<WeeklySettings>('/settings/usage-budget');
+export const saveWeeklySettings=(body:WeeklySettings&{initialize_only?:boolean})=>api<WeeklySettings>('/settings/usage-budget',{method:'PUT',headers:jsonHeaders,body:JSON.stringify(body)});
+export const getWeeklyUsage=(signal?:AbortSignal)=>api<WeeklyOverview>('/usage/weekly',{signal});

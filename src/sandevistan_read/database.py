@@ -245,10 +245,50 @@ class Database:
         self._migrate_v4()
         self._migrate_v5()
         self._migrate_v6()
+        self._migrate_v7()
+        self._migrate_v8()
         with self.transaction() as connection:
             connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
                 WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
             connection.execute("UPDATE jobs SET stage_progress=progress WHERE stage_progress=0 AND progress>0")
+
+    def _migrate_v8(self) -> None:
+        with self.transaction() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS usage_events (
+                id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, provider_name TEXT NOT NULL,
+                kind TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL,
+                prompt_tokens INTEGER, completion_tokens INTEGER, accounted_tokens INTEGER NOT NULL)""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_week ON usage_events(created_at,provider_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_events(provider_id,created_at)")
+            connection.execute("""INSERT OR IGNORE INTO usage_events
+                SELECT c.id,COALESCE(c.provider_id,'__connection_test__'),COALESCE(p.name,c.model),COALESCE(p.kind,''),c.created_at,c.state,c.prompt_tokens,c.completion_tokens,c.accounted_tokens
+                FROM provider_calls c LEFT JOIN provider_profiles p ON p.id=c.provider_id""")
+            connection.execute("INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(8,?)", (utc_now(),))
+
+    def _migrate_v7(self) -> None:
+        with self.transaction() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS generation_runs (
+                id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL, job_id TEXT, target_id TEXT, state TEXT NOT NULL,
+                token_limit INTEGER, created_at TEXT NOT NULL, finished_at TEXT)""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_notebook ON generation_runs(notebook_id,target_id,job_id)")
+            connection.execute("""CREATE TABLE IF NOT EXISTS provider_calls (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+                provider_id TEXT, model TEXT NOT NULL, role TEXT NOT NULL, stage TEXT NOT NULL,
+                state TEXT NOT NULL, estimated_input_tokens INTEGER NOT NULL, output_limit INTEGER NOT NULL,
+                prompt_tokens INTEGER, completion_tokens INTEGER, reasoning_tokens INTEGER, cached_tokens INTEGER,
+                accounted_tokens INTEGER NOT NULL, controls_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, finished_at TEXT)""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_calls_run ON provider_calls(run_id)")
+            connection.execute("""CREATE TABLE IF NOT EXISTS review_reports (
+                id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL, run_id TEXT NOT NULL, report_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS media_calls (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+                stage TEXT NOT NULL, model TEXT NOT NULL, state TEXT NOT NULL,
+                submitted_chars INTEGER NOT NULL, audio_seconds REAL, created_at TEXT NOT NULL)""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_media_run ON media_calls(run_id)")
+            connection.execute("INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(7,?)", (utc_now(),))
 
     def _migrate_v2(self) -> None:
         """Add observable jobs and resumable cleanup. Safe to run on every start."""
@@ -562,6 +602,11 @@ class Database:
 
     def reset_running_jobs(self) -> None:
         now = utc_now()
+        with self.transaction() as connection:
+            connection.execute("UPDATE generation_runs SET state='interrupted',finished_at=? WHERE state='running'", (now,))
+            connection.execute("UPDATE provider_calls SET state='unknown' WHERE state='pending'")
+            connection.execute("UPDATE usage_events SET state='unknown' WHERE state='pending'")
+            connection.execute("UPDATE media_calls SET state='unknown' WHERE state='pending'")
         self.execute(
             "UPDATE jobs SET state='queued', stage='服务重启后恢复排队', stage_code='recovering', updated_at=? WHERE state IN ('running','cancelling')",
             (now,),

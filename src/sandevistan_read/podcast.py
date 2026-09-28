@@ -4133,6 +4133,8 @@ async def _audit_product_episode(turns, chapters, thesis, language, trace, claim
         _refresh_episode_review(audit, len(turns))
         return audit
     except Exception as exc:
+        from .delivery import audit_reason
+        audit_reason(exc)
         audit = {"passed": False, "scores": {}, "invalid_boundaries": [], "issues": ["连贯性审校未完成"],
                  "reviewed_indexes": [], "reviewed_transitions": [], "coverage_mode": "sampled",
                  "reason": "连贯性审校未完成：" + type(exc).__name__,

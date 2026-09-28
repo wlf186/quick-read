@@ -22,6 +22,8 @@ ffmpeg = ""
 libreoffice = ""
 
 [development]
+# Weekly token/call budgets are stored in application settings, editable from
+# the top-bar weekly usage panel; no TOML setting is required.
 # MAIN window/output overrides are stored in Provider settings, not this TOML.
 # Optional Provider config.reasoning_effort is passed to OpenAI-compatible MAIN
 # requests only when set; use values supported by that model (K3: low/high/max).

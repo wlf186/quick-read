@@ -193,19 +193,23 @@ class ContextPreviewRequest(BaseModel):
         return self
 
 
-class ChatRequest(BaseModel):
+class TaskBudget(BaseModel):
+    token_limit: int | None = Field(default=None, ge=1024, le=4194304, description="可选的本次模型用量上限；逐请求预留输入与最大输出，未知消耗不按零计算，不是货币账单承诺。")
+
+
+class ChatRequest(TaskBudget):
     question: str = Field(min_length=1, max_length=8000)
     conversation_id: str | None = Field(default=None, description="继续同一 Notebook 的对话；近期同资料修订范围的完整问答用于指代理解与检索，不作为事实证据。")
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
 
-class SummaryRequest(BaseModel):
+class SummaryRequest(TaskBudget):
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
 
-class QuizRequest(BaseModel):
+class QuizRequest(TaskBudget):
     source_ids: list[str] | None = None
     count: int = Field(default=10, ge=1, le=30, description="目标题数；保留结构可用的题目，不为质量偏差反复补写，实际数量及评级随产物返回。")
     difficulty: StudyDifficulty = "mixed"
@@ -213,7 +217,7 @@ class QuizRequest(BaseModel):
     custom_prompt: str = Field(default="", max_length=1000)
 
 
-class FlashcardRequest(BaseModel):
+class FlashcardRequest(TaskBudget):
     source_ids: list[str] | None = None
     count: int = Field(default=20, ge=1, le=50, description="目标卡数；保留可用卡片，数量不足或质量待核实会在结果中注明。")
     difficulty: StudyDifficulty = "mixed"
@@ -221,7 +225,7 @@ class FlashcardRequest(BaseModel):
     custom_prompt: str = Field(default="", max_length=1000)
 
 
-class PodcastRequest(BaseModel):
+class PodcastRequest(TaskBudget):
     source_ids: list[str] | None = None
     duration_mode: Literal["auto", "fixed"] = "auto"
     minutes: Literal[5, 10, 20, 30] | None = None
@@ -272,3 +276,38 @@ class FlashcardReview(BaseModel):
 
 class LoginRequest(BaseModel):
     access_key: str
+
+
+class TaskPreviewRequest(TaskBudget):
+    kind: Literal["chat", "summary", "quiz", "flashcard", "podcast"]
+    source_ids: list[str] | None = None
+    question: str = Field(default="", max_length=8000)
+    count: int = Field(default=10, ge=1, le=50)
+    minutes: int = Field(default=20, ge=5, le=30)
+
+
+class ReviewRequest(TaskBudget):
+    target_type: Literal["artifact", "message"]
+    target_id: str
+
+
+class WeeklyLimit(BaseModel):
+    tokens: int | None = Field(default=None, ge=1, le=9_000_000_000_000, strict=True)
+    calls: int | None = Field(default=None, ge=1, le=1_000_000_000, strict=True)
+    mode: Literal['warn', 'block'] = 'warn'
+
+
+class WeeklyBudgetSettings(BaseModel):
+    timezone: str = Field(default='UTC', max_length=100)
+    global_limit: WeeklyLimit = Field(default_factory=lambda: WeeklyLimit(tokens=1_000_000, calls=500))
+    providers: dict[str, WeeklyLimit] = Field(default_factory=dict)
+    initialize_only: bool = False
+
+    @model_validator(mode='after')
+    def valid_timezone(self):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError('请选择有效的 IANA 时区，例如 Asia/Shanghai') from exc
+        return self

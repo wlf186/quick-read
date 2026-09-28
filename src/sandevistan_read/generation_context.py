@@ -404,3 +404,37 @@ def adaptive_generation(kind: str) -> Callable:
                 CURRENT.reset(token)
         return wrapped
     return decorate
+
+
+def task_preview(db: Any, notebook_id: str, provider: dict[str, Any], *, kind: str,
+                 source_ids: list[str], question: str = "", count: int = 10,
+                 minutes: int = 20, token_limit: int | None = None) -> dict[str, Any]:
+    """Local estimate from execution's material rules, planner and batch sizing."""
+    import math
+    import re
+    from .context_budget import context_strategy, study_batch_size, estimate_text_tokens
+    from .providers import study_generation_profile
+    marks = ','.join('?' for _ in source_ids)
+    rows = db.fetchall(f"SELECT c.*,s.filename FROM chunks c JOIN sources s ON s.id=c.source_id WHERE s.notebook_id=? AND s.id IN ({marks}) AND s.state='ready' ORDER BY s.created_at,c.ordinal", (notebook_id, *source_ids)) if source_ids else []
+    eligible, costs = context_material(kind, rows)
+    limits = TokenLimits.from_provider(provider)
+    plan = plan_context(limits, kind, material_tokens=sum(costs), segment_tokens=max(1, math.ceil(sum(costs) / max(1, len(costs)))), count=count, minutes=minutes, source_count=max(1, len(source_ids)), broad_query=bool(re.search(r"每份|各份|所有|对比|比较|\b(each|all|across|compare)\b", question, re.I)))
+    strategy = context_strategy(provider, kind)
+    batches = plan.preparation_batches if strategy == "balanced" else 0
+    if kind in {"quiz", "flashcard"}:
+        tier = study_generation_profile(provider)["tier"]
+        size = study_batch_size(kind, count, tier, limits.max_output_tokens, plan.output_items if strategy == "balanced" else None)
+        calls = math.ceil(count / size) + batches + 1
+    elif kind == "podcast":
+        calls = batches + 3 + max(1, plan.podcast_chapters)
+    else:
+        calls = batches + 2
+    estimated = min(sum(costs), plan.evidence_tokens) + estimate_text_tokens(question) + 512
+    ceiling = plan.total_token_limit if strategy == "balanced" else 300_000 if kind in {"summary", "quiz", "flashcard"} else None
+    return {"kind": kind, "strategy": strategy, "source_count": len(source_ids), "candidate_segments": len(eligible),
+            "estimated_input_tokens": estimated, "output_limit": limits.max_output_tokens,
+            "calls_range": [max(1, calls - 1) if kind == "podcast" else calls, calls + 1],
+            "token_limit": min(ceiling, token_limit) if ceiling and token_limit else token_limit or ceiling,
+            "context_tokens": limits.effective_context_tokens, "context_source": limits.context_source,
+            "can_generate": bool(eligible and provider),
+            "notice": "本地容量估算，不是账单；选材、实际输出、审校和一次技术恢复会影响用量。每次调用可能重复发送原文。"}

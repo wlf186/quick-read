@@ -367,6 +367,8 @@ async def _audit_candidates(
         if not salvaged:
             raise ValueError("审校没有返回完整的 accepted_indexes")
         indexes = [int(value) for value in salvaged if str(value).isdigit() and 0 <= int(value) < len(candidates)]
+        from .delivery import audit_reason
+        audit_reason("output_truncated")
         return list(dict.fromkeys(indexes)), []
     if not isinstance(parsed.get("accepted_indexes"), list):
         raise ValueError("审校缺少 accepted_indexes 数组")
@@ -462,11 +464,9 @@ async def generate_study_artifact(
     accepted: list[dict[str, Any]] = []
     rejected: Counter[str] = Counter()
     provisional_target = count
-    batch_size = 1 if tier == "lite" else math.ceil(provisional_target / 2) if kind == "flashcard" else 3
+    from .context_budget import study_batch_size
     output_limit = TokenLimits.from_provider(provider).max_output_tokens
-    batch_size = min(batch_size, max(1, (output_limit - 512) // (900 if kind == "quiz" else 500)))
-    if current() and tier == "full":
-        batch_size = min(6 if kind == "quiz" else 10, current().plan.output_items)
+    batch_size = study_batch_size(kind, provisional_target, tier, output_limit, current().plan.output_items if current() else None)
     max_candidate_rounds = math.ceil(count / batch_size)
     trace.request_limit = max_candidate_rounds + 2
     if not current():
@@ -555,14 +555,18 @@ async def generate_study_artifact(
         try:
             audit_rounds = 1
             indexes, audit_issues = await _audit_candidates(kind, [accepted[i] for i in sample_indexes], evidence_by_label, trace)
-            reviewed = len(sample_indexes)
+            from .delivery import CURRENT as DELIVERY
+            incomplete = bool(DELIVERY.get() and DELIVERY.get().audit_reason == "output_truncated")
+            reviewed = len(indexes) if incomplete else len(sample_indexes)
             supported = len(indexes)
             for local_index, original in enumerate(sample_indexes):
-                if local_index not in indexes:
+                if local_index not in indexes and not incomplete:
                     issue = {"unit": f"{'q' if kind == 'quiz' else 'c'}{original + 1}", "code": "audit_unconfirmed", "severity": "suspect", "message": "自动审校未确认该项目，请核对原文。"}
                     quality_issues.append(issue)
                     accepted[original].setdefault("quality_issues", []).append(issue)
-        except Exception:
+        except Exception as exc:
+            from .delivery import audit_reason
+            audit_reason(exc)
             audit_fallback = True
     quality_assessment = assessment(len(accepted), reviewed, quality_issues, method="model_sample", supported=supported)
     accepted = accepted[:count]

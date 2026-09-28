@@ -806,6 +806,26 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
 
 
 async def execute(job: dict[str, Any]) -> Any:
+    from .usage import running, attach, summarize
+    payload = json_load(job["payload_json"], {})
+    with running(DB, job["notebook_id"], job["kind"], job_id=job["id"], target_id=payload.get("source_id"), token_limit=payload.get("token_limit")) as run:
+        result = await _execute(job)
+        if isinstance(result, dict) and result.get("id"):
+            attach(run, result["id"])
+    if isinstance(result, dict):
+        result["usage"] = summarize(DB, run_id=run.id)
+        if run.quota_denial:
+            result["quota_denial"] = run.quota_denial
+            artifact = DB.fetchone("SELECT payload_json FROM artifacts WHERE id=?", (result.get("id"),))
+            if artifact:
+                content = json_load(artifact["payload_json"], {})
+                content["quota_denial"] = run.quota_denial
+                content.setdefault("warnings", []).append({**run.quota_denial, "stage": "budget"})
+                DB.execute("UPDATE artifacts SET payload_json=? WHERE id=?", (json_dump(content), result["id"]))
+    return result
+
+
+async def _execute(job: dict[str, Any]) -> Any:
     payload = json_load(job["payload_json"], {})
     if job["kind"] == "ingest":
         reporter = Reporter(job["id"])

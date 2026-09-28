@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 from playwright.sync_api import Browser, Page, expect, sync_playwright
 
-BASE_URL = "http://127.0.0.1:20830"
+BASE_URL = os.environ.get("SREAD_BROWSER_BASE_URL", "http://127.0.0.1:20830")
 
 
 class Fixture:
@@ -27,6 +29,7 @@ class Fixture:
         self.job_state = "queued"
         self.artifact = None
         self.messages = None
+        self.budget_settings = {"timezone":"UTC", "initialized":True, "global_limit":{"tokens":1000000,"calls":500,"mode":"warn"}, "providers":{}}
         self.provider = None
         self.qualified_summary = False
         page.on("pageerror", lambda error: self.errors.append(str(error)))
@@ -51,10 +54,20 @@ class Fixture:
                "state": self.job_state, "stage": "已取消" if self.job_state == "cancelled" else "等待执行", "stage_code": self.job_state,
                "progress": 1 if self.job_state == "cancelled" else 0, "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
                "eta": {"status": "learning", "sample_count": 0, "queue_position": 1}}
-        if path.endswith("/chat"):
+        if path == "/settings/usage-budget":
+            if request.method == "PUT":
+                self.budget_settings = body
+            result = self.budget_settings
+        elif path == "/usage/weekly":
+            limit = self.budget_settings["global_limit"]
+            now = datetime.now(UTC)
+            start = (now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0)
+            result = {"period_start":start.isoformat(), "reset_at":(start+timedelta(days=7)).isoformat(), "timezone":self.budget_settings["timezone"],
+                      "global_usage":{"known_tokens":320000,"unconfirmed_tokens":80000,"occupied_tokens":400000,"unknown_calls":2,"calls":126,"limit":limit,"remaining_tokens":max(0,(limit["tokens"] or 0)-400000),"remaining_calls":max(0,(limit["calls"] or 0)-126)},"providers":[],"notice":"测试统计：仅本应用，语音另计。"}
+        elif path.endswith("/chat"):
             self.pending.append(route)
             return
-        if path == "/notebooks":
+        elif path == "/notebooks":
             result = notebooks
         elif path == "/providers":
             result = [self.provider] if self.provider else []
@@ -62,6 +75,8 @@ class Fixture:
             result = []
         elif path == "/providers/inspect":
             result = {"status":"passed","connection_ok":True,"models":[],"capabilities":{},"latency_ms":1,"activation_eligible":True}
+        elif path.endswith("/task-preview"):
+            result = {"kind":body["kind"],"strategy":"conservative","source_count":len(body.get("source_ids", [])),"estimated_input_tokens":2000,"output_limit":4096,"calls_range":[2,3],"token_limit":body.get("token_limit") or 300000,"context_tokens":32768,"context_source":"provider_metadata","can_generate":True,"notice":"本地估算，不调用模型。"}
         elif path == "/providers/context-preview":
             from sandevistan_read.context_budget import TokenLimits, plan_context
             limits=TokenLimits.from_provider({"config":body["config"]})
@@ -162,8 +177,8 @@ def run_core_regressions(browser: Browser):
         expect(page.locator(".thinking")).not_to_be_visible()
         expect(page.locator(".messages")).not_to_contain_text("OLD ANSWER A")
         send(page, fixture, "question B")
-        assert fixture.requests[-1][1] == "/notebooks/b/chat"
-        assert fixture.requests[-1][2].get("conversation_id") is None
+        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][1] == "/notebooks/b/chat"
+        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2].get("conversation_id") is None
         fixture.reply(1, "Correct answer B", "conversation-b")
         expect(page.locator(".messages")).to_contain_text("Correct answer B")
         page.screenshot(path=f"/tmp/quick-read-chat-fixed-{width}.png")
@@ -185,7 +200,7 @@ def run_core_regressions(browser: Browser):
         send(page, fixture, "discarded conversation")
         page.get_by_role("button", name="新对话", exact=True).click()
         send(page, fixture, "fresh conversation")
-        assert fixture.requests[-1][2].get("conversation_id") is None
+        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2].get("conversation_id") is None
         fixture.reply(4, "DISCARDED RESPONSE", "discarded")
         settle(page)
         expect(page.locator(".thinking")).to_be_visible()
@@ -193,7 +208,7 @@ def run_core_regressions(browser: Browser):
         fixture.reply(5, "Fresh response", "fresh")
         expect(page.locator(".messages")).to_contain_text("Fresh response")
         send(page, fixture, "follow up")
-        assert fixture.requests[-1][2]["conversation_id"] == "fresh"
+        assert [request for request in fixture.requests if request[1].endswith("/chat")][-1][2]["conversation_id"] == "fresh"
         fixture.reply(6, "Follow up response", "fresh")
         expect(page.locator(".messages")).to_contain_text("Follow up response")
 
@@ -242,7 +257,7 @@ def run_core_regressions(browser: Browser):
 
         # The drawer must accept the server's smaller queue and its completed state.
         if width < 600:
-            page.locator(".workspace-tabs button").filter(has_text="Studio").click()
+            page.locator(".workspace-tabs button").filter(has_text="学习与输出").click()
         page.locator(".artifact").filter(has_text="闪卡组").click()
         drawer = page.get_by_role("dialog", name="闪卡组")
         expect(drawer.locator(".flash-card")).to_contain_text("f1")
@@ -302,7 +317,7 @@ def run_generation_regressions(browser: Browser) -> None:
         expect(page.get_by_label("向已选资料提问")).to_be_enabled()
         expect(page.locator(".messages").get_by_label("生成结果说明")).to_contain_text("公式提取不完整，请核对原文件")
         if width < 600:
-            page.locator(".workspace-tabs button").filter(has_text="Studio").click()
+            page.locator(".workspace-tabs button").filter(has_text="学习与输出").click()
         page.locator(".artifact").filter(has_text="降级播客").click()
         drawer = page.get_by_role("dialog", name="降级播客")
         expect(drawer.get_by_label("生成结果说明")).to_contain_text("目标 5 分钟，实际 4 分钟")
@@ -334,6 +349,7 @@ def run_context_regressions(browser: Browser) -> None:
         page.get_by_role('button',name='设置',exact=True).click()
         page.get_by_role('button',name='管理 MAIN',exact=True).click()
         page.get_by_role('button',name='编辑',exact=True).click()
+        page.get_by_text('高级参数与容量说明',exact=True).click()
         panel=page.get_by_label('上下文容量预估')
         expect(panel.locator('tbody tr')).to_have_count(5)
         expect(panel).to_contain_text('分批选材后综合')
@@ -396,7 +412,7 @@ def run_summary_coverage_regressions(browser: Browser) -> None:
                                                         'context_usage': {'coverage': coverage}}}
         page.goto(BASE_URL)
         if width < 600:
-            page.locator('.workspace-tabs button').filter(has_text='Studio').click()
+            page.locator('.workspace-tabs button').filter(has_text='学习与输出').click()
         page.locator('.artifact').filter(has_text='核验摘要').click()
         drawer = page.get_by_role('dialog', name='核验摘要')
         drawer.locator('.coverage-details > summary').click()
@@ -466,15 +482,15 @@ def run_delivery_regressions(browser: Browser) -> None:
             fixture.artifact["payload"].update(generation_mode="expanded" if review_status=="complete" else "complete_short", narrative_status="complete" if review_status=="complete" else "incomplete" if review_status=="partial" else "unverified")
             fixture.artifact['payload']['quality_report'] = {'episode_audit': {'status':review_status,'coverage_mode':'sampled' if review_status!='complete' else 'full','checked_transitions':2 if review_status=='complete' else 1 if review_status=='partial' else 0,'total_transitions':2,'reviewed_transitions':[]}}
         page.goto(BASE_URL)
-        rating = page.locator('.messages details').filter(has_text='质量：待核实')
+        rating = page.locator('.messages details').filter(has_text='已生成 · 已核对 1/2 项')
         rating.locator('summary').focus()
         page.keyboard.press('Enter')
-        expect(rating).to_contain_text('自动检查 1 / 2 项')
+        expect(rating).to_contain_text('有效原文核查结论 1 / 2 项')
         if width < 600:
-            page.locator('.workspace-tabs button').filter(has_text='Studio').click()
+            page.locator('.workspace-tabs button').filter(has_text='学习与输出').click()
         page.locator('.artifact').filter(has_text='仅脚本示例').click()
         drawer = page.get_by_role('dialog', name='仅脚本示例')
-        expect(drawer).to_contain_text('质量：待核实 · 仅脚本')
+        expect(drawer).to_contain_text('仅脚本 · 已核对 1/2 项')
         expect(drawer.locator('audio')).to_have_count(0)
         expect(drawer.get_by_label('播客连贯性检查')).to_contain_text({'complete':'连贯性检查已完成','partial':'连贯性已部分检查'}.get(review_status,'连贯性未验证'))
         if review_status:
@@ -488,3 +504,135 @@ def run_delivery_regressions(browser: Browser) -> None:
         expect(drawer).not_to_be_visible()
         assert not fixture.errors and not fixture.console_errors
         context.close()
+
+
+def run_experience_regressions(browser: Browser) -> None:
+    """New-reader flows with synthetic records; never contact a provider."""
+    for width in (1440, 390):
+        context = browser.new_context(viewport={'width':width, 'height':900}, reduced_motion='reduce')
+        page = context.new_page(); fixture = Fixture(page)
+        fixture.provider = {'id':'main','name':'示例文字模型','role':'main','kind':'ollama','base_url':'http://example.invalid','model':'fixture','active':True,'selected':True,'config':{},'capabilities':{'parameter_controls':{'thinking':{'editable':False}}}}
+        metered = {'recorded':True,'complete':False,'calls':2,'unknown_calls':1,'input_tokens':1000,'output_tokens':200,'reasoning_tokens':100,'cached_tokens':300,'estimated_input_tokens':900,'accounted_tokens':3000,'stages':{'generation':{'calls':1,'input_tokens':1000,'output_tokens':200,'unknown_calls':0}},'scope':'测试计量','requests':[]}
+        fixture.messages = [{'id':'answer','role':'assistant','content':'例子的结论。','metadata':{'usage':metered,'quality_assessment':{'level':'unrated','review_status':'unavailable','reason_code':'budget_exhausted','reason':'本次用量不足，未完成原文核查。','reviewed_units':0,'total_units':6,'supported_units':0,'issues':[]},'delivery_status':'full'}}]
+        changes = []
+        def policy(route):
+            result = json.loads(route.request.post_data) if route.request.method == 'PUT' else {'mode':'off','processors':['vlm','main','ocr']}
+            if route.request.method == 'PUT':
+                changes.append(result)
+            route.fulfill(json=result)
+        page.route('**/api/settings/image-processing', policy)
+        page.goto(BASE_URL, wait_until='networkidle')
+        assert page.title() == 'Sandevistan-Read'
+        expect(page.locator('.messages')).to_contain_text('尚未完成原文核查（0/6）')
+        quality = page.locator('.messages .generation-warnings').first
+        quality.locator('summary').focus();page.keyboard.press('Enter')
+        expect(quality).to_contain_text('本次用量不足')
+        costs = page.locator('.messages .usage-details').first
+        costs.locator(':scope > summary').click()
+        expect(costs).to_contain_text('1,200 tokens（已知部分）')
+        expect(costs).to_contain_text('1 次请求未返回完整计量')
+        page.screenshot(path=f'/tmp/quick-read-experience-result-{width}.png')
+        estimate = page.locator('.composer .task-estimate')
+        estimate.locator('summary').click()
+        expect(estimate).to_contain_text('约 2–3 次调用')
+        estimate.get_by_label('本次模型用量上限', exact=True).fill('2048')
+        page.wait_for_timeout(550)
+        assert any(path.endswith('/task-preview') and body.get('token_limit') == 2048 for _,path,body in fixture.requests)
+        estimate.locator('summary').click()
+        # Static example: no API calls for answers or review.
+        if not page.get_by_text('体验示例（不消耗 token）', exact=True).is_visible():
+            page.locator('.getting-started > summary').click()
+        before = len(fixture.requests)
+        page.get_by_text('体验示例（不消耗 token）', exact=True).click()
+        demo = page.get_by_role('dialog', name='使用示例')
+        demo.get_by_role('button', name='[S1] 查看原文').click()
+        expect(demo.locator('blockquote')).to_contain_text('光照时间不同')
+        demo.get_by_role('button', name='A. A 组肥料一定更好').click()
+        expect(demo.get_by_role('status')).to_contain_text('这次答错了')
+        demo.get_by_role('button', name='重新练习').click()
+        assert demo.get_by_role('button',name='B. A 组的发芽比例较高').is_enabled()
+        assert len(fixture.requests) == before
+        page.keyboard.press('Escape')
+        page.get_by_role('button', name='设置', exact=True).click()
+        settings = page.get_by_role('dialog', name='Provider 配置')
+        assert settings.evaluate('el=>el.contains(document.activeElement)')
+        settings.get_by_role('button',name='资料导入',exact=True).click()
+        expect(settings.locator('.image-policy-card')).to_contain_text('将跳过：未配置或已暂停')
+        settings.get_by_role('button', name='下移 VLM', exact=True).click()
+        page.wait_for_function("document.querySelector('.image-policy-order b').textContent === 'MAIN'")
+        assert changes[-1]['mode'] == 'off'
+        assert not settings.locator('.image-policy-card input').is_checked()
+        page.screenshot(path=f'/tmp/quick-read-experience-import-{width}.png')
+        settings.get_by_role('button',name='文字模型',exact=True).click()
+        settings.get_by_role('button',name='管理 MAIN',exact=True).click()
+        settings.get_by_role('button',name='编辑',exact=True).click()
+        assert not settings.get_by_label('Temperature 覆盖').is_visible()
+        settings.get_by_text('高级参数与容量说明',exact=True).click()
+        assert settings.get_by_label('思考模式').is_disabled()
+        expect(settings).to_contain_text('固定请求关闭思考')
+        page.keyboard.press('Escape')
+        if width == 390:
+            page.get_by_role('button',name='资料 1',exact=True).click()
+        page.locator('.upload-zone input').set_input_files({'name':'example.pdf','mimeType':'application/pdf','buffer':b'example'})
+        upload=page.get_by_role('dialog',name='确认上传')
+        expect(upload).to_contain_text('已继承默认图片处理方式')
+        assert not upload.get_by_role('checkbox',name='处理资料中的图片').is_visible()
+        upload.get_by_role('button',name='仅修改本次').click()
+        assert not upload.get_by_role('checkbox',name='处理资料中的图片').is_checked()
+        upload.get_by_role('checkbox',name='处理资料中的图片').check()
+        page.keyboard.press('Escape')
+        assert len(changes) == 1, 'A one-off upload override changed global settings'
+        assert not any(method=='POST' and path.endswith('/sources') for method,path,_ in fixture.requests)
+        assert_layout(page)
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+    print('New-reader experience regressions passed')
+
+
+def run_weekly_budget_regressions(browser):
+    for width in (1440,390):
+        context=browser.new_context(viewport={"width":width,"height":900},reduced_motion="reduce")
+        page=context.new_page()
+        fixture=Fixture(page)
+        fixture.provider={"id":"main","name":"Local","role":"main","kind":"ollama","model":"fixture","active":True,"base_url":"http://127.0.0.1:11434","config":{},"capabilities":{}}
+        page.goto(BASE_URL)
+        entry=page.get_by_role("button",name="本周用量与额度",exact=True)
+        expect(entry).to_be_visible()
+        expect(entry).to_contain_text("320,000")
+        expect(entry.get_by_role("progressbar",name="本周 token 额度")).to_have_attribute("aria-valuenow","40")
+        entry.click()
+        dialog=page.get_by_role("dialog",name="用量与额度")
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text("80,000")
+        field=dialog.get_by_role("group",name="所有资料库总额度")
+        field.get_by_label("每周 token 额度",exact=True).fill("500000")
+        dialog.get_by_role("button",name="保存额度设置").click()
+        expect(dialog).to_contain_text("已使用至少 80%")
+        field.get_by_label("每周 token 额度",exact=True).fill("400000")
+        field.get_by_label("额度不足时").select_option("block")
+        dialog.get_by_role("button",name="保存额度设置").click()
+        expect(dialog).to_contain_text("已达到或超过额度")
+        expect(dialog).to_contain_text("不足时停止新请求")
+        assert fixture.budget_settings["global_limit"]["tokens"]==400000
+        dialog.evaluate("el => el.scrollTop = 0")
+        page.screenshot(path=f"/tmp/quick-read-weekly-{width}.png")
+        field.get_by_label("每周 token 额度",exact=True).fill("")
+        dialog.get_by_role("button",name="保存额度设置").click()
+        expect(dialog).to_contain_text("未设置此项额度")
+        dialog.get_by_text("单独配置 Provider 额度（可选）",exact=True).click()
+        dialog.get_by_role("checkbox",name="Local · 本地运行").check()
+        local=dialog.get_by_role("group",name="Local",exact=True)
+        local.get_by_label("每周 token 额度",exact=True).fill("1000")
+        dialog.get_by_role("button",name="保存额度设置").click()
+        expect(dialog.get_by_role("status")).to_contain_text("额度设置已保存")
+        assert fixture.budget_settings["providers"]["main"]["tokens"]==1000
+        field.get_by_label("每周文字/视觉调用次数").fill("0")
+        expect(dialog.get_by_role("button",name="保存额度设置")).to_be_disabled()
+        page.keyboard.press("Escape")
+        expect(dialog).to_have_count(0)
+        expect(entry).to_be_focused()
+        page.screenshot(path=f"/tmp/quick-read-weekly-entry-{width}.png")
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+    print("Weekly budget desktop/mobile checks passed")
