@@ -240,11 +240,13 @@ export default function App(){
   if(phase==='locked')return <LoginScreen error={loginError} onLogin={async key=>{try{await login(key);setLoginError('');await initialize()}catch(error){const message=error instanceof Error?error.message:'认证失败';setLoginError(message);throw error}}}/>;
 
   const studio=<StudioRail notebookId={notebook?.id} hasNotebook={Boolean(notebook)} selectedCount={selected.length} podcastUnavailableReason={podcastUnavailableReason} onCreate={onCreate} onOpen={summary=>void openArtifact(summary)} onConfigureAudio={openAudioSettings} artifacts={artifacts} jobs={jobs}/>;
+  const guide=<GettingStarted hasModel={Boolean(mainProvider)} hasNotebook={Boolean(notebook)} sourceCount={selected.length} hasResult={artifacts.length>0||messages.some(message=>message.role==='assistant')} onSettings={()=>{setSettingsPanel('models');setSettings(true)}} onCreate={()=>{location.hash='notebooks'}} onImport={()=>{setWorkspacePanel('sources');requestAnimationFrame(()=>document.querySelector<HTMLInputElement>('.upload-zone input')?.click())}} onTry={()=>{setWorkspacePanel('chat');setQuestion('请提炼核心结论与适用限制，并给出原文引用。')}}/>;
+  const hasResult=artifacts.length>0||messages.some(message=>message.role==='assistant');
   return <div className={`shell route-${route}`}>
     <Header route={route} notebook={notebook} notebooks={notebooks} status={status} onSelect={activateNotebook} onCreate={onCreateNotebook} onSettings={()=>{setSettingsPanel('models');setSettings(true)}}/>
     <WeeklyBudget providers={providers} running={busy||jobs.some(job=>['running','queued','cancelling'].includes(job.state))} revision={`${messages.length}:${jobs.map(job=>`${job.id}:${job.state}`).join(',')}:${providers.length}`}/>
     {route==='jobs'?<JobsPage onOpenChat={(conversationId,messageId)=>setOpenedChat({conversationId,messageId})} onError={reportError} onOpenArtifact={id=>void getArtifact(id).then(setOpenedArtifact).catch(reportError)}/>:route==='notebooks'?<NotebooksPage onError={reportError} onNotify={notify} onChanged={refreshNotebooks} onOpen={id=>{activateNotebook(id);location.hash='workspace'}}/>:<section className="workspace-shell">
-      <GettingStarted hasModel={Boolean(mainProvider)} hasNotebook={Boolean(notebook)} sourceCount={selected.length} hasResult={artifacts.length>0||messages.some(message=>message.role==='assistant')} onSettings={()=>{setSettingsPanel('models');setSettings(true)}} onCreate={()=>{location.hash='notebooks'}} onImport={()=>{setWorkspacePanel('sources');requestAnimationFrame(()=>document.querySelector<HTMLInputElement>('.upload-zone input')?.click())}} onTry={()=>{setWorkspacePanel('chat');setQuestion('请提炼核心结论与适用限制，并给出原文引用。')}}/>
+
       <nav className="workspace-tabs" aria-label="工作区面板">
         <button className={workspacePanel==='chat'?'active':''} aria-pressed={workspacePanel==='chat'} onClick={()=>setWorkspacePanel('chat')}><MessageSquare/>对话</button>
         <button className={workspacePanel==='sources'?'active':''} aria-pressed={workspacePanel==='sources'} onClick={()=>setWorkspacePanel('sources')}><BookOpen/>资料 <b>{selected.length}</b></button>
@@ -252,7 +254,7 @@ export default function App(){
       </nav>
       <div className={`workspace workspace-panel-${workspacePanel}`}>
         <SourceRail providers={providers} hasNotebook={Boolean(notebook)} sources={notebook?.sources||[]} imagePolicy={imagePolicy} onUpload={onUpload} onToggle={onToggle} onDelete={onDeleteSource} onNotify={notify}/>
-        <ChatPanel notebookId={notebook?.id} sourceIds={selected} tokenLimit={chatTokenLimit} onTokenLimit={setChatTokenLimit} hasNotebook={Boolean(notebook)} selectedCount={selected.length} messages={messages} question={question} setQuestion={setQuestion} onAsk={onAsk} busy={busy} loading={chatLoading} onCitation={setCitation} onNewConversation={newConversation} onOpenStudio={()=>setTabletStudio(true)}/>
+        <ChatPanel guide={guide} showOnboarding={!hasResult&&!messages.length} setupRequired={!mainProvider||!notebook||!selected.length} notebookId={notebook?.id} sourceIds={selected} tokenLimit={chatTokenLimit} onTokenLimit={setChatTokenLimit} hasNotebook={Boolean(notebook)} selectedCount={selected.length} messages={messages} question={question} setQuestion={setQuestion} onAsk={onAsk} busy={busy} loading={chatLoading} onCitation={setCitation} onNewConversation={newConversation} onOpenStudio={()=>setTabletStudio(true)}/>
         {studio}
       </div>
     </section>}
@@ -264,7 +266,7 @@ export default function App(){
     {settings?<SettingsDrawer initialPanel={settingsPanel} status={status} providers={providers} roles={providerRoles} imagePolicy={imagePolicy} notebookId={notebook?.id} sourceIds={selected} onClose={()=>setSettings(false)} onSave={saveProvider} onCreate={addProvider} onInspect={inspectConfiguration} onSaveRole={saveRole} onSaveImagePolicy={saveImagePolicy}/>:null}
     {podcastOpen?<PodcastCreateModal notebookId={notebook?.id} sourceIds={selected} provider={audioProvider} unavailableReason={podcastUnavailableReason||undefined} sourceCount={selected.length} onClose={()=>setPodcastOpen(false)} onCreate={onCreatePodcast}/>:null}
     {studyCreate?<StudyCreateModal notebookId={notebook?.id} sourceIds={selected} kind={studyCreate} provider={mainProvider} sourceCount={selected.length} onClose={()=>setStudyCreate(null)} onCreate={onCreateStudy}/>:null}
-    {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}><button className="drawer-close" data-autofocus onClick={()=>setTabletStudio(false)}>关闭 ×</button>{studio}</Overlay>:null}
+    {tabletStudio?<Overlay className="tablet-studio-drawer" label="Studio" onClose={()=>setTabletStudio(false)}>{studio}</Overlay>:null}
     {toast?<div className={`toast toast-${toast.tone}`} role={toast.tone==='error'?'alert':'status'}><span>{toast.message}</span><button aria-label="关闭提示" onClick={()=>setToast(undefined)}>×</button></div>:null}
   </div>;
 }

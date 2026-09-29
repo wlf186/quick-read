@@ -260,3 +260,8 @@ PDF 慢时检查资料元数据中的 `ingest_timings`：原生解析、预览�
 ### v0.4.12 每周额度升级
 
 同步更新前后端和锁文件，执行正常依赖安装以包含 `tzdata`（Windows IANA 时区支持），重建前端后重启后端。数据库自动增量迁移至 v8，保留已有计量；无需编辑 config.toml。每周额度默认只提醒，整个实例共用，可从顶部「本周用量」修改。升级前备份数据库。
+
+
+### 阅读界面精修更新
+
+本次为前端更新，无新增数据库迁移、后端 API 或配置项。同步 `frontend/package.json` 与 `frontend/pnpm-lock.yaml` 后，在 `frontend` 目录运行 `corepack pnpm install --frozen-lockfile`、`corepack pnpm lint` 和 `corepack pnpm build`，再刷新页面；依赖包含锁定版本的 `react-markdown` 与 `remark-gfm`。原始资料、学习进度和已有生成结果无需重建。回退时同时恢复对应的前端代码、依赖锁文件与构建产物，不回退运行数据库。新入口及键盘行为见 [使用与用量指南](user-experience.md#阅读界面精修)。

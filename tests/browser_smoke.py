@@ -5,7 +5,7 @@ import re
 import tomllib
 
 from playwright.sync_api import Page, sync_playwright
-from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions, run_ui_usability_regressions, run_quality_flow_regressions
+from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions, run_ui_usability_regressions, run_quality_flow_regressions, run_visual_refinement_regressions
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +46,7 @@ def main() -> None:
     console_errors: list[str] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
+        run_visual_refinement_regressions(browser)
         run_core_regressions(browser)
         run_generation_regressions(browser)
         run_context_regressions(browser)
@@ -280,7 +281,7 @@ def main() -> None:
         page.keyboard.press("Escape")
         assert settings.count() == 0
 
-        page.locator(".studio-cards button").filter(has_text="Quiz 题库").click()
+        page.locator(".studio-cards button").filter(has_text="测验题库").click()
         study_create = page.get_by_role("dialog", name="生成理解型 Quiz")
         assert study_create.is_visible()
         assert study_create.get_by_label("数量").is_visible()
@@ -290,10 +291,11 @@ def main() -> None:
         page.keyboard.press("Escape")
         assert study_create.count() == 0
 
-        page.locator(".studio-cards button").filter(has_text="双人Podcast").click()
+        page.locator(".studio-cards button").filter(has_text="双人播客").click()
         podcast_create = page.get_by_role("dialog", name="生成双人深度播客")
         assert podcast_create.is_visible()
         assert podcast_create.get_by_text("PODCAST V4 // EDITORIAL ACTS", exact=True).is_visible()
+        podcast_create.locator(".generation-service-details > summary").click()
         assert podcast_create.get_by_text(re.compile("成品再由本地 ASR 验收")).is_visible()
         assert page.get_by_label("目标时长").is_visible()
         page.screenshot(path="/tmp/sandevistan-read-podcast-v4-desktop.png")
@@ -344,15 +346,16 @@ def main() -> None:
         authenticate(guard_page)
         select_qa_notebook(guard_page)
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
-        guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人Podcast")
+        guarded_podcast = guard_page.locator(".studio-cards button").filter(has_text="双人播客")
         assert guarded_podcast.is_enabled()
-        assert guard_page.get_by_text("音频服务离线 · 双人Podcast将仅生成文本", exact=True).is_visible()
+        assert guard_page.get_by_text("音频服务离线 · 双人播客将仅生成文本", exact=True).is_visible()
         guard_page.get_by_text("播客语音（可选）", exact=True).click()
         assert guard_page.get_by_text("请先配置并启用 AUDIO Provider", exact=True).is_visible()
-        assert guard_page.locator(".studio-cards button").filter(has_text="Quiz 题库").is_enabled()
+        assert guard_page.locator(".studio-cards button").filter(has_text="测验题库").is_enabled()
         guarded_podcast.click()
         degraded_dialog = guard_page.get_by_role("dialog", name="生成双人深度播客")
         assert degraded_dialog.is_visible()
+        degraded_dialog.locator(".generation-service-details > summary").click()
         assert degraded_dialog.get_by_text(re.compile("仍可生成双人对话脚本")).is_visible()
         assert degraded_dialog.get_by_role("button", name="仅生成对话脚本").is_enabled()
         guard_page.screenshot(path="/tmp/sandevistan-read-podcast-script-only-desktop.png")
@@ -367,16 +370,16 @@ def main() -> None:
         guard_page.reload(wait_until="domcontentloaded")
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
         guard_page.get_by_text("所选 ASR 设备不可用", exact=True).wait_for()
-        assert guard_page.locator(".studio-cards button").filter(has_text="双人Podcast").is_enabled()
+        assert guard_page.locator(".studio-cards button").filter(has_text="双人播客").is_enabled()
         guard_page.screenshot(path="/tmp/sandevistan-read-podcast-unhealthy-desktop.png")
 
         audio_guard["mode"] = "ready"
         guard_page.reload(wait_until="domcontentloaded")
         guard_page.wait_for_function("document.querySelectorAll('.source-row').length === 4")
         guard_page.wait_for_function(
-            "!Array.from(document.querySelectorAll('.studio-cards button')).find(button => button.textContent.includes('双人Podcast')).disabled"
+            "!Array.from(document.querySelectorAll('.studio-cards button')).find(button => button.textContent.includes('双人播客')).disabled"
         )
-        guard_page.locator(".studio-cards button").filter(has_text="双人Podcast").click()
+        guard_page.locator(".studio-cards button").filter(has_text="双人播客").click()
         assert guard_page.get_by_role("dialog", name="生成双人深度播客").is_visible()
         guard_page.close()
 
@@ -552,7 +555,7 @@ def main() -> None:
         tablet_studio = tablet.get_by_role("dialog", name="Studio")
         assert tablet_studio.is_visible()
         assert tablet_studio.locator(".studio-cards button").count() == 4
-        assert tablet_studio.locator(".studio-cards button").filter(has_text="双人Podcast").is_enabled()
+        assert tablet_studio.locator(".studio-cards button").filter(has_text="双人播客").is_enabled()
         assert_no_horizontal_overflow(tablet)
         tablet.screenshot(path="/tmp/sandevistan-read-podcast-script-only-tablet.png")
         tablet_studio.get_by_role("button", name="配置 AUDIO Provider").click()
@@ -572,7 +575,7 @@ def main() -> None:
         assert mobile.locator(".sources").is_visible()
         mobile.get_by_role("button", name="学习与输出", exact=True).click()
         assert mobile.locator(".workspace > .studio").is_visible()
-        assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人Podcast").is_enabled()
+        assert mobile.locator(".workspace > .studio .studio-cards button").filter(has_text="双人播客").is_enabled()
         assert mobile.locator(".workspace > .studio").get_by_role("button", name="配置 AUDIO Provider").is_visible()
         mobile.screenshot(path="/tmp/sandevistan-read-podcast-script-only-mobile.png")
 
@@ -633,7 +636,7 @@ def main() -> None:
             "document.querySelectorAll('.notebook-grid.manage-row').length === 3"
         )
         assert mobile.get_by_role("button", name="打开 Batch QA A").is_visible()
-        assert mobile.locator(".notebook-grid.manage-row").first.get_by_text("2 FILES", exact=True).is_visible()
+        assert mobile.locator(".notebook-grid.manage-row").first.get_by_text("2 份资料", exact=True).is_visible()
         assert mobile.locator(".state-pill.active").first.is_visible()
         mobile.get_by_role("checkbox", name="选择 Batch QA A").check()
         mobile.get_by_role("checkbox", name="选择 Batch QA B").check()

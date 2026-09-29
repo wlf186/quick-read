@@ -288,7 +288,7 @@ def run_core_regressions(browser: Browser):
         fixture.show_job = True
         fixture.source_state = "queued"
         page.evaluate("window.dispatchEvent(new Event('focus'))")
-        expect(page.locator(".source-row")).to_contain_text("QUEUED")
+        expect(page.locator(".source-row")).to_contain_text("等待解析")
         page.goto(f"{BASE_URL}/#jobs")
         page.get_by_role("button", name="终止 文档解析", exact=True).click()
         confirmation = page.get_by_role("dialog", name="终止“文档解析”")
@@ -445,7 +445,7 @@ def run_import_regressions(browser: Browser) -> None:
         if width < 600:
             page.get_by_role('button', name='资料 1', exact=True).click()
         expect(page.locator('.source').first).to_be_visible()
-        expect(page.locator('.source').first).to_contain_text('10 SHEETS')
+        expect(page.locator('.source').first).to_contain_text('10 张工作表')
         expect(page.locator('.source .warning').first).to_contain_text('部分公式')
         upload = page.locator('.upload-zone input')
         assert '.xlsx' in upload.get_attribute('accept')
@@ -558,6 +558,7 @@ def run_experience_regressions(browser: Browser) -> None:
             estimate.locator('summary').click()
         # Static example: no API calls for answers or review.
         if not page.get_by_text('体验示例（不消耗 token）', exact=True).is_visible():
+            page.get_by_role('button',name='使用指南',exact=True).click()
             page.locator('.getting-started > summary').click()
         before = len(fixture.requests)
         page.get_by_text('体验示例（不消耗 token）', exact=True).click()
@@ -570,6 +571,8 @@ def run_experience_regressions(browser: Browser) -> None:
         assert demo.get_by_role('button',name='B. A 组的发芽比例较高').is_enabled()
         assert len(fixture.requests) == before
         page.keyboard.press('Escape')
+        if page.get_by_role('dialog',name='使用指南',exact=True).count():
+            page.keyboard.press('Escape')
         page.get_by_role('button', name='设置', exact=True).click()
         settings = page.get_by_role('dialog', name='Provider 配置')
         assert settings.evaluate('el=>el.contains(document.activeElement)')
@@ -631,7 +634,7 @@ def run_weekly_budget_regressions(browser):
         expect(dialog).to_contain_text("已达到或超过额度")
         expect(dialog).to_contain_text("不足时停止新请求")
         assert fixture.budget_settings["global_limit"]["tokens"]==400000
-        dialog.evaluate("el => el.scrollTop = 0")
+        dialog.locator(".overlay-body").evaluate("el => el.scrollTop = 0")
         page.screenshot(path=f"/tmp/quick-read-weekly-{width}.png")
         field.get_by_label("每周 token 额度",exact=True).fill("")
         dialog.get_by_role("button",name="保存额度设置").click()
@@ -853,3 +856,121 @@ def run_quality_flow_regressions(browser: Browser) -> None:
         assert not fixture.errors and not fixture.console_errors
         context.close()
     print('Quality flow desktop/mobile/keyboard checks passed')
+
+
+def run_visual_refinement_regressions(browser: Browser) -> None:
+    """Readability, safe rich text, IME, scroll intent and full output access."""
+    for width,height in ((1440,900),(1280,800),(1024,768),(768,1024),(390,844),(320,640)):
+        context=browser.new_context(viewport={'width':width,'height':height},reduced_motion='reduce')
+        page=context.new_page();page.set_default_timeout(8000);fixture=Fixture(page)
+        page.route('**/api/notebooks',lambda route:route.fulfill(json=[]))
+        page.goto(BASE_URL,wait_until='networkidle')
+        expect(page.locator('.getting-started')).to_be_visible()
+        expect(page.locator('.composer')).to_have_count(0)
+        next_step=page.get_by_role('button',name='下一步：连接文字模型',exact=True)
+        next_step.scroll_into_view_if_needed()
+        box=next_step.bounding_box();reading=page.locator('.messages').bounding_box()
+        assert box['y']>=reading['y'] and box['y']+box['height']<=reading['y']+reading['height']
+        assert_layout(page)
+        if width in (1440,320):page.screenshot(path=f'/tmp/quick-read-refined-onboarding-{width}.png')
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+
+        context=browser.new_context(viewport={'width':width,'height':height},reduced_motion='reduce')
+        page=context.new_page();page.set_default_timeout(8000);fixture=Fixture(page)
+        fixture.provider={'id':'main','name':'本地文字模型','role':'main','kind':'ollama','model':'fixture','active':True,'base_url':'http://example.invalid','config':{},'capabilities':{}}
+        fixture.messages=[{'id':f'message-{index}','role':'assistant','content':f'第 {index+1} 条回答。'+('阅读旧消息时，新结果不应打断当前位置。'*12),'metadata':{}} for index in range(8)]
+        page.goto(BASE_URL,wait_until='networkidle')
+        expect(page.locator('.message')).to_have_count(8)
+        reading=page.locator('.messages');composer=page.locator('.composer')
+        if width==320:assert reading.bounding_box()['height']>=260
+        if width==1280:assert reading.bounding_box()['height']>=400
+        assert composer.bounding_box()['height']<=(112 if width<768 else 140)
+        assert reading.evaluate('e=>e.scrollHeight-e.clientHeight-e.scrollTop<3'), (width,reading.evaluate('e=>({scroll:e.scrollHeight,height:e.clientHeight,top:e.scrollTop})'))
+        assert_layout(page)
+        if width not in (1440,390,320):
+            context.close();continue
+
+        reading.evaluate('e=>e.scrollTop=0');settle(page)
+        fixture.messages.append({'id':'new-answer','role':'assistant','content':'新结果已经准备好。','metadata':{}})
+        page.evaluate("window.dispatchEvent(new Event('sread-quality-changed'))")
+        expect(page.locator('.message').last).to_contain_text('新结果已经准备好')
+        assert reading.evaluate('e=>e.scrollTop')==0
+        page.get_by_role('button',name='回到最新 ↓',exact=True).click()
+        assert reading.evaluate('e=>e.scrollHeight-e.clientHeight-e.scrollTop<3'), (width,reading.evaluate('e=>({scroll:e.scrollHeight,height:e.clientHeight,top:e.scrollTop})'))
+        field=page.get_by_label('向已选资料提问');field.fill('中文候选确认')
+        field.evaluate("e=>e.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',isComposing:true,bubbles:true,cancelable:true}))")
+        field.evaluate("e=>e.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:229,bubbles:true,cancelable:true}))")
+        settle(page);assert not fixture.pending
+        expect(field).to_have_value('中文候选确认')
+        field.press('Enter');expect(page.locator('.thinking')).to_be_visible();assert len(fixture.pending)==1
+        fixture.messages.extend([{'id':'ime-user','role':'user','content':'中文候选确认'},{'id':'ime-answer','role':'assistant','content':'正确发送后的虚构回答。','metadata':{}}])
+        fixture.pending.pop().fulfill(json={'id':'ime-job','run_id':'ime-run','message_id':'ime-answer','conversation_id':'history'})
+        expect(page.locator('.thinking')).to_have_count(0)
+        expect(page.locator('.message').last).to_contain_text('正确发送后的虚构回答')
+        assert reading.evaluate('e=>e.scrollHeight-e.clientHeight-e.scrollTop<3'), (width,reading.evaluate('e=>({scroll:e.scrollHeight,height:e.clientHeight,top:e.scrollTop})'))
+
+        citation={'id':'S1','source_id':'a-source','filename':'研究报告.pdf','quote':'原文中的研究方法与适用边界。','locator':{'page':3}}
+        markdown='## 研究结论\n\n**重要结论 [S1]**，需要核对原文。未知引用 [S99] 保持原样。\n\n- 列表也应使用相同字号。\n\n1. 核对来源\n2. 检查限制\n\n| 指标 | 说明 |\n| --- | --- |\n| 温度 [S1] | 相同条件下比较 |\n\n`[S1]` 是代码中的标记。\n\n```text\n[S1]\n'+('long_unbroken_code_'*30)+'\n```\n\n![远程图片说明](https://example.invalid/remote.png)\n\n<script>window.__unsafe=true</script>\n\n[无效链接](javascript:alert(1))\n\n'+('\n\n这是长摘要中的独立段落，用于验证滚动时关闭入口持续可达。'*12)
+        outputs=[{'id':f'output-{index}','type':'summary','title':f'第 {index+1} 份研究成果','status':'ready','payload':{'content':markdown},'citations':[citation]} for index in range(8)]
+        page.route('**/api/notebooks/*/artifacts**',lambda route:route.fulfill(json=outputs))
+        page.route('**/api/artifacts/output-*',lambda route:route.fulfill(json=next(item for item in outputs if route.request.url.endswith(item['id']))))
+        page.evaluate("window.dispatchEvent(new Event('sread-quality-changed'))")
+        if width<768:page.get_by_role('button',name='学习与输出',exact=True).click()
+        expect(page.locator('.studio .artifact:visible')).to_have_count(6)
+        page.get_by_role('button',name='全部成果（8）',exact=True).click()
+        library=page.get_by_role('dialog',name='全部成果',exact=True)
+        expect(library.locator('.artifact')).to_have_count(8)
+        library.get_by_label('成果类型').select_option('quiz');expect(library).to_contain_text('没有匹配的成果')
+        library.get_by_label('成果类型').select_option('summary');library.get_by_label('搜索成果').fill('第 8')
+        expect(library.locator('.artifact')).to_have_count(1)
+        opener=library.locator('.artifact');opener.click()
+        result=page.get_by_role('dialog',name='第 8 份研究成果',exact=True)
+        expect(result.locator('.rich-text strong')).to_have_count(1)
+        expect(result.locator('.rich-text table')).to_have_count(1)
+        expect(result.locator('.rich-text ol li')).to_have_count(2)
+        expect(result.locator('.citation-inline')).to_have_count(2)
+        expect(result.locator('.rich-text code .citation-inline')).to_have_count(0)
+        expect(result.locator('.rich-text img')).to_have_count(0)
+        assert not page.evaluate('Boolean(window.__unsafe)')
+        assert not result.locator('a[href^="javascript:"]').count()
+        assert result.locator('.rich-text p').first.evaluate('e=>getComputedStyle(e).fontSize')=='16px'
+        assert result.locator('.rich-text li').first.evaluate('e=>getComputedStyle(e).fontSize')=='16px'
+        body=result.locator('.overlay-body');body.evaluate('e=>e.scrollTop=e.scrollHeight')
+        close=result.get_by_role('button',name='关闭 ×',exact=True)
+        assert close.bounding_box()['y']>=0 and close.bounding_box()['y']+close.bounding_box()['height']<=height
+        close.focus();page.keyboard.press('Shift+Tab');assert result.evaluate('e=>e.contains(document.activeElement)')
+        body.evaluate('e=>e.scrollTop=0')
+        result.locator('.citation-inline').first.click();nested=page.get_by_role('dialog',name='引用 S1',exact=True)
+        expect(nested).to_be_visible();page.keyboard.press('Escape');expect(result.locator('.citation-inline').first).to_be_focused()
+        page.screenshot(path=f'/tmp/quick-read-refined-summary-{width}.png')
+        page.keyboard.press('Escape');expect(opener).to_be_focused();page.keyboard.press('Escape')
+
+        fixture.source_state='failed';fixture.source_overrides={'error':'未提取到可检索文字，请启用图片处理后重新导入。'}
+        page.evaluate("window.dispatchEvent(new Event('focus'))")
+        if width<768:page.get_by_role('button',name='资料 0',exact=True).click()
+        error=page.locator('.source small.failed');expect(error).to_contain_text('请启用图片处理')
+        assert page.locator('.source').evaluate('e=>getComputedStyle(e).opacity')=='1'
+        page.locator('.source-info summary').focus();page.keyboard.press('Enter')
+        expect(page.locator('.source-info p').first).to_contain_text('Audit A.txt')
+        page.get_by_role('button',name='本周用量与额度').click();budget=page.get_by_role('dialog',name='用量与额度')
+        budget.locator('.overlay-body').evaluate('e=>e.scrollTop=e.scrollHeight')
+        for button_name in ('关闭 ×','保存额度设置'):
+            box=budget.get_by_role('button',name=button_name,exact=True).bounding_box()
+            assert box['y']>=0 and box['y']+box['height']<=height
+        page.keyboard.press('Escape')
+        notebooks=[{'id':'a','title':'很长的研究资料库名称：文献综述与阶段性工作总结','description':'虚构的研究资料','state':'active','source_count':8}, {'id':'failed','title':'清理失败的资料库','state':'cleanup_failed','cleanup_error':'本地文件暂时被占用，请稍后重试。'}]
+        page.route('**/api/notebook-management?*',lambda route:route.fulfill(json={'items':notebooks,'page':1,'page_size':20,'total':2,'pages':1}))
+        page.get_by_role('button',name='资料库',exact=True).click()
+        expect(page.locator('.cleanup-error')).to_be_visible();expect(page.locator('.cleanup-error')).to_contain_text('文件暂时被占用')
+        expect(page.get_by_role('button',name='重试清理 清理失败的资料库',exact=True)).to_be_visible()
+        if width<768:
+            for button in page.locator('.row-actions button:has(span)').all():
+                bounds=button.bounding_box();label=button.locator('span').bounding_box()
+                assert label['y']>=bounds['y'] and label['y']+label['height']<=bounds['y']+bounds['height']
+        page.screenshot(path=f'/tmp/quick-read-refined-notebooks-{width}.png')
+        assert_layout(page)
+        assert not fixture.errors and not fixture.console_errors
+        assert not any(method=='POST' and path.endswith('/sources') for method,path,_ in fixture.requests)
+        context.close()
+    print('Visual refinement, safe Markdown, IME, reading space and output library regressions passed (6 viewports)')
