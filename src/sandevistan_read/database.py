@@ -248,10 +248,28 @@ class Database:
         self._migrate_v7()
         self._migrate_v8()
         self._migrate_v9()
+        self._migrate_v10()
         with self.transaction() as connection:
             connection.execute("""UPDATE jobs SET processing_seconds=MAX(0,(julianday(finished_at)-julianday(started_at))*86400)
                 WHERE processing_seconds=0 AND started_at IS NOT NULL AND finished_at IS NOT NULL""")
             connection.execute("UPDATE jobs SET stage_progress=progress WHERE stage_progress=0 AND progress>0")
+
+    def _migrate_v10(self) -> None:
+        if self.fetchone("SELECT 1 FROM schema_versions WHERE version=10"):
+            return
+        # Back up the actual database beside itself, including isolated installations.
+        backup = self.path.with_name(self.path.name + ".pre-v10.bak")
+        if not backup.exists():
+            with sqlite3.connect(self.path) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+        with self.transaction() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS podcast_audio_renders (
+                id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL, job_id TEXT,
+                request_id TEXT NOT NULL, script_hash TEXT NOT NULL, provider_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, UNIQUE(parent_id,request_id))""")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_audio_parent ON podcast_audio_renders(parent_id,created_at)")
+            connection.execute("INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(10,?)", (utc_now(),))
 
     def _migrate_v9(self) -> None:
         with self.transaction() as connection:
@@ -617,10 +635,15 @@ class Database:
     def reset_running_jobs(self) -> None:
         now = utc_now()
         with self.transaction() as connection:
+            connection.execute("""UPDATE podcast_audio_renders SET job_id=(
+                SELECT id FROM jobs WHERE kind='podcast_audio' AND json_extract(payload_json,'$.audio_render_id')=podcast_audio_renders.id
+                ORDER BY created_at DESC LIMIT 1) WHERE job_id IS NULL""")
+            connection.execute("DELETE FROM podcast_audio_renders WHERE job_id IS NULL")
             connection.execute("UPDATE generation_runs SET state='interrupted',finished_at=? WHERE state='running'", (now,))
             connection.execute("UPDATE provider_calls SET state='unknown' WHERE state='pending'")
             connection.execute("UPDATE usage_events SET state='unknown' WHERE state='pending'")
             connection.execute("UPDATE media_calls SET state='unknown' WHERE state='pending'")
+            connection.execute("UPDATE jobs SET state='failed',stage='音频任务中断，请显式重试',error='服务重启，未自动重发可能已计费的语音请求',retryable=1,finished_at=?,updated_at=? WHERE kind='podcast_audio' AND state IN ('running','cancelling')", (now, now))
         self.execute(
             "UPDATE jobs SET state='queued', stage='服务重启后恢复排队', stage_code='recovering', updated_at=? WHERE state IN ('running','cancelling')",
             (now,),

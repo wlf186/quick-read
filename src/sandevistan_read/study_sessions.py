@@ -121,6 +121,12 @@ def _session_items(artifact_id: str, kind: str, mode: str, items: list[dict[str,
     available = [str(item.get("id")) for item in items if item.get("id")]
     states = {}
     if kind == "flashcard":
+        legacy = DB.fetchall("SELECT DISTINCT r.card_id FROM flashcard_reviews r LEFT JOIN flashcard_states s ON s.artifact_id=r.artifact_id AND s.card_id=r.card_id WHERE r.artifact_id=? AND s.card_id IS NULL", (artifact_id,))
+        if legacy:
+            with DB.transaction() as connection:
+                for row in legacy:
+                    if row["card_id"] in available:
+                        _load_card_state(artifact_id, row["card_id"], connection)
         states = {row["card_id"]: row for row in DB.fetchall("SELECT card_id,due_at,last_rating,suspended FROM flashcard_states WHERE artifact_id=?", (artifact_id,))}
         available = [key for key in available if not states.get(key, {}).get("suspended")]
     if mode == "same":
@@ -314,3 +320,60 @@ def flashcards_csv(artifact_id: str) -> str:
     for item in items:
         writer.writerow([item.get("front", ""), item.get("back", ""), item.get("explanation", ""), " ".join(item.get("citations") or [])])
     return output.getvalue()
+
+
+def restore_flashcard(artifact_id: str, card_id: str, session_id: str | None = None) -> dict[str, Any]:
+    """Resume scheduling without changing the card's memory or review history."""
+    _, _, items = _artifact(artifact_id, "flashcard")
+    if card_id not in {item.get("id") for item in items}:
+        raise ValueError("闪卡不存在")
+    with DB.transaction() as connection:
+        session = connection.execute("SELECT * FROM study_sessions WHERE id=? AND artifact_id=? AND kind='flashcard'", (session_id, artifact_id)).fetchone() if session_id else None
+        if session_id and not session:
+            raise ValueError("学习会话不匹配")
+        connection.execute("UPDATE flashcard_states SET suspended=0,updated_at=? WHERE artifact_id=? AND card_id=?", (utc_now(), artifact_id, card_id))
+        if session:
+            ids = json_load(session["item_ids_json"], [])
+            if card_id not in ids:
+                ids.append(card_id)
+            connection.execute("UPDATE study_sessions SET item_ids_json=?,status='active',completed_at=NULL,updated_at=? WHERE id=?", (json_dump(ids), utc_now(), session_id))
+    return {"card_id": card_id, "session": get_session(session_id) if session_id else None}
+
+
+def study_overview(notebook_id: str | None = None) -> dict[str, Any]:
+    """Read-only projection; replay legacy reviews without writing card states."""
+    now = datetime.now(UTC)
+    rows = DB.fetchall("SELECT a.*,n.title AS notebook_title FROM artifacts a JOIN notebooks n ON n.id=a.notebook_id WHERE a.type='flashcard' AND (? IS NULL OR a.notebook_id=?) ORDER BY a.created_at DESC", (notebook_id, notebook_id))
+    best = {r["id"]: r["target_id"] for r in DB.fetchall("SELECT q.id,v.target_id FROM quality_runs q LEFT JOIN quality_versions v ON v.id=json_extract(q.state_json,'$.best')")}
+    groups = []
+    for row in rows:
+        payload = json_load(row["payload_json"], {})
+        quality = payload.get("quality_control")
+        if quality and best.get(quality.get("run_id")) != row["id"]:
+            continue
+        group = {"artifact_id": row["id"], "title": row["title"], "notebook_id": row["notebook_id"], "notebook_title": row["notebook_title"], "due": 0, "new": 0, "next_due": None, "paused": []}
+        states = {r["card_id"]: r for r in DB.fetchall("SELECT * FROM flashcard_states WHERE artifact_id=?", (row["id"],))}
+        for item in payload.get("items") or []:
+            state = states.get(item["id"])
+            if state and state["suspended"]:
+                group["paused"].append({"id": item["id"], "front": item.get("front", "")})
+                continue
+            due = _parse_time(state["due_at"]) if state else None
+            reviewed = bool(state and state["last_rating"])
+            if not state:
+                reviews = DB.fetchall("SELECT rating,created_at FROM flashcard_reviews WHERE artifact_id=? AND card_id=? ORDER BY created_at", (row["id"], item["id"]))
+                if reviews:
+                    card = Card(due=_parse_time(reviews[0]["created_at"]))
+                    for review in reviews:
+                        if review["rating"] in RATINGS:
+                            card, _ = SCHEDULER.review_card(card, RATINGS[review["rating"]], review_datetime=_parse_time(review["created_at"]))
+                    due, reviewed = card.due, True
+            if not reviewed:
+                group["new"] += 1
+            elif due and due <= now:
+                group["due"] += 1
+            elif due:
+                stamp = due.isoformat()
+                group["next_due"] = min(group["next_due"], stamp) if group["next_due"] else stamp
+        groups.append(group)
+    return {"server_time": now.isoformat(), "groups": groups}

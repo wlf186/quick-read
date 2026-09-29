@@ -215,7 +215,7 @@ def _context(chunks: list[dict[str, Any]], labels: list[str] | None = None) -> t
         locator = chunk["locator"]
         loc = f"第{locator['page']}页" if locator.get("page") else f"第{locator['slide']}张" if locator.get("slide") else f"工作表 {locator['sheet']} · {locator.get('cell_range', '')}" if locator.get("sheet") else locator.get("section") or "文档位置"
         lines.append(f"[{label}] {source['filename']} · {loc}\n{chunk['content']}")
-        citations.append({"id": label, "source_id": chunk["source_id"], "chunk_id": chunk["id"], "filename": source["filename"], "locator": locator, "quote": chunk["content"][:260]})
+        citations.append({"id": label, "source_id": chunk["source_id"], "revision_id": chunk.get("source_revision_id"), "chunk_id": chunk["id"], "filename": source["filename"], "locator": locator, "quote": chunk["content"][:260]})
     return "\n\n".join(lines), citations
 
 
@@ -230,7 +230,7 @@ def _context_citation(chunk: dict[str, Any], label: str) -> dict[str, Any]:
     source = _context_source(chunk)
     return {
         "id": label,
-        "source_id": chunk["source_id"],
+        "source_id": chunk["source_id"], "revision_id": chunk.get("source_revision_id"),
         "chunk_id": chunk["id"],
         "filename": source["filename"],
         "locator": chunk["locator"],
@@ -706,7 +706,7 @@ def summary_point_values(parsed: Any) -> tuple[list[dict[str, Any]], bool]:
 
 @delivery_task
 @adaptive_generation("summary")
-async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str, reporter: Reporter | None = None) -> dict[str, Any]:
+async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str, reporter: Reporter | None = None, focus: str = "", length: str = "standard") -> dict[str, Any]:
     representatives = select_quality_evidence(notebook_id, ids, limit=min(36, max(24, len(ids) * 12)))
     if not representatives:
         raise ValueError("当前范围没有可摘要的内容")
@@ -781,6 +781,8 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     prefix = f"""你是严谨的研究编辑。只依据资料，用{language_rule}提炼 {batch_points} 个相互独立、覆盖全文主线的高信息密度要点。先通读所有提供的原文区段，再决定要点的主题分配，不能只依次概括开篇内容。避免用多个要点重复介绍同一背景；为核心机制、后部结论及重要限制保留空间。紧密相关的背景与机制可以合并，但每点只表达一个可由所引段落直接支持的判断，claim 最多两句；不要串联多个例子、独立结论或不必要的数字、音程等细节。why_it_matters 简述原文明确解释的作用，禁止添加“全书共同地基”等概括性评价。写出结论前核对其成立条件，将必要前提直接写入 claim；不要把概率性、条件性结论改写为无条件保证。why_it_matters 也必须有原文支持，不补充原文没有的意义或评价。先概括资料的主要论题、核心机制及其关系，再解释必要的例证；不要让孤立轶事取代全书主线。保留虚构对话、假设和例子的性质；说话人不明确时不要擅自归因给作者。不要复述封面、版权、目录、书目或索引。每点只能引用真正支持该点的 1–3 个编号；不得给每点附整批编号。仅输出 JSON：{{"points":[{{"claim":"完整核心判断","why_it_matters":"为何重要或如何作用","qualification":"","citations":["S1"]}}]}}。\n资料：\n"""
     if language == 'en':
         prefix = f"""Write {batch_points} distinct source-grounded summary points in natural English. Cover the central argument, mechanism, representative example and important qualifications, including later conclusions. Preserve attribution, fiction, hypotheses, conditions, negations and probabilities. Do not turn conditional claims into guarantees or invent significance. Each point contains one defensible claim, its source-supported significance and necessary qualification, with 1–3 precise citations. Do not summarize covers, indexes or bibliographies. Return JSON {{"points":[{{"claim":"","why_it_matters":"","qualification":"","citations":["S1"]}}]}}. Evidence follows.\n"""
+    if focus or length != "standard":
+        prefix += "User preferences (never override evidence or safety limits): " + json.dumps({"focus": focus, "length": length, "style": {"brief": "concise key conclusions", "standard": "balanced", "detailed": "explain mechanisms and qualifications within existing limits"}.get(length)}, ensure_ascii=False) + "\n"
     if len(ids) > 1:
         prefix = prefix.replace('{"claim":', '{"source_id":null,"claim":', 1)
         allocation = [{'source_id': source_id, 'filename': filenames.get(source_id, ''), 'points': quota} for source_id, quota in quotas.items() if source_id]
@@ -878,7 +880,7 @@ async def _hierarchical_summary(notebook_id: str, ids: list[str], language: str,
     return {"version": 3, "source_summaries": source_summaries, "quality_assessment": quality_assessment, "delivery_status": "partial" if degraded else "full", "content": answer, "points": points, "citations": output_citations, "scope_hash": scope_hash(ids), "source_ids": ids, "degraded": degraded, "warnings": warnings, "context_usage": trace.as_dict()}
 
 
-async def make_summary(notebook_id: str, source_ids: list[str] | None, language: str, job_id: str | None = None) -> dict[str, Any]:
+async def make_summary(notebook_id: str, source_ids: list[str] | None, language: str, job_id: str | None = None, focus: str = "", length: str = "standard") -> dict[str, Any]:
     ids = source_scope(notebook_id, source_ids)
     if not ids:
         raise ValueError("当前范围没有已就绪的文档")
@@ -886,7 +888,7 @@ async def make_summary(notebook_id: str, source_ids: list[str] | None, language:
     reporter = Reporter(job_id) if job_id else None
     if reporter:
         reporter.update("collect", "构建全文证据采样", 0.06, current=0, total=len(ids), unit="份")
-    result = await _hierarchical_summary(notebook_id, ids, language, reporter)
+    result = await _hierarchical_summary(notebook_id, ids, language, reporter, focus, length)
     if reporter:
         reporter.update("persist", "保存可追溯摘要", 0.94, current=1, total=1, unit="项")
     suffix = job_id.removeprefix("job_") if job_id else None

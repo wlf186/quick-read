@@ -70,6 +70,10 @@ class Fixture:
             return
         elif path == "/notebooks":
             result = notebooks
+        elif path == "/study-overview":
+            result = {"server_time":"2026-09-29T00:00:00Z","groups":[]}
+        elif path.endswith('/audio-renders'):
+            result = {"eligible":False,"reason":"语音服务未配置","script_hash":"a"*64,"provider_hash":"b"*64,"provider":{},"versions":[]}
         elif path == "/providers":
             result = [self.provider] if self.provider else []
         elif path == "/provider-roles":
@@ -267,7 +271,7 @@ def run_core_regressions(browser: Browser):
         page.locator(".artifact").filter(has_text="闪卡组").click()
         drawer = page.get_by_role("dialog", name="闪卡组")
         expect(drawer.locator(".flash-card")).to_contain_text("f1")
-        drawer.get_by_role("button", name="移除", exact=True).click()
+        drawer.get_by_role("button", name="暂停复习", exact=True).click()
         expect(drawer.locator(".flash-card")).to_contain_text("f2")
         page.keyboard.press("Escape")
         expect(drawer).not_to_be_visible()
@@ -278,7 +282,7 @@ def run_core_regressions(browser: Browser):
         expect(drawer.get_by_text("本轮复习完成")).to_be_visible()
         assert_layout(page)
         page.screenshot(path=f"/tmp/quick-read-flashcard-fixed-{width}.png")
-        drawer.get_by_role("button", name="移除", exact=True).click()
+        drawer.get_by_role("button", name="暂停复习", exact=True).click()
         expect(drawer.get_by_text("当前队列没有待学习内容")).to_be_visible()
         drawer.get_by_role("button", name="学习全部", exact=True).click()
         expect(drawer.get_by_text("当前队列没有待学习内容")).to_be_visible()
@@ -814,6 +818,7 @@ def run_quality_flow_regressions(browser: Browser) -> None:
         state.update(score=72,phase='complete',attempts=2,stop_reason='attempt_limit')
         fixture.messages[0]['metadata']['quality_control']=dict(state)
         expect(page.locator('.quality-result')).to_contain_text('尚未达到目标')
+        page.get_by_text('更多改进选项',exact=True).click()
         expect(page.get_by_label('追加改进次数')).to_have_value('1')
         page.get_by_label('追加改进次数').select_option('2')
         page.screenshot(path=f'/tmp/quality-actions-before-{width}.png')
@@ -822,9 +827,10 @@ def run_quality_flow_regressions(browser: Browser) -> None:
         assert actions[-1]['attempts']==2 and actions[-1]['action']=='retry'
         state.update(phase='complete',score=73,attempts=4,stop_reason='attempt_limit')
         fixture.messages[0]['metadata']['quality_control']=dict(state)
+        page.get_by_text('更多改进选项',exact=True).click()
         expect(page.get_by_role('button',name='采用当前结果',exact=True)).to_be_visible()
         adopt=page.get_by_role('button',name='采用当前结果',exact=True);adopt.focus();page.keyboard.press('Enter')
-        expect(page.locator('.quality-result')).to_contain_text('已达标')
+        expect(page.locator('.quality-result')).to_contain_text('达到本档生成目标')
         assert actions[-1]['action']=='lower' and actions[-1]['quality_level']=='low'
         expect(page.get_by_label('内容质量',exact=True)).to_have_value('high')
         page.screenshot(path=f'/tmp/quick-read-quality-{width}.png')
@@ -850,7 +856,7 @@ def run_quality_flow_regressions(browser: Browser) -> None:
         page.get_by_role('dialog',name='任务详情 资料对话').get_by_role('button',name='查看结果',exact=True).click()
         result=page.get_by_role('dialog',name='对话结果')
         expect(result).to_contain_text('三个核心要点')
-        expect(result).to_contain_text('已达标')
+        expect(result).to_contain_text('达到本档生成目标')
         page.keyboard.press('Escape');expect(result).not_to_be_visible()
         assert_layout(page)
         assert not fixture.errors and not fixture.console_errors
@@ -974,3 +980,116 @@ def run_visual_refinement_regressions(browser: Browser) -> None:
         assert not any(method=='POST' and path.endswith('/sources') for method,path,_ in fixture.requests)
         context.close()
     print('Visual refinement, safe Markdown, IME, reading space and output library regressions passed (6 viewports)')
+
+
+def run_reuse_workflow_regressions(browser: Browser):
+    for width in (320,390,820,1440):
+        context=browser.new_context(viewport={'width':width,'height':900}, reduced_motion='reduce')
+        page=context.new_page(); fixture=Fixture(page)
+        fixture.provider={'id':'main','name':'Fixture','role':'main','kind':'ollama','model':'fixture','active':True,'base_url':'http://example.invalid','config':{},'capabilities':{}}
+        fixture.source_overrides={'revision_id':'r'}
+        fixture.messages=[{'id':'user','role':'user','content':'Saved question','metadata':{'source_scope':[{'id':'a-source','revision_id':'r','filename':'Audit A.txt'}]}},{'id':'answer','role':'assistant','content':'Saved answer','citations':[]}]
+        fixture.artifact={'id':'cards','type':'podcast','title':'仅脚本播客','status':'ready','citations':[],'payload':{'version':2,'turns':[{'id':'t1','speaker':'HOST_A','text':'First chapter','chapter_id':'c1'},{'id':'t2','speaker':'HOST_B','text':'Second chapter','chapter_id':'c2'}],'chapters':[{'id':'c1','title':'第一章','turn_start':0},{'id':'c2','title':'第二章','turn_start':1}]}}
+        def extras(route):
+            path=urlsplit(route.request.url).path
+            if path.endswith('/conversations'):
+                route.fulfill(json=[{'id':'history','title':'Saved conversation','updated_at':'2026-09-01T00:00:00Z'},{'id':'older','title':'Older notes','updated_at':'2026-08-01T00:00:00Z'}])
+            elif path.endswith('/source-selection'):
+                selected=json.loads(route.request.post_data)['source_ids'];fixture.source_overrides['selected']=int('a-source' in selected)
+                fixture.requests.append(('PUT',path,json.loads(route.request.post_data)));route.fulfill(json={'source_ids':selected})
+            else:route.fallback()
+        page.route('**/api/**',extras)
+        page.goto(BASE_URL,wait_until='networkidle')
+        page.get_by_label('向已选资料提问').fill('Unsent draft')
+        page.get_by_role('button',name='历史对话与资料范围').click()
+        tools=page.get_by_role('dialog',name='对话与资料',exact=True)
+        tools.get_by_role('button',name='历史对话',exact=True).click()
+        history=page.get_by_role('dialog',name='历史对话',exact=True)
+        history.get_by_label('搜索标题或日期').fill('Older')
+        expect(history.get_by_role('button',name='Saved conversation')).to_have_count(0)
+        history.get_by_role('button',name='Older notes').click()
+        expect(history).to_have_count(0)
+        tools.get_by_role('button',name='历史对话',exact=True).click()
+        history.get_by_label('搜索标题或日期').fill('Saved')
+        history.get_by_role('button',name='Saved conversation').click()
+        expect(history).to_have_count(0)
+        page.keyboard.press('Escape')
+        expect(tools).to_have_count(0)
+        expect(page.get_by_label('向已选资料提问')).to_have_value('Unsent draft')
+        page.get_by_role('button',name='历史对话与资料范围').click()
+        tools.get_by_role('button',name='资料范围（1）').click()
+        picker=page.get_by_role('dialog',name='选择资料范围',exact=True)
+        picker.get_by_role('button',name='清除搜索结果').click()
+        picker.get_by_role('button',name='应用范围（0）').click()
+        expect(picker).to_have_count(0)
+        expect(tools.get_by_text('当前资料范围与历史不同。',exact=False)).to_be_visible()
+        tools.get_by_role('button',name='查看并恢复历史范围').click()
+        restore=page.get_by_role('dialog',name='恢复历史资料范围',exact=True)
+        restore.get_by_role('button',name='应用可用范围（1）').click()
+        expect(restore).to_have_count(0);page.keyboard.press('Escape')
+        if width<768:page.get_by_role('button',name='学习与输出',exact=True).click()
+        elif width<1180:page.locator('.tablet-studio-trigger').click()
+        page.get_by_role('button',name='仅脚本播客',exact=False).last.click()
+        drawer=page.get_by_role('dialog',name='仅脚本播客',exact=True)
+        expect(drawer.locator('.podcast-turn[role=button]')).to_have_count(0)
+        drawer.get_by_role('button',name='第二章',exact=True).focus();page.keyboard.press('Enter')
+        expect(drawer.locator('.podcast-turn').filter(has_text='Second chapter')).to_be_visible()
+        drawer.get_by_role('button',name='为已有脚本补生成音频',exact=True).click()
+        expect(drawer.get_by_role('button',name='按当前语音配置生成')).to_be_disabled()
+        expect(drawer.get_by_text('语音服务未配置',exact=True)).to_be_visible()
+        assert_layout(page)
+        page.screenshot(path=f'/tmp/quick-read-reuse-{width}.png')
+        assert not fixture.errors and not fixture.console_errors
+        context.close()
+    print('History, drafts, atomic source selection and script-only audio checks passed (4 viewports)')
+
+
+def run_configuration_sync_regressions(browser: Browser):
+    for width in (390,1440):
+        context=browser.new_context(viewport={'width':width,'height':900},reduced_motion='reduce')
+        page=context.new_page();fixture=Fixture(page);writes=[];fail_status=[False]
+        def configuration(route):
+            request=route.request;path=urlsplit(request.url).path
+            if path=='/api/provider-roles':
+                route.fulfill(json=[{'role':'main','enabled':bool(fixture.provider),'required':True,'selected_provider_id':'main' if fixture.provider else None}])
+            elif path in ('/api/providers','/api/providers/main') and request.method in ('POST','PATCH'):
+                body=json.loads(request.post_data);writes.append((request.method,body))
+                fixture.provider={**(fixture.provider or {}),**body,'id':'main','role':'main','kind':'openai','has_api_key':False,'capabilities':{}}
+                if request.method=='PATCH':fail_status[0]=True
+                route.fulfill(json={'id':'main','active':True})
+            elif path=='/api/status':
+                if fail_status[0]:
+                    fail_status[0]=False;route.fulfill(status=503,json={'detail':'Temporary status failure'})
+                else:route.fulfill(json={'version':'fixture','providers':{'main':{'ok':bool(fixture.provider)}}})
+            else:route.fallback()
+        page.route('**/api/**',configuration)
+        page.goto(BASE_URL,wait_until='networkidle')
+        page.get_by_role('button',name='设置',exact=True).click()
+        settings=page.get_by_role('dialog',name='Provider 配置',exact=True)
+        settings.get_by_role('button',name='连接服务',exact=True).click()
+        settings.get_by_label('服务地址',exact=False).fill('http://example.invalid/v1')
+        settings.get_by_placeholder('手动输入模型 ID').fill('fixture-main')
+        settings.get_by_role('button',name='验证并启用',exact=True).click()
+        settings.get_by_role('button',name='返回角色概览').click()
+        expect(settings.locator('.provider-role-card')).to_contain_text('fixture-main')
+        expect(settings.get_by_role('button',name='编辑当前配置',exact=True)).to_be_visible()
+        assert len(writes)==1
+        settings.get_by_role('button',name='编辑当前配置',exact=True).click()
+        settings.get_by_placeholder('手动输入模型 ID').fill('fixture-updated')
+        settings.get_by_role('button',name='验证并保存',exact=True).click()
+        expect(page.get_by_text('配置已保存，状态刷新失败。',exact=False)).to_be_visible()
+        # The failed health read must not leave the edit form or force a second save.
+        expect(settings.get_by_role('button',name='返回角色概览')).to_be_visible()
+        page.keyboard.press('Escape')
+        page.get_by_role('button',name='重试状态刷新',exact=True).click()
+        expect(page.get_by_role('button',name='重试状态刷新',exact=True)).to_have_count(0)
+        assert len(writes)==2
+        page.get_by_role('button',name='设置',exact=True).click()
+        settings.get_by_role('button',name='用量与额度',exact=True).click()
+        settings.get_by_role('button',name='查看用量与编辑周额度').click()
+        budget=page.get_by_role('dialog',name='用量与额度',exact=True)
+        expect(budget.get_by_label('常用时区')).to_be_visible()
+        assert_layout(page);assert not fixture.errors
+        assert all('503' in text for text in fixture.console_errors), fixture.console_errors
+        context.close()
+    print('Provider role/health synchronization and refresh-only retry checks passed')

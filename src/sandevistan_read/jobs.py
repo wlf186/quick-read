@@ -37,8 +37,8 @@ def enqueue(kind: str, notebook_id: str | None, payload: dict[str, Any], parent_
     job_id, now = new_id("job"), utc_now()
     source_count = len(payload.get("source_ids") or []) or (1 if payload.get("source_id") else 0)
     workload = {"source_count": source_count, "count": payload.get("count"), "minutes": payload.get("minutes"), "bucket": "single" if source_count <= 1 else "small_multi" if source_count <= 4 else "large_multi"}
-    provider = active_provider("audio" if kind == "podcast" else "main") if kind != "ingest" else None
-    context_provider = active_provider("main") if kind not in {"ingest"} else None
+    provider = payload.get("_quality_audio_provider") if kind == "podcast_audio" else active_provider("audio" if kind == "podcast" else "main") if kind != "ingest" else None
+    context_provider = active_provider("main") if kind not in {"ingest", "podcast_audio"} else None
     if kind == "podcast":
         payload["provider_ids"] = {
             "audio": provider.get("id") if provider else None,
@@ -206,28 +206,33 @@ def _podcast_overlap_safe(main_provider: dict[str, Any], audio_provider: dict[st
     return main_host != audio_host
 
 
-@adaptive_generation("podcast")
-async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
+async def _synthesize_podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:
     podcast_started = time.perf_counter()
     snapshot = payload.get("provider_ids") or {}
-    provider = provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
+    provider = None if "_quality_audio_provider" in payload else provider_by_id(snapshot.get("audio")) if snapshot.get("audio") else active_provider("audio")
     if "_quality_audio_provider" in payload:
         snapshot_audio = payload["_quality_audio_provider"]
         current_audio = provider_by_id(snapshot_audio.get("id")) if snapshot_audio.get("id") else None
         provider = {**snapshot_audio, "api_key": current_audio.get("api_key", "")} if current_audio and current_audio.get("base_url") == snapshot_audio.get("base_url") else None
     ready, readiness_message = audio_provider_readiness(provider)
+    if (not ready or not provider) and payload.get("_audio_only"):
+        raise RuntimeError(readiness_message or "绑定的语音配置不可用")
     if not ready or not provider:
         generated = copy.deepcopy(payload["_quality_script"]) if payload.get("_quality_script") else await build_podcast_script(notebook_id, payload, allow_partial=True,
             cancel_check=lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested")))
         return _save_script_result(notebook_id, job_id, generated, readiness_message)
-    main_provider = copy.deepcopy(current().provider if current() else provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main"))
-    if not main_provider:
+    main_provider = {} if payload.get("_audio_only") else copy.deepcopy(current().provider if current() else provider_by_id(snapshot.get("main")) if snapshot.get("main") else active_provider("main"))
+    if not main_provider and not payload.get("_audio_only"):
         raise RuntimeError("请先配置并启用 MAIN provider")
     config = provider.get("config", {})
     cancel_check = lambda: bool((DB.fetchone("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)) or {}).get("cancel_requested"))
     suffix = job_id.removeprefix("job_")
     work_dir = PATHS.job_work / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    if payload.get("_audio_only") and payload.get("audio_retry_job_id"):
+        prior_parts = PATHS.job_work / payload["audio_retry_job_id"] / "parts"
+        if prior_parts.is_dir() and not (work_dir / "parts").exists():
+            shutil.copytree(prior_parts, work_dir / "parts")
     register_resource("job", job_id, notebook_id, "podcast-work", work_dir)
     out_dir = PATHS.artifacts / f"podcast_{suffix}"
     manifest_path = work_dir / "manifest.json"
@@ -516,6 +521,11 @@ async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> di
     max_sequence_items = max(1, min(100, int(sequence_capability.get("max_items") or 100)))
     max_sequence_chars = max(1, int(sequence_capability.get("max_total_chars") or 100000))
     part_hashes = manifest.setdefault("tts_parts", {})
+    if payload.get("_audio_only") and payload.get("audio_retry_job_id"):
+        prior_manifest = PATHS.job_work / payload["audio_retry_job_id"] / "manifest.json"
+        if prior_manifest.is_file():
+            prior_hashes = json_load(prior_manifest.read_text(encoding="utf-8"), {}).get("tts_parts", {})
+            part_hashes.update(prior_hashes)
     tts_execution: dict[str, Any] = {
         "requested_device": selected_device, "compute_device": selected_device, "fallback_used": False,
         "sequence_supported": bool(sequence_capability.get("supported")), "sequence_enabled": sequence_enabled,
@@ -871,7 +881,7 @@ async def _execute(job: dict[str, Any]) -> Any:
             image_policy=payload.get("image_policy"),
             image_provider_ids=payload.get("image_provider_ids"),
         )
-    if job["kind"] == "summary": return await make_summary(job["notebook_id"], payload.get("source_ids"), payload.get("language", "auto"), job["id"])
+    if job["kind"] == "summary": return await make_summary(job["notebook_id"], payload.get("source_ids"), payload.get("language", "auto"), job["id"], focus=payload.get("focus", ""), length=payload.get("length", "standard"))
     if job["kind"] in {"quiz", "flashcard"}:
         return await generate_study_artifact(
             job["notebook_id"],
@@ -883,6 +893,16 @@ async def _execute(job: dict[str, Any]) -> Any:
             payload.get("custom_prompt", ""),
             job["id"],
         )
+    if job["kind"] == "podcast_audio":
+        # Reuse the audio pipeline directly, bypassing adaptive MAIN planning and
+        # script-only recovery: a failed render must not replace the original.
+        token = _SCRIPT_RESULT.set(None)
+        try:
+            result = await _synthesize_podcast(job["notebook_id"], payload, job["id"])
+        finally:
+            _SCRIPT_RESULT.reset(token)
+        DB.execute("UPDATE podcast_audio_renders SET artifact_id=? WHERE id=?", (result["id"], payload["audio_render_id"]))
+        return result
     if job["kind"] == "podcast": return await _podcast(job["notebook_id"], payload, job["id"])
     raise RuntimeError(f"未知任务类型: {job['kind']}")
 
@@ -929,7 +949,7 @@ def _save_script_result(notebook_id: str, job_id: str, generated: dict[str, Any]
     DB.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, notebook_id, "podcast", "双人音频解读", json_dump(generated["source_ids"]), generated["language"], "partial", json_dump(generated), json_dump(generated["citations"]), None, now, now))
     return {"id": artifact_id, "delivery_status": generated["delivery_status"], "context_usage": generated.get("context_usage", {})}
 
-_render_podcast_job = _podcast
+_render_podcast_job = adaptive_generation("podcast")(_synthesize_podcast)
 
 @delivery_task
 async def _podcast(notebook_id: str, payload: dict[str, Any], job_id: str) -> dict[str, Any]:

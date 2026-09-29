@@ -3,11 +3,11 @@ import type {QualityLevel} from './quality_preferences';
 export type EpisodeAudit={status:"complete"|"partial"|"unavailable";coverage_mode:"full"|"sampled";checked_transitions:number;total_transitions:number;reviewed_transitions:number[];requested_transitions?:number[];reason?:string;repair_unreviewed?:boolean;transition_checks?:Array<{index:number;verdict:"connected"|"broken"|"uncertain";reason:string}>};
 export type QualityAssessment={review_status?:string;reason_code?:string;reason?:string;version:1;level:"good"|"fair"|"needs_review"|"unrated";method:string;total_units:number;reviewed_units:number;supported_units:number;issues:Array<{unit?:string;code:string;message:string;severity?:string}>};
 export type DeliveryStatus="full"|"partial"|"script_only"|"draft_only";
-export type Source={id:string;filename:string;state:string;selected:number;page_count:number;parser?:string;error?:string;metadata?:Record<string,any>};
+export type Source={id:string;revision_id?:string;filename:string;state:string;selected:number;page_count:number;parser?:string;error?:string;metadata?:Record<string,any>};
 export type Notebook={id:string;title:string;description:string;state?:string;sources?:Source[];source_count?:number;source_bytes?:number;artifact_count?:number;active_jobs?:number;cleanup_error?:string};
 export type NotebookDeleteResult={id:string;accepted:boolean;operation_id?:string;error?:string};
 export type NotebookBatchDeleteResponse={items:NotebookDeleteResult[]};
-export type Citation={id:string;filename:string;locator:Record<string,any>;quote:string;source_id:string};
+export type Citation={id:string;revision_id?:string;filename:string;locator:Record<string,any>;quote:string;source_id:string};
 export type Job={usage?:Usage;id:string;notebook_id?:string;notebook_title?:string;display_name:string;kind:string;state:string;stage:string;stage_code:string;progress:number;stage_current?:number;stage_total?:number;stage_unit?:string;progress_basis?:string;error?:string;result?:Record<string,any>;created_at:string;updated_at:string;started_at?:string;finished_at?:string;eta:{status:'learning'|'ready';sample_count:number;confidence?:string;queue_position:number;remaining_seconds?:number;remaining_range?:number[]}};
 export type Page<T>={items:T[];page:number;page_size:number;total:number;pages:number};
 export type SummaryPoint={claim:string;why_it_matters:string;qualification:string;citations:string[];source_id?:string|null;review_status?:string};
@@ -32,15 +32,17 @@ export type VoiceprintPersonOption={id:string;name:string;note?:string|null;elig
 export type VoiceprintLibrary={status:'ready'|'unsupported'|'unavailable';people:VoiceprintPersonOption[];message?:string|null};
 export type ProviderInspection={status:'passed'|'warning'|'failed';connection_ok:boolean;activation_eligible:boolean;latency_ms:number;catalog_supported:boolean;models:ProviderModel[];capabilities:Record<string,any>;recommended?:{model?:string;compute_device?:string;reason?:string}|null;voiceprint_library?:VoiceprintLibrary;resolved_audio_config?:ProviderConfig;warning?:string|null;error?:{code:string;stage:string;message:string;hint:string;upstream_status?:number|null}|null};
 export type ProviderDraft={provider_id?:string;name:string;role:ProviderRole;kind:ProviderKind;base_url:string;model:string;api_key?:string;config:ProviderConfig};
+export type SummaryOptions={token_limit?:number;focus:string;length:'brief'|'standard'|'detailed';language:string};
 export type PodcastOptions={token_limit?:number;duration_mode:'auto'|'fixed';minutes?:5|10|20|30;language:'zh-CN'|'auto'|'en';focus:string};
 export type AuthStatus={required:boolean;authenticated:boolean};
 
+export class ApiError extends Error{get fieldErrors(){return Array.isArray(this.details)?this.details:[]}constructor(message:string,public status:number,public code?:string,public details?:unknown){super(message);this.name='ApiError'}}
 const jsonHeaders={'Content-Type':'application/json'};
 function storedToken(){try{return localStorage.getItem('sread_token')}catch{return null}}
 function saveToken(token:string){try{localStorage.setItem('sread_token',token)}catch{/* The secure cookie remains the source of truth. */}}
 export function clearSession(){try{localStorage.removeItem('sread_token')}catch{/* Storage may be unavailable. */}}
 export async function authStatus(){const headers=new Headers();const token=storedToken();if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch('/auth/status',{headers});if(!response.ok)throw new Error('无法确认访问状态');return response.json() as Promise<AuthStatus>}
-export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(init?.method&&init.method!=='GET'&&(/^\/(providers|reviews)(\/|$)/.test(path)||/^\/notebooks\/[^/]+\/(chat|summary|quiz|flashcard|podcast)$/.test(path)))window.dispatchEvent(new Event('sread-usage-changed'));if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));const detail=body.detail;const message=typeof detail==='string'?detail:detail?.message||detail?.inspection?.error?.message||body.error||'请求失败';throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
+export async function api<T>(path:string,init?:RequestInit):Promise<T>{const token=storedToken();const headers=new Headers(init?.headers);if(token)headers.set('Authorization',`Bearer ${token}`);const response=await fetch(`/api${path}`,{...init,headers});if(init?.method&&init.method!=='GET'&&(/^\/(providers|reviews)(\/|$)/.test(path)||/^\/notebooks\/[^/]+\/(chat|summary|quiz|flashcard|podcast)$/.test(path)))window.dispatchEvent(new Event('sread-usage-changed'));if(response.status===401){clearSession();throw new Error('AUTH_REQUIRED')}if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));const detail=body.detail;const message=typeof detail==='string'?detail:Array.isArray(detail)?detail.map(item=>`${(item.loc||[]).join('.')}: ${item.msg||'输入无效'}`).join('；'):detail?.message||detail?.inspection?.error?.message||body.error||'请求失败';throw new ApiError(message,response.status,detail?.code,detail)}if(response.status===204)return undefined as T;return response.json()}
 export async function login(access_key:string){const response=await fetch('/auth/login',{method:'POST',headers:jsonHeaders,body:JSON.stringify({access_key})});if(!response.ok)throw new Error('访问密钥错误');const result=await response.json();saveToken(result.token);return result}
 export const getNotebooks=()=>api<Notebook[]>('/notebooks');
 export const createNotebook=(title:string,description='')=>api<Notebook>('/notebooks',{method:'POST',headers:jsonHeaders,body:JSON.stringify({title,description})});
@@ -52,9 +54,13 @@ export const selectSource=(id:string,selected:boolean)=>api(`/sources/${id}/sele
 export const deleteSource=(id:string)=>api<void>(`/sources/${id}`,{method:'DELETE'});
 export async function upload(id:string,files:FileList|File[],imagePolicy?:ImageProcessingPolicy){const body=new FormData();Array.from(files).forEach(file=>body.append('files',file));if(imagePolicy)body.append('image_policy',JSON.stringify(imagePolicy));return api(`/notebooks/${id}/sources`,{method:'POST',body})}
 export const ask=(id:string,question:string,source_ids:string[],conversation_id?:string,token_limit?:number)=>api<any>(`/notebooks/${id}/chat`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,token_limit,language:'auto'})});
-export const getConversations=(id:string)=>api<any[]>(`/notebooks/${id}/conversations`);
-export const getMessages=(id:string)=>api<any[]>(`/conversations/${id}/messages`);
-export const createArtifact=(id:string,type:string,source_ids:string[],options?:PodcastOptions|StudyOptions|{token_limit?:number})=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options,quality_level:qualityPreference(type)})});
+export type SourceSnapshot={id:string;revision_id:string;filename:string};
+export type Conversation={id:string;notebook_id:string;title:string;created_at:string;updated_at:string};
+export const getConversation=(id:string)=>api<Conversation>(`/conversations/${id}`);
+export const getConversations=(id:string)=>api<Conversation[]>(`/notebooks/${id}/conversations`);
+export type Message={id:string;role:'user'|'assistant';content:string;citations?:Citation[];metadata?:Record<string,any>&{source_scope?:SourceSnapshot[]|null};created_at?:string};
+export const getMessages=(id:string)=>api<Message[]>(`/conversations/${id}/messages`);
+export const createArtifact=(id:string,type:string,source_ids:string[],options?:SummaryOptions|PodcastOptions|StudyOptions|{token_limit?:number})=>api<any>(`/notebooks/${id}/${type}`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({source_ids,...options,quality_level:qualityPreference(type)})});
 export const getArtifacts=(id:string)=>api<Artifact[]>(`/notebooks/${id}/artifacts?view=summary`);
 export const getArtifact=(id:string)=>api<Artifact>(`/artifacts/${id}`);
 export const getJobsPage=(params:Record<string,string|number|undefined>={})=>{const query=new URLSearchParams();Object.entries(params).forEach(([key,value])=>value!==undefined&&query.set(key,String(value)));return api<Page<Job>>(`/jobs?${query}`)};
@@ -111,3 +117,12 @@ export type QualityControl={run_id:string;job_id:string;quality_level:QualityLev
 export const qualityState=(id:string)=>api<QualityControl>(`/quality-runs/${id}`);
 export const qualityAction=(id:string,body:Record<string,unknown>)=>api<QualityControl>(`/quality-runs/${id}/actions`,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});
 export const submitChat=(id:string,question:string,source_ids:string[],conversation_id?:string,token_limit?:number)=>api<{id:string;run_id:string;message_id:string;conversation_id:string}>(`/notebooks/${id}/chat-runs`,{method:'POST',headers:jsonHeaders,body:JSON.stringify({question,source_ids,conversation_id,token_limit,quality_level:qualityPreference('chat'),language:'auto'})});
+
+export const selectSources=(id:string,source_ids:string[])=>api(`/notebooks/${id}/source-selection`,{method:"PUT",headers:jsonHeaders,body:JSON.stringify({source_ids})});
+
+export type StudyOverview={server_time:string;groups:Array<{artifact_id:string;title:string;notebook_id:string;notebook_title:string;due:number;new:number;next_due:string|null;paused:Array<{id:string;front:string}>}>};
+export const getStudyOverview=(id?:string)=>api<StudyOverview>(`/study-overview${id?`?notebook_id=${encodeURIComponent(id)}`:''}`);
+export const restoreFlashcard=(id:string,card:string,session?:string)=>api<{session:StudySession|null}>(`/artifacts/${id}/flashcards/${card}/restore${session?`?session_id=${encodeURIComponent(session)}`:''}`,{method:'POST'});
+export type AudioRenders={eligible:boolean;reason:string;script_hash:string;provider_hash:string;provider:{name:string;base_url:string;model:string;config:ProviderConfig};versions:Array<{id:string;artifact_id:string|null;job_id:string|null;created_at:string;state:string;error?:string}>};
+export const getAudioRenders=(id:string)=>api<AudioRenders>(`/artifacts/${id}/audio-renders`);
+export const createAudioRender=(id:string,body:{request_id:string;script_hash:string;provider_hash:string;retry_render_id?:string})=>api<{id:string;job_id:string}>(`/artifacts/${id}/audio-renders`,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body)});

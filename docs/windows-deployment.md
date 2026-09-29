@@ -265,3 +265,7 @@ PDF 慢时检查资料元数据中的 `ingest_timings`：原生解析、预览�
 ### 阅读界面精修更新
 
 本次为前端更新，无新增数据库迁移、后端 API 或配置项。同步 `frontend/package.json` 与 `frontend/pnpm-lock.yaml` 后，在 `frontend` 目录运行 `corepack pnpm install --frozen-lockfile`、`corepack pnpm lint` 和 `corepack pnpm build`，再刷新页面；依赖包含锁定版本的 `react-markdown` 与 `remark-gfm`。原始资料、学习进度和已有生成结果无需重建。回退时同时恢复对应的前端代码、依赖锁文件与构建产物，不回退运行数据库。新入口及键盘行为见 [使用与用量指南](user-experience.md#阅读界面精修)。
+
+### v10 数据兼容
+
+更新前停止服务并备份运行目录；前后端一同更新和构建。首次启动会在数据库旁创建 `.pre-v10.bak` 备份并增加音频版本关联表。不会自动重新生成内容或清空消费、学习记录。已开始的 `podcast_audio` 任务在重启后显示中断，用户可显式重试；原稿和已完成音频保留。降级前先完成或取消新类型任务，旧版本不认识 `podcast_audio`；需要完整回退数据时使用升级前备份，并注意升级后的新记录不会包含在旧备份中。

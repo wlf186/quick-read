@@ -34,6 +34,7 @@ from .study_sessions import answer_quiz, create_session, flashcards_csv, get_ses
 from .schemas import ContextPreviewRequest, TaskPreviewRequest, ReviewRequest, QualityAction
 from .context_budget import TokenLimits, estimate_text_tokens, plan_context
 from .retrieval import is_quality_chunk
+from .api_docs import MESSAGE_LIST_RESPONSES, AUDIO_RENDER_RESPONSES, AUDIO_RENDER_SUBMIT_RESPONSES, SOURCE_SELECTION_RESPONSES, STUDY_OVERVIEW_RESPONSES, SUMMARY_EXPORT_RESPONSES
 from .api_docs import QUALITY_RESPONSES, CHAT_RUN_RESPONSES, USAGE_RESPONSES, TASK_PREVIEW_RESPONSES, REVIEW_RESPONSES, REVIEW_HISTORY_RESPONSES, CONTEXT_PREVIEW_RESPONSES, NOTEBOOK_RESPONSES, SOURCE_UPLOAD_RESPONSES
 
 
@@ -104,12 +105,12 @@ def update_weekly_budget(body: WeeklyBudgetSettings):
 def weekly_usage():
     return weekly_budget.overview(DB)
 
-_STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None, "revision": 0}
 _STATUS_LOCK = asyncio.Lock()
 
 
 def invalidate_status_cache() -> None:
-    _STATUS_CACHE.update({"at": 0.0, "value": None})
+    _STATUS_CACHE.update({"at": 0.0, "value": None, "revision": int(_STATUS_CACHE.get("revision", 0)) + 1})
 
 
 def normalize(row: dict[str, Any]) -> dict[str, Any]:
@@ -142,6 +143,7 @@ async def status():
     async with _STATUS_LOCK:
         if _STATUS_CACHE["value"] is not None and time.monotonic() - float(_STATUS_CACHE["at"]) < 30:
             return _STATUS_CACHE["value"]
+        revision = _STATUS_CACHE.get("revision", 0)
         ffmpeg = CONFIG.tools.ffmpeg_path
         libreoffice = CONFIG.tools.libreoffice_path
         tool_status = {
@@ -151,7 +153,8 @@ async def status():
         roles = ("main", "vlm", "audio")
         health_results = await asyncio.gather(*(health(role) for role in roles))
         value = {"name": "Sandevistan-Read", "version": __version__, "host": CONFIG.server.host, "port": CONFIG.server.port, "providers": dict(zip(roles, health_results)), "tools": tool_status, "retrieval": {"embedding_mode": EMBEDDINGS.mode, "model": CONFIG.models.embedding, "offline": CONFIG.models.offline}, "runtime_root": str(PATHS.runtime)}
-        _STATUS_CACHE.update({"at": time.monotonic(), "value": value})
+        if revision == _STATUS_CACHE.get("revision", 0):
+            _STATUS_CACHE.update({"at": time.monotonic(), "value": value})
         return value
 
 
@@ -292,6 +295,68 @@ async def upload_sources(notebook_id: str, files: list[UploadFile] = File(...), 
             await upload.close()
 
 
+def source_snapshot(ids: list[str]) -> list[dict[str, Any]]:
+    return [row for source_id in ids if (row := DB.fetchone("SELECT id,revision_id,filename FROM sources WHERE id=?", (source_id,)))]
+
+
+from .schemas import SourceSelectionBatch
+
+
+@api.put("/notebooks/{notebook_id}/source-selection", responses=SOURCE_SELECTION_RESPONSES, description="原子更新已就绪资料范围；无效资料使整个请求失败。")
+def select_sources(notebook_id: str, body: SourceSelectionBatch):
+    _require_notebook(notebook_id)
+    ids = set(body.source_ids)
+    with DB.transaction() as connection:
+        ready = {row["id"] for row in connection.execute("SELECT id FROM sources WHERE notebook_id=? AND state='ready'", (notebook_id,))}
+        if not ids <= ready:
+            raise HTTPException(409, "资料已删除或尚未就绪，请刷新范围")
+        connection.execute("UPDATE sources SET selected=0,updated_at=? WHERE notebook_id=?", (utc_now(), notebook_id))
+        connection.executemany("UPDATE sources SET selected=1 WHERE id=?", [(key,) for key in ids])
+    return {"source_ids": sorted(ids)}
+
+
+@api.get("/sources/{source_id}/file", description="读取固定修订的原始资料；活动内容强制下载。")
+def source_file(source_id: str, revision: str):
+    row = DB.fetchone("SELECT * FROM sources WHERE id=?", (source_id,))
+    if not row:
+        raise HTTPException(404, "原始资料已删除，引用摘录仍保留")
+    if row["revision_id"] != revision:
+        raise HTTPException(409, "资料修订已变化，无法打开旧版原件")
+    path = (PATHS.root / row["blob_path"]).resolve()
+    if not path.is_relative_to(PATHS.blobs.resolve()) or not path.is_file():
+        raise HTTPException(404, "原始文件不可用")
+    inline = path.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
+    return FileResponse(path, filename=row["filename"], content_disposition_type="inline" if inline else "attachment")
+
+
+@api.get("/artifacts/{artifact_id}/summary.md", responses=SUMMARY_EXPORT_RESPONSES, description="导出指定摘要版本的正文、引用和核查状态，不调用模型。")
+def summary_markdown(artifact_id: str):
+    row = DB.fetchone("SELECT * FROM artifacts WHERE id=? AND type='summary'", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "摘要不存在")
+    payload = json_load(row["payload_json"], {})
+    citations = json_load(row["citations_json"], [])
+    text = f"# {row['title']}\n\n{payload.get('content', '')}\n\n## 原文引用\n"
+    text += "\n".join(f"[{c.get('id')}] {c.get('filename')} · {json_dump(c.get('locator', {}))}\n> {c.get('quote', '')}\n" for c in citations)
+    text += "\n## 核查状态\nAI 抽样评分，不代表事实正确率。\n" + json_dump(payload.get("quality_control") or payload.get("quality_assessment") or {"status": "未记录"})
+    return Response(text, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="summary.md"'})
+
+
+@api.get("/study-overview", responses=STUDY_OVERVIEW_RESPONSES, description="只读到期、新卡和暂停卡概览；不创建会话，不重设复习安排。")
+def get_study_overview(notebook_id: str | None = None):
+    from .study_sessions import study_overview
+    return study_overview(notebook_id)
+
+
+@api.post("/artifacts/{artifact_id}/flashcards/{card_id}/restore", description="恢复暂停闪卡，保留记忆状态；可重新加入指定学习会话。")
+def restore_card(artifact_id: str, card_id: str, session_id: str | None = None):
+    from .study_sessions import restore_flashcard
+    try:
+        return restore_flashcard(artifact_id, card_id, session_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @api.patch("/sources/{source_id}/selection")
 def select_source(source_id: str, body: SourceSelection):
     if not DB.fetchone("SELECT 1 FROM sources WHERE id=?", (source_id,)):
@@ -317,6 +382,7 @@ async def ask(notebook_id: str, body: ChatRequest):
     ids = source_scope(notebook_id, body.source_ids)
     if not ids:
         raise HTTPException(409, "当前范围没有已就绪的文档")
+    scope_snapshot = source_snapshot(ids)
     conversation_id = body.conversation_id
     now = utc_now()
     if conversation_id:
@@ -329,13 +395,14 @@ async def ask(notebook_id: str, body: ChatRequest):
         """INSERT INTO messages
         (id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at)
         VALUES(?,?,?,?,?,?,?,?,?)""",
-        (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", "{}", now),
+        (new_id("message"), conversation_id, "user", body.question, "[]", None, "complete", json_dump({"source_scope": scope_snapshot}), now),
     )
     message_id = new_id("message")
     with usage.running(DB, notebook_id, "chat", target_id=message_id, token_limit=body.token_limit) as run:
         result = await grounded_generate(notebook_id, "直接、清楚地回答问题。", body.question, ids, body.language, conversation_id=conversation_id)
     context_usage = result.pop("context_usage", {})
     metadata = {"quality_assessment": result.get("quality_assessment"), "delivery_status": result.get("delivery_status"), "context_usage": context_usage, "degraded": result.get("degraded", False), "warnings": result.get("warnings", [])}
+    metadata["source_scope"] = scope_snapshot
     metadata["usage"] = usage.summarize(DB, run_id=run.id)
     if run.quota_denial:
         metadata["quota_denial"] = run.quota_denial
@@ -356,6 +423,7 @@ def submit_chat(notebook_id: str, body: ChatRequest):
     ids = source_scope(notebook_id, body.source_ids)
     if not ids:
         raise HTTPException(409, "当前范围没有已就绪的文档")
+    scope_snapshot = source_snapshot(ids)
     conversation_id, now = body.conversation_id, utc_now()
     if conversation_id:
         row = DB.fetchone("SELECT notebook_id FROM conversations WHERE id=?", (conversation_id,))
@@ -367,10 +435,10 @@ def submit_chat(notebook_id: str, body: ChatRequest):
     message_id = new_id("message")
     for role, text, identity in (("user", body.question, new_id("message")), ("assistant", "", message_id)):
         DB.execute("INSERT INTO messages(id,conversation_id,role,content,citations_json,scope_hash,state,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                   (identity, conversation_id, role, text, "[]", None, "queued" if role == "assistant" else "complete", "{}", utc_now()))
+                   (identity, conversation_id, role, text, "[]", None, "queued" if role == "assistant" else "complete", json_dump({"source_scope": scope_snapshot}), utc_now()))
     job = enqueue("chat", notebook_id, {**body.model_dump(), "source_ids": ids, "conversation_id": conversation_id, "message_id": message_id})
     run_id = json_load(job["payload_json"], {})["quality_run_id"]
-    DB.execute("UPDATE messages SET metadata_json=? WHERE id=?", (json_dump({"quality_control": quality.public(run_id)}), message_id))
+    DB.execute("UPDATE messages SET metadata_json=? WHERE id=?", (json_dump({"source_scope": scope_snapshot, "quality_control": quality.public(run_id)}), message_id))
     return {"id": job["id"], "run_id": run_id, "message_id": message_id, "conversation_id": conversation_id}
 
 
@@ -394,7 +462,15 @@ def quality_action(run_id: str, body: QualityAction):
 def conversations(notebook_id: str): return [normalize(row) for row in DB.fetchall("SELECT * FROM conversations WHERE notebook_id=? ORDER BY updated_at DESC", (notebook_id,))]
 
 
-@api.get("/conversations/{conversation_id}/messages")
+@api.get("/conversations/{conversation_id}", description="读取对话归属，用于从任务结果继续提问。")
+def get_conversation(conversation_id: str):
+    row = DB.fetchone("SELECT * FROM conversations WHERE id=?", (conversation_id,))
+    if not row:
+        raise HTTPException(404, "对话不存在")
+    return row
+
+
+@api.get("/conversations/{conversation_id}/messages", responses=MESSAGE_LIST_RESPONSES)
 def messages(conversation_id: str): return [normalize(row) for row in DB.fetchall("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conversation_id,))]
 
 
@@ -438,6 +514,8 @@ def podcast(notebook_id: str, body: PodcastRequest):
 @api.get("/notebooks/{notebook_id}/artifacts", responses=ARTIFACT_LIST_RESPONSES)
 def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
     rows = DB.fetchall("SELECT * FROM artifacts WHERE notebook_id=? AND (? IS NULL OR type=?) ORDER BY created_at DESC", (notebook_id, type, type))
+    audio_children = {item["artifact_id"] for item in DB.fetchall("SELECT artifact_id FROM podcast_audio_renders WHERE artifact_id IS NOT NULL")}
+    rows = [row for row in rows if row["id"] not in audio_children]
     selected = {item["run_id"]: item["target_id"] for item in DB.fetchall("SELECT q.id AS run_id,v.target_id FROM quality_runs q LEFT JOIN quality_versions v ON v.id=json_extract(q.state_json,'$.best') WHERE q.notebook_id=?", (notebook_id,))}
     rows = [row for row in rows if not (q := json_load(row.get("payload_json"), {}).get("quality_control")) or selected.get(q["run_id"]) == row["id"]]
     if view == "summary":
@@ -454,6 +532,68 @@ def artifacts(notebook_id: str, type: str | None = None, view: str = "full"):
         if item.get("media_path"):
             item["media_url"] = f"/api/artifacts/{item['id']}/media"
     return [public_artifact(item) for item in output]
+
+
+from .schemas import AudioRenderRequest
+
+
+def audio_render_preview(artifact_id: str) -> dict[str, Any]:
+    from .podcast import reusable_audio_script
+    from .providers import audio_provider_readiness
+    row = DB.fetchone("SELECT * FROM artifacts WHERE id=? AND type='podcast'", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "播客不存在")
+    provider = active_provider("audio")
+    # Credentials never enter fingerprints or persisted snapshots.
+    snapshot = {key: (provider or {}).get(key) for key in ("id", "name", "kind", "base_url", "model", "config", "capabilities")}
+    reason, script = "", None
+    try:
+        script = reusable_audio_script(row)
+    except ValueError as exc:
+        reason = str(exc)
+    ready, message = audio_provider_readiness(provider)
+    script_hash = hashlib.sha256(json_dump(script).encode()).hexdigest()
+    provider_hash = hashlib.sha256(json_dump(snapshot).encode()).hexdigest()
+    return {"row": row, "script": script, "snapshot": snapshot, "eligible": bool(script and ready), "reason": reason or (message if not ready else ""), "script_hash": script_hash, "provider_hash": provider_hash}
+
+
+@api.get("/artifacts/{artifact_id}/audio-renders", responses=AUDIO_RENDER_RESPONSES, description="读取原脚本的独立音频版本与当前语音配置预览，不调用模型。")
+def audio_renders(artifact_id: str):
+    preview = audio_render_preview(artifact_id)
+    versions = DB.fetchall("SELECT r.id,r.artifact_id,r.job_id,r.created_at,j.state,j.error FROM podcast_audio_renders r LEFT JOIN jobs j ON j.id=r.job_id WHERE r.parent_id=? ORDER BY r.created_at DESC", (artifact_id,))
+    provider = preview["snapshot"]
+    return {key: preview[key] for key in ("eligible", "reason", "script_hash", "provider_hash")} | {"provider": {key: provider[key] for key in ("name", "base_url", "model", "config")}, "versions": versions}
+
+
+@api.post("/artifacts/{artifact_id}/audio-renders", status_code=202, responses=AUDIO_RENDER_SUBMIT_RESPONSES, description="按预览指纹绑定当前 AUDIO，仅执行 TTS、合并和 ASR；不调用文字模型，不覆盖原脚本或旧音频。")
+def create_audio_render(artifact_id: str, body: AudioRenderRequest):
+    existing = DB.fetchone("SELECT * FROM podcast_audio_renders WHERE parent_id=? AND request_id=?", (artifact_id, body.request_id))
+    if existing:
+        return existing
+    preview = audio_render_preview(artifact_id)
+    if body.script_hash != preview["script_hash"] or body.provider_hash != preview["provider_hash"]:
+        raise HTTPException(409, {"code": "stale_preview", "message": "脚本或语音配置已变化，请刷新预览后提交"})
+    if not preview["eligible"]:
+        raise HTTPException(409, preview["reason"])
+    render_id = new_id("audio_render")
+    with DB.transaction() as connection:
+        existing = connection.execute("SELECT r.* FROM podcast_audio_renders r LEFT JOIN jobs j ON j.id=r.job_id WHERE r.parent_id=? AND (r.request_id=? OR (r.script_hash=? AND r.provider_hash=? AND (r.job_id IS NULL OR j.state IN ('queued','running','cancelling')))) ORDER BY r.created_at DESC LIMIT 1", (artifact_id, body.request_id, body.script_hash, body.provider_hash)).fetchone()
+        if existing:
+            return dict(existing)
+        connection.execute("INSERT INTO podcast_audio_renders(id,parent_id,request_id,script_hash,provider_hash,created_at) VALUES(?,?,?,?,?,?)", (render_id, artifact_id, body.request_id, body.script_hash, body.provider_hash, utc_now()))
+    try:
+        payload = {"audio_render_id": render_id, "_audio_only": True, "_quality_script": preview["script"], "_quality_audio_provider": preview["snapshot"], "source_ids": preview["script"]["source_ids"]}
+        if body.retry_render_id:
+            prior = DB.fetchone("SELECT r.*,j.state FROM podcast_audio_renders r JOIN jobs j ON j.id=r.job_id WHERE r.id=? AND r.parent_id=?", (body.retry_render_id, artifact_id))
+            if not prior or prior["state"] not in {"failed", "cancelled"} or prior["script_hash"] != body.script_hash or prior["provider_hash"] != body.provider_hash:
+                raise HTTPException(409, "只能重试相同脚本和配置的已停止音频任务")
+            payload["audio_retry_job_id"] = prior["job_id"]
+        job = enqueue("podcast_audio", preview["row"]["notebook_id"], payload)
+        DB.execute("UPDATE podcast_audio_renders SET job_id=? WHERE id=?", (job["id"], render_id))
+    except Exception:
+        DB.execute("DELETE FROM podcast_audio_renders WHERE id=? AND job_id IS NULL", (render_id,))
+        raise
+    return DB.fetchone("SELECT * FROM podcast_audio_renders WHERE id=?", (render_id,))
 
 
 @api.get("/artifacts/{artifact_id}", responses=ARTIFACT_RESPONSES)

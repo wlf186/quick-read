@@ -328,3 +328,23 @@ QUALITY_RESPONSES = json_response(_object({**QUALITY_CONTROL_SCHEMA["properties"
 CHAT_RUN_RESPONSES = {202: {"description":"已排队，可立即轮询质量任务及对话消息。", "content":{"application/json":{"schema":_object({"id":{"type":"string"},"run_id":{"type":"string"},"message_id":{"type":"string"},"conversation_id":{"type":"string"}})}}}}
 ARTIFACT_SCHEMA["properties"]["payload"]["properties"]["quality_control"] = QUALITY_CONTROL_SCHEMA
 TASK_PREVIEW_RESPONSES[200]["content"]["application/json"]["schema"]["properties"]["quality_policy"] = _object({}, "与执行相同的档位、目标分、自动次数及抽样深度。")
+
+# Additive UX contracts. These describe payloads without filtering legacy fields.
+SOURCE_SCOPE_SCHEMA = _array(_object({
+    "id": {"type": "string"}, "revision_id": {"type": "string"}, "filename": {"type": "string"}
+}), "消息提交时的完整资料范围；历史缺失为未知，不从引用子集推断。")
+SOURCE_SELECTION_RESPONSES = json_response(_object({"source_ids": _array({"type": "string"})}), "原子更新后的已就绪资料范围。")
+STUDY_OVERVIEW_RESPONSES = json_response(_object({
+    "server_time": {"type": "string", "format": "date-time"},
+    "groups": _array(_object({"artifact_id": {"type": "string"}, "notebook_id": {"type": "string"}, "due": {"type": "integer"}, "new": {"type": "integer"}, "next_due": {"type": ["string", "null"]}, "paused": _array(_object({"id": {"type": "string"}, "front": {"type": "string"}}))}))
+}), "只读学习概览，只计入当前可见最佳版本；不创建学习会话。")
+AUDIO_RENDER_RESPONSES = json_response(_object({
+    "eligible": {"type": "boolean"}, "reason": {"type": "string"}, "script_hash": {"type": "string"}, "provider_hash": {"type": "string"},
+    "provider": _object({}, "当前语音配置预览，不含凭据。"), "versions": _array(_object({"id": {"type": "string"}, "artifact_id": {"type": ["string", "null"]}, "job_id": {"type": ["string", "null"]}, "state": {"type": ["string", "null"]}}))
+}), "独立音频版本；选择版本后播放、时间轴和下载使用同一 artifact_id。")
+AUDIO_RENDER_SUBMIT_RESPONSES = {202: {"description": "新建或幂等返回音频任务引用，不覆盖原产物。", "content": {"application/json": {"schema": _object({"id": {"type": "string"}, "job_id": {"type": ["string", "null"]}})}}}, 409: {"description": "预览已过期、配置不可用或重试不匹配。"}}
+SUMMARY_EXPORT_RESPONSES = {200: {"description": "指定版本的正文、引用、核查状态。", "content": {"text/markdown": {"schema": {"type": "string"}}}}, 404: {"description": "摘要不存在。"}}
+MESSAGE_LIST_RESPONSES = json_response(_array(_object({
+    "id": {"type": "string"}, "role": {"type": "string"}, "content": {"type": "string"},
+    "metadata": _object({"source_scope": {"anyOf": [SOURCE_SCOPE_SCHEMA, {"type": "null"}]}}, "额外计量、质量与来源字段保持兼容。")
+})), "按创建时间排序的消息；source_scope 缺失或 null 表示历史范围未知。")

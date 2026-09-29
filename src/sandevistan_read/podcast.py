@@ -4195,3 +4195,35 @@ def finish_product_script(turns: list[dict[str, Any]], chapters: list[dict[str, 
         for i in wrong:
             turns[i].setdefault("quality_issues", []).append({"code":"output_language","message":"本轮输出语言与请求不同。"})
     return turns, chapters, status
+
+
+def reusable_audio_script(row: dict[str, Any]) -> dict[str, Any]:
+    """Recover only explicit speaker labels; never use a language model here."""
+    from .database import json_load
+    result = copy.deepcopy(json_load(row["payload_json"], {}))
+    if result.get("delivery_status") == "draft_only":
+        raise ValueError("该草稿结构尚未确认，请先完成脚本后再生成音频")
+    turns = result.get("turns")
+    if not turns:
+        turns = []
+        for line in str(result.get("script") or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = re.fullmatch(r"(?:HOST_)?([AB])\s*[:：]\s*(.+)", line)
+            if not match:
+                raise ValueError("旧脚本缺少明确的 A/B 逐轮标记；可下载脚本，不会自动改写")
+            turns.append({"id": f"turn_{len(turns)+1}", "speaker": "HOST_" + match[1], "text": match[2], "citation_ids": [], "chapter_id": "chapter_1"})
+        result["turns"] = turns
+    if not turns or any(t.get("speaker") not in {"HOST_A", "HOST_B"} or not str(t.get("text") or "").strip() for t in turns):
+        raise ValueError("脚本缺少可合成的双人轮次")
+    result.setdefault("chapters", [{"id": "chapter_1", "title": "完整脚本", "turn_start": 0, "turn_end": len(turns)-1}])
+    result.setdefault("language", row.get("language") or "zh-CN")
+    result.setdefault("source_ids", json_load(row["scope_json"], []))
+    result["citations"] = json_load(row["citations_json"], [])
+    result.setdefault("duration", {"target_minutes": 10})
+    result.setdefault("quality", {})
+    result["version"] = max(2, int(result.get("version") or 2))
+    result.pop("quality_control", None)
+    result["delivery_status"] = "full"
+    return result

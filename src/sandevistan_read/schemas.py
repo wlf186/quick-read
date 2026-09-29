@@ -219,7 +219,13 @@ class ChatRequest(QualityTask):
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
 
+class SourceSelectionBatch(BaseModel):
+    source_ids: list[str] = Field(max_length=10000)
+
+
 class SummaryRequest(QualityTask):
+    focus: str = Field(default="", max_length=1000)
+    length: Literal["brief", "standard", "detailed"] = "standard"
     source_ids: list[str] | None = None
     language: Literal["auto", "zh-CN", "en"] = "auto"
 
@@ -326,3 +332,10 @@ class WeeklyBudgetSettings(BaseModel):
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError('请选择有效的 IANA 时区，例如 Asia/Shanghai') from exc
         return self
+
+
+class AudioRenderRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=100)
+    script_hash: str = Field(min_length=64, max_length=64)
+    provider_hash: str = Field(min_length=64, max_length=64)
+    retry_render_id: str | None = None

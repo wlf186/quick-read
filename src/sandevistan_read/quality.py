@@ -126,13 +126,14 @@ def publish(run: dict[str, Any]) -> None:
     if not best:
         message_id = data["payload"].get("message_id")
         if message_id:
-            DB.execute("UPDATE messages SET metadata_json=?,state=? WHERE id=?", (json_dump({"quality_control": control(run)}), "failed" if data["phase"] == "complete" else data["phase"], message_id))
+            DB.execute("UPDATE messages SET metadata_json=?,state=? WHERE id=?", (json_dump({**json_load((DB.fetchone("SELECT metadata_json FROM messages WHERE id=?", (message_id,)) or {}).get("metadata_json"), {}), "quality_control": control(run)}), "failed" if data["phase"] == "complete" else data["phase"], message_id))
         return
     metadata = control(run)
     if run["kind"] == "chat":
         content = best["content"]
         from .usage import summarize
         meta = {k: content.get(k) for k in ("quality_assessment", "context_usage", "warnings", "delivery_status")}
+        meta["source_scope"] = json_load((DB.fetchone("SELECT metadata_json FROM messages WHERE id=?", (best["target_id"],)) or {}).get("metadata_json"), {}).get("source_scope")
         meta.update(quality_control=metadata, usage=summarize(DB, target_id=best["target_id"]))
         DB.execute("UPDATE messages SET content=?,citations_json=?,metadata_json=?,state='complete' WHERE id=?",
                    (content["content"], json_dump(content.get("citations", [])), json_dump(meta), best["target_id"]))
@@ -276,7 +277,7 @@ async def model_step(run: dict[str, Any], candidate: dict[str, Any], *, improve:
     elif len(remaining) > limit - len(cited) and len(cited) < limit:
         count = limit - len(cited)
         selected = cited + [remaining[i * (len(remaining)-1) // max(1, count-1)] for i in range(count)]
-    requirements = {key: data["payload"].get(key) for key in ("question", "custom_prompt", "focus", "count", "difficulty", "language", "minutes")}
+    requirements = {key: data["payload"].get(key) for key in ("question", "custom_prompt", "focus", "length", "count", "difficulty", "language", "minutes")}
     serialized = json_dump(content)
     legend = [{k: c.get(k) for k in ("id", "chunk_id", "source_id")} for c in candidate["content"].get("citations", [])]
     suggestions = (candidate.get("score") or {}).get("suggestions", [])
@@ -335,7 +336,7 @@ async def first_candidate(run: dict[str, Any]) -> tuple[dict[str, Any], str | No
         return await podcast.build_podcast_script(notebook_id, payload, allow_partial=True, cancel_check=lambda: bool(interrupted(run))), None
     # Existing builders retain their structural validation and evidence preparation.
     if kind == "summary":
-        result = await services.make_summary(notebook_id, payload["source_ids"], payload.get("language", "auto"), run["job_id"])
+        result = await services.make_summary(notebook_id, payload["source_ids"], payload.get("language", "auto"), run["job_id"], focus=payload.get("focus", ""), length=payload.get("length", "standard"))
         target = result["artifact_id"]
     else:
         result = await study.generate_study_artifact(notebook_id, kind, payload.get("count", 10), payload["source_ids"], payload.get("language", "auto"), payload.get("difficulty", "mixed"), payload.get("custom_prompt", ""), run["job_id"])

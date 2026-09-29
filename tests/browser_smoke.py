@@ -5,7 +5,7 @@ import re
 import tomllib
 
 from playwright.sync_api import Page, sync_playwright
-from browser_regressions import run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions, run_ui_usability_regressions, run_quality_flow_regressions, run_visual_refinement_regressions
+from browser_regressions import run_configuration_sync_regressions, run_reuse_workflow_regressions, run_core_regressions, run_generation_regressions, run_context_regressions, run_import_regressions, run_delivery_regressions, run_experience_regressions, run_weekly_budget_regressions, run_ui_usability_regressions, run_quality_flow_regressions, run_visual_refinement_regressions
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +46,8 @@ def main() -> None:
     console_errors: list[str] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
+        run_configuration_sync_regressions(browser)
+        run_reuse_workflow_regressions(browser)
         run_visual_refinement_regressions(browser)
         run_core_regressions(browser)
         run_generation_regressions(browser)

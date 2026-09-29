@@ -202,3 +202,21 @@ export function GettingStarted({hasModel,hasNotebook,sourceCount,hasResult,onSet
   const actions=[onSettings,onCreate,onImport,onTry];const names=['连接文字模型','创建资料库','导入并选择资料','生成内容并点击引用核对'];
   return <details className="getting-started" open={current>=0&&!hasResult?true:undefined}><summary>{current>=0?`开始使用 · ${names[current]}`:'使用指南 · 阅读 → 核对 → 自测 → 复习'}</summary><ol>{names.map((name,index)=><li key={name}>{steps[index]?'✓ ':`${index+1}. `}{name}</li>)}</ol><div className="review-actions">{current>=0?<button onClick={()=>{onNavigate?.();actions[current]()}}>下一步：{names[current]}</button>:null}<button onClick={()=>{setDemo(true);setAnswer(undefined);setQuote(false)}}>体验示例（不消耗 token）</button></div>{demo?<Overlay label="使用示例" className="example-tour" onClose={()=>setDemo(false)} title={<>从资料到可复习的知识</>}><p>以下是内置的虚构示例，不会上传资料或调用模型。</p><h3>1. 阅读与核对</h3><p>试验 A 的发芽率为 80%，试验 B 为 60%。两次试验光照不同，不能仅据此认定差异来自肥料。<button onClick={()=>setQuote(value=>!value)} aria-expanded={quote}>[S1] 查看原文</button></p>{quote?<blockquote>示例试验记录，第 1 页：A 组 10 粒种子发芽 8 粒，B 组 10 粒发芽 6 粒。两组的光照时间不同。</blockquote>:null}<h3>2. 自测</h3><p>可以从资料中确认哪项结论？</p><button disabled={answer!==undefined} onClick={()=>setAnswer(0)}>A. A 组肥料一定更好</button><button disabled={answer!==undefined} onClick={()=>setAnswer(1)}>B. A 组的发芽比例较高</button>{answer!==undefined?<p role="status">{answer===1?'回答正确。':'这次答错了。'}记录支持发芽比例的差异，不能排除光照的影响。<button onClick={()=>setAnswer(undefined)}>重新练习</button></p>:null}<h3>3. 持续复习</h3><p>真实测验支持错题重练，闪卡会依据反馈安排到期复习。复习已有内容不会重新调用生成模型。</p><p>每项任务都可查看资料范围、原文核查情况和用量；自动核查不能保证事实正确。</p></Overlay>:null}</details>
 }
+
+export function CopyResult({content,citations=[]}:{content:string;citations?:import('./api').Citation[]}){
+  const[state,setState]=useState('复制正文与引用');
+  return <button onClick={()=>{const text=content+'\n\n'+citations.map(c=>`[${c.id}] ${c.filename}\n${c.quote}`).join('\n\n');void copyText(text).then(()=>setState('已复制')).catch(()=>setState('复制失败，请选择正文复制'))}}>{state}</button>
+}
+
+export function SourceRangePicker({sources,onSave}:{sources:import('./api').Source[];onSave:(ids:string[])=>Promise<void>}){
+  const[open,setOpen]=useState(false),[query,setQuery]=useState(''),[ids,setIds]=useState<string[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const ready=sources.filter(s=>s.state==='ready'),visible=ready.filter(s=>s.filename.toLowerCase().includes(query.toLowerCase()));
+  return <><button onClick={()=>{setIds(ready.filter(s=>s.selected).map(s=>s.id));setError('');setOpen(true)}}>资料范围（{ready.filter(s=>s.selected).length}）</button>{open?<Overlay label="选择资料范围" title={<>选择资料范围</>} onClose={()=>setOpen(false)}><label>搜索资料<input value={query} onChange={e=>setQuery(e.target.value)}/></label><p>仅列出已完成索引的资料。应用后用于后续问题和新任务。</p><button onClick={()=>setIds(current=>Array.from(new Set([...current,...visible.map(s=>s.id)])))}>全选搜索结果</button><button onClick={()=>setIds(current=>current.filter(id=>!visible.some(s=>s.id===id)))}>清除搜索结果</button>{visible.map(s=><label className="provider-check" key={s.id}><input type="checkbox" checked={ids.includes(s.id)} onChange={e=>setIds(current=>e.target.checked?[...current,s.id]:current.filter(id=>id!==s.id))}/>{s.filename}</label>)}{error?<p role="alert">{error}</p>:null}<button className="primary" disabled={busy} onClick={()=>{setBusy(true);void onSave(ids).then(()=>setOpen(false)).catch(e=>setError(e.message)).finally(()=>setBusy(false))}}>应用范围（{ids.length}）</button></Overlay>:null}</>
+}
+
+async function copyText(text:string){
+  if(navigator.clipboard){await navigator.clipboard.writeText(text);return}
+  const focus=document.activeElement as HTMLElement|null,field=document.createElement('textarea');
+  field.value=text;field.setAttribute('readonly','');field.style.position='fixed';field.style.opacity='0';document.body.append(field);field.select();
+  try{if(!document.execCommand('copy'))throw new Error('复制不可用')}finally{field.remove();focus?.focus()}
+}
